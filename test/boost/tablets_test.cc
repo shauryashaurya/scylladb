@@ -10,10 +10,12 @@
 
 #include "test/lib/scylla_test_case.hh"
 #include "test/lib/random_utils.hh"
+#include <fmt/ranges.h>
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/log.hh"
 #include "test/lib/simple_schema.hh"
+#include "test/lib/test_utils.hh"
 #include "db/config.hh"
 #include "schema/schema_builder.hh"
 
@@ -25,6 +27,7 @@
 #include "locator/load_sketch.hh"
 #include "utils/UUID_gen.hh"
 #include "utils/error_injection.hh"
+#include "utils/to_string.hh"
 
 using namespace locator;
 using namespace replica;
@@ -264,6 +267,10 @@ SEASTAR_TEST_CASE(test_tablet_metadata_persistence) {
 }
 
 SEASTAR_TEST_CASE(test_read_required_hosts) {
+    // FIXME: the test fails without using force_gossip_topology_changes.
+    // Fix the test and remove force_gossip_topology_changes from config.
+    auto cfg = tablet_cql_test_config();
+    cfg.db_config->force_gossip_topology_changes(true);
     return do_with_cql_env_thread([] (cql_test_env& e) {
         auto h1 = host_id(utils::UUID_gen::get_time_UUID());
         auto h2 = host_id(utils::UUID_gen::get_time_UUID());
@@ -325,7 +332,7 @@ SEASTAR_TEST_CASE(test_read_required_hosts) {
         verify_tablet_metadata_persistence(e, tm, ts);
         BOOST_REQUIRE_EQUAL(std::unordered_set<locator::host_id>({h1, h2, h3}),
                             read_required_hosts(e.local_qp()).get());
-    }, tablet_cql_test_config());
+    }, cfg);
 }
 
 SEASTAR_TEST_CASE(test_get_shard) {

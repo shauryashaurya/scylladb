@@ -59,6 +59,7 @@
 #include "repair/row_level.hh"
 #include <cstdio>
 #include <seastar/core/file.hh>
+#include <unistd.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
@@ -112,8 +113,6 @@
 #include "service/raft/raft_group0.hh"
 
 #include <boost/algorithm/string/join.hpp>
-
-namespace fs = std::filesystem;
 
 seastar::metrics::metric_groups app_metrics;
 
@@ -556,8 +555,9 @@ static locator::host_id initialize_local_info_thread(sharded<db::system_keyspace
     }
 
     linfo.listen_address = listen_address;
+    const auto host_id = linfo.host_id;
     sys_ks.local().save_local_info(std::move(linfo), snitch.local()->get_location(), broadcast_address, broadcast_rpc_address).get();
-    return linfo.host_id;
+    return host_id;
 }
 
 extern "C" void __attribute__((weak)) __llvm_profile_dump();
@@ -638,8 +638,10 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 
     // If --version is requested, print it out and exit immediately to avoid
     // Seastar-specific warnings that may occur when running the app
-    auto parsed_opts = bpo::command_line_parser(ac, av).options(app.get_options_description()).allow_unregistered().run();
-    print_starting_message(ac, av, parsed_opts);
+    if (!isatty(fileno(stdin))) {
+        auto parsed_opts = bpo::command_line_parser(ac, av).options(app.get_options_description()).allow_unregistered().run();
+        print_starting_message(ac, av, parsed_opts);
+    }
 
     sharded<locator::shared_token_metadata> token_metadata;
     sharded<locator::effective_replication_map_factory> erm_factory;
@@ -775,11 +777,8 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                     throw bad_configuration_error();
                 }
             }
-            const bool raft_topology_change_enabled =
-                cfg->check_experimental(db::experimental_features_t::feature::CONSISTENT_TOPOLOGY_CHANGES);
 
             gms::feature_config fcfg = gms::feature_config_from_db_config(*cfg);
-            fcfg.use_raft_cluster_features = raft_topology_change_enabled;
 
             debug::the_feature_service = &feature_service;
             feature_service.start(fcfg).get();
@@ -1386,11 +1385,6 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             service::tablet_allocator::config tacfg;
             tacfg.initial_tablets_scale = cfg->tablets_initial_scale_factor();
             distributed<service::tablet_allocator> tablet_allocator;
-            if (cfg->check_experimental(db::experimental_features_t::feature::TABLETS) &&
-                !cfg->check_experimental(db::experimental_features_t::feature::CONSISTENT_TOPOLOGY_CHANGES)) {
-                    startlog.error("Bad configuration: The consistent-topology-changes feature has to be enabled if tablets feature is enabled");
-                    throw bad_configuration_error();
-            }
             tablet_allocator.start(tacfg, std::ref(mm_notifier), std::ref(db)).get();
             auto stop_tablet_allocator = defer_verbose_shutdown("tablet allocator", [&tablet_allocator] {
                 tablet_allocator.stop().get();
@@ -1501,7 +1495,14 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             }).get();
 
             supervisor::notify("loading tablet metadata");
-            ss.local().load_tablet_metadata().get();
+            try {
+                ss.local().load_tablet_metadata().get();
+            } catch (...) {
+                if (!cfg->maintenance_mode()) {
+                    throw;
+                }
+                startlog.error("Failed to load tablet metadata (ignoring due to maintenance mode): {}", std::current_exception());
+            }
 
             // We do not support tablet re-sharding yet, see https://github.com/scylladb/scylladb/issues/16739.
             // To avoid undefined behaviour due to violated assumptions, that
@@ -1627,7 +1628,6 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             cdc_config.ignore_msb_bits = cfg->murmur3_partitioner_ignore_msb_bits();
             cdc_config.ring_delay = std::chrono::milliseconds(cfg->ring_delay_ms());
             cdc_config.dont_rewrite_streams = cfg->cdc_dont_rewrite_streams();
-            cdc_config.raft_experimental_topology = raft_topology_change_enabled;
             cdc_generation_service.start(std::move(cdc_config), std::ref(gossiper), std::ref(sys_dist_ks), std::ref(sys_ks),
                     std::ref(stop_signal.as_sharded_abort_source()), std::ref(token_metadata), std::ref(feature_service), std::ref(db),
                     [&ss] () -> bool { return ss.local().raft_topology_change_enabled(); }).get();
@@ -1693,7 +1693,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 
             auto start_auth_service = [&mm] (sharded<auth::service>& auth_service, std::any& stop_auth_service, const char* what) {
                 supervisor::notify(fmt::format("starting {}", what));
-                auth_service.invoke_on_all(&auth::service::start, std::ref(mm)).get();
+                auth_service.invoke_on_all(&auth::service::start, std::ref(mm), std::ref(sys_ks)).get();
 
                 stop_auth_service = defer_verbose_shutdown(what, [&auth_service] {
                     auth_service.stop().get();
@@ -1799,7 +1799,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             });
 
             // Set up group0 service earlier since it is needed by group0 setup just below
-            ss.local().set_group0(group0_service, raft_topology_change_enabled);
+            ss.local().set_group0(group0_service);
 
             const auto generation_number = gms::generation_type(sys_ks.local().increment_and_get_generation().get());
 
@@ -1858,6 +1858,10 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             auth_service.start(std::move(perm_cache_config), std::ref(qp), std::ref(group0_client), std::ref(mm_notifier), std::ref(mm), auth_config, maintenance_socket_enabled::no).get();
 
             std::any stop_auth_service;
+            // Has to be called after node joined the cluster (join_cluster())
+            // with raft leader elected as only then auth version mutation is put
+            // in scylla_local table. This allows to know the version at auth service
+            // startup also when creating a new cluster.
             start_auth_service(auth_service, stop_auth_service, "auth service");
 
             api::set_server_authorization_cache(ctx, auth_service).get();
@@ -1903,8 +1907,10 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 view_backlog_broker.stop().get();
             });
 
-            startlog.info("Waiting for gossip to settle before accepting client requests...");
-            gossiper.local().wait_for_gossip_to_settle().get();
+            if (!ss.local().raft_topology_change_enabled()) {
+                startlog.info("Waiting for gossip to settle before accepting client requests...");
+                gossiper.local().wait_for_gossip_to_settle().get();
+            }
             api::set_server_gossip_settle(ctx, gossiper).get();
 
             supervisor::notify("allow replaying hints");

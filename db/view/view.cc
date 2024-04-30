@@ -23,6 +23,8 @@
 #include <boost/algorithm/cxx11/any_of.hpp>
 #include <boost/algorithm/cxx11/all_of.hpp>
 
+#include <fmt/ranges.h>
+
 #include <seastar/core/future-util.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -1946,25 +1948,17 @@ future<> view_builder::start(service::migration_manager& mm) {
 
 future<> view_builder::drain() {
     if (_as.abort_requested()) {
-        return make_ready_future();
+        co_return;
     }
     vlogger.info("Draining view builder");
     _as.request_abort();
-    return _started.then([this] {
-        return _mnotifier.unregister_listener(this).then([this] {
-            return _sem.wait();
-        }).then([this] {
-            _sem.broken();
-            return _build_step.join();
-        }).handle_exception_type([] (const broken_semaphore&) {
-            // ignored
-        }).handle_exception_type([] (const semaphore_timed_out&) {
-            // ignored
-        }).finally([this] {
-            return parallel_for_each(_base_to_build_step, [] (std::pair<const table_id, build_step>& p) {
-                return p.second.reader.close();
-            });
-        });
+    co_await std::move(_started);
+    co_await _mnotifier.unregister_listener(this);
+    co_await _sem.wait();
+    _sem.broken();
+    co_await _build_step.join();
+    co_await coroutine::parallel_for_each(_base_to_build_step, [] (std::pair<const table_id, build_step>& p) {
+        return p.second.reader.close();
     });
 }
 
@@ -2339,7 +2333,7 @@ future<> view_builder::do_build_step() {
             }
         }
     }).handle_exception([] (std::exception_ptr ex) {
-        vlogger.warn("Unexcepted error executing build step: {}. Ignored.", std::current_exception());
+        vlogger.warn("Unexcepted error executing build step: {}. Ignored.", ex);
     });
 }
 
@@ -2501,8 +2495,8 @@ public:
             auto reader = make_flat_mutation_reader_from_fragments(_step.reader.schema(), _builder._permit, std::move(_fragments));
             auto close_reader = defer([&reader] { reader.close().get(); });
             reader.upgrade_schema(base_schema);
-            _step.base->populate_views(
-                    _gen,
+            _gen->populate_views(
+                    *_step.base,
                     std::move(views),
                     _step.current_token(),
                     std::move(reader),

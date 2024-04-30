@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
+#include <fmt/ranges.h>
+#include <fmt/std.h>
 #include "log.hh"
 #include "replica/database_fwd.hh"
 #include "utils/lister.hh"
@@ -18,7 +20,6 @@
 #include "db/commitlog/commitlog.hh"
 #include "db/config.hh"
 #include "db/extensions.hh"
-#include "utils/to_string.hh"
 #include "cql3/functions/functions.hh"
 #include "cql3/functions/user_function.hh"
 #include "cql3/functions/user_aggregate.hh"
@@ -310,7 +311,7 @@ public:
 };
 
 database::database(const db::config& cfg, database_config dbcfg, service::migration_notifier& mn, gms::feature_service& feat, const locator::shared_token_metadata& stm,
-        compaction_manager& cm, sstables::storage_manager& sstm, wasm::manager& wasm, sharded<sstables::directory_semaphore>& sst_dir_sem, utils::cross_shard_barrier barrier)
+        compaction_manager& cm, sstables::storage_manager& sstm, wasm::manager& wasm, sstables::directory_semaphore& sst_dir_sem, utils::cross_shard_barrier barrier)
     : _stats(make_lw_shared<db_stats>())
     , _user_types(std::make_shared<db_user_types_storage>(*this))
     , _cl_stats(std::make_unique<cell_locker_stats>())
@@ -370,15 +371,14 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
               _cfg.compaction_rows_count_warning_threshold,
               _cfg.compaction_collection_elements_count_warning_threshold))
     , _nop_large_data_handler(std::make_unique<db::nop_large_data_handler>())
-    , _user_sstables_manager(std::make_unique<sstables::sstables_manager>("user", *_large_data_handler, _cfg, feat, _row_cache_tracker, dbcfg.available_memory, sst_dir_sem.local(), [&stm]{ return stm.get()->get_my_id(); }, &sstm))
-    , _system_sstables_manager(std::make_unique<sstables::sstables_manager>("system", *_nop_large_data_handler, _cfg, feat, _row_cache_tracker, dbcfg.available_memory, sst_dir_sem.local(), [&stm]{ return stm.get()->get_my_id(); }))
+    , _user_sstables_manager(std::make_unique<sstables::sstables_manager>("user", *_large_data_handler, _cfg, feat, _row_cache_tracker, dbcfg.available_memory, sst_dir_sem, [&stm]{ return stm.get()->get_my_id(); }, &sstm))
+    , _system_sstables_manager(std::make_unique<sstables::sstables_manager>("system", *_nop_large_data_handler, _cfg, feat, _row_cache_tracker, dbcfg.available_memory, sst_dir_sem, [&stm]{ return stm.get()->get_my_id(); }))
     , _result_memory_limiter(dbcfg.available_memory / 10)
     , _data_listeners(std::make_unique<db::data_listeners>())
     , _mnotifier(mn)
     , _feat(feat)
     , _shared_token_metadata(stm)
     , _wasm(wasm)
-    , _sst_dir_semaphore(sst_dir_sem)
     , _stop_barrier(std::move(barrier))
     , _update_memtable_flush_static_shares_action([this, &cfg] { return _memtable_controller.update_static_shares(cfg.memtable_flush_static_shares()); })
     , _memtable_flush_static_shares_observer(cfg.memtable_flush_static_shares.observe(_update_memtable_flush_static_shares_action.make_observer()))
@@ -1245,7 +1245,6 @@ keyspace::make_column_family_config(const schema& s, const database& db) const {
     cfg.reversed_reads_auto_bypass_cache = db_config.reversed_reads_auto_bypass_cache;
     cfg.enable_optimized_reversed_reads = db_config.enable_optimized_reversed_reads;
     cfg.tombstone_warn_threshold = db_config.tombstone_warn_threshold();
-    cfg.view_update_concurrency_semaphore = _config.view_update_concurrency_semaphore;
     cfg.view_update_concurrency_semaphore_limit = _config.view_update_concurrency_semaphore_limit;
     cfg.data_listeners = &db.data_listeners();
     cfg.enable_compacting_data_for_streaming_and_repair = db_config.enable_compacting_data_for_streaming_and_repair();
@@ -2131,7 +2130,6 @@ database::make_keyspace_config(const keyspace_metadata& ksm) {
     cfg.statement_scheduling_group = _dbcfg.statement_scheduling_group;
     cfg.enable_metrics_reporting = _cfg.enable_keyspace_column_family_metrics();
 
-    cfg.view_update_concurrency_semaphore = &_view_update_concurrency_sem;
     cfg.view_update_concurrency_semaphore_limit = max_memory_pending_view_updates();
     return cfg;
 }
@@ -2627,9 +2625,9 @@ static std::pair<sstring, table_id> extract_cf_name_and_uuid(const sstring& dire
     return std::make_pair(directory_name.substr(0, pos), table_id(utils::UUID(directory_name.substr(pos + 1))));
 }
 
-future<std::vector<database::snapshot_details_result>> database::get_snapshot_details() {
+future<std::unordered_map<sstring, database::snapshot_details>> database::get_snapshot_details() {
     std::vector<sstring> data_dirs = _cfg.data_file_directories();
-    std::vector<database::snapshot_details_result> details;
+    std::unordered_map<sstring, snapshot_details> details;
 
     for (auto& datadir : data_dirs) {
         co_await lister::scan_dir(fs::path{datadir}, lister::dir_entry_types::of<directory_entry_type::directory>(), [&details] (fs::path parent_dir, directory_entry de) -> future<> {
@@ -2649,44 +2647,9 @@ future<std::vector<database::snapshot_details_result>> database::get_snapshot_de
 
                 auto cf_name_and_uuid = extract_cf_name_and_uuid(de.name);
                 co_return co_await lister::scan_dir(cf_dir / sstables::snapshots_dir, lister::dir_entry_types::of<directory_entry_type::directory>(), [&details, &ks_name, &cf_name = cf_name_and_uuid.first, &cf_dir] (fs::path parent_dir, directory_entry de) -> future<> {
-                    database::snapshot_details_result snapshot_result = {
-                        .snapshot_name = de.name,
-                        .details = {0, 0, cf_name, ks_name}
-                    };
-
-                    co_await lister::scan_dir(parent_dir / de.name,  lister::dir_entry_types::of<directory_entry_type::regular>(), [cf_dir, &snapshot_result] (fs::path snapshot_dir, directory_entry de) -> future<> {
-                        auto sd = co_await io_check(file_stat, (snapshot_dir / de.name).native(), follow_symlink::no);
-                        auto size = sd.allocated_size;
-
-                        // The manifest and schema.sql files are the only files expected to be in this directory not belonging to the SSTable.
-                        //
-                        // All the others should just generate an exception: there is something wrong, so don't blindly
-                        // add it to the size.
-                        if (de.name != "manifest.json" && de.name != "schema.cql") {
-                            snapshot_result.details.total += size;
-                        } else {
-                            size = 0;
-                        }
-
-                        try {
-                            // File exists in the main SSTable directory. Snapshots are not contributing to size
-                            auto psd = co_await io_check(file_stat, (cf_dir / de.name).native(), follow_symlink::no);
-                            // File in main SSTable directory must be hardlinked to the file in the snapshot dir with the same name.
-                            if (psd.device_id != sd.device_id || psd.inode_number != sd.inode_number) {
-                                dblog.warn("[{} device_id={} inode_number={} size={}] is not the same file as [{} device_id={} inode_number={} size={}]",
-                                        (cf_dir / de.name).native(), psd.device_id, psd.inode_number, psd.size,
-                                        (snapshot_dir / de.name).native(), sd.device_id, sd.inode_number, sd.size);
-                                snapshot_result.details.live += size;
-                            }
-                        } catch (std::system_error& e) {
-                            if (e.code() != std::error_code(ENOENT, std::system_category())) {
-                                throw;
-                            }
-                            snapshot_result.details.live += size;
-                        }
-                    });
-
-                    details.emplace_back(std::move(snapshot_result));
+                    auto snapshot_name = de.name;
+                    auto cf_details = co_await table::get_snapshot_details(parent_dir / snapshot_name, cf_dir);
+                    details[snapshot_name].emplace_back(ks_name, cf_name, std::move(cf_details));
                 });
             });
         });

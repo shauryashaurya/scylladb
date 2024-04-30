@@ -9,6 +9,7 @@
  */
 
 #include <random>
+#include <fmt/ranges.h>
 #include <seastar/core/sleep.hh>
 #include <seastar/util/defer.hh>
 #include "partition_range_compat.hh"
@@ -91,6 +92,7 @@
 #include "utils/exceptions.hh"
 #include "utils/tuple_utils.hh"
 #include "utils/rpc_utils.hh"
+#include "utils/to_string.hh"
 #include "replica/exceptions.hh"
 #include "db/operation_type.hh"
 #include "locator/util.hh"
@@ -167,7 +169,7 @@ enum class storage_proxy_remote_read_verb {
 
 }
 
-template <> struct fmt::formatter<service::storage_proxy_remote_read_verb> : fmt::formatter<std::string_view> {
+template <> struct fmt::formatter<service::storage_proxy_remote_read_verb> : fmt::formatter<string_view> {
     auto format(service::storage_proxy_remote_read_verb verb, fmt::format_context& ctx) const {
         std::string_view name;
         using enum service::storage_proxy_remote_read_verb;
@@ -182,7 +184,7 @@ template <> struct fmt::formatter<service::storage_proxy_remote_read_verb> : fmt
             name = "read_digest";
             break;
         }
-        return formatter<std::string_view>::format(name, ctx);
+        return formatter<string_view>::format(name, ctx);
     }
 };
 
@@ -2223,7 +2225,7 @@ future<bool> paxos_response_handler::accept_proposal(lw_shared_ptr<paxos::propos
 
 // debug output in mutate_internal needs this
 template <>
-struct fmt::formatter<service::paxos_response_handler> : fmt::formatter<std::string_view> {
+struct fmt::formatter<service::paxos_response_handler> : fmt::formatter<string_view> {
     auto format(const service::paxos_response_handler& h, fmt::format_context& ctx) const {
         return fmt::format_to(ctx.out(), "paxos_response_handler{{{}}}", h.id());
     }
@@ -2854,14 +2856,14 @@ struct read_repair_mutation {
 
 }
 
-template <> struct fmt::formatter<service::hint_wrapper> : fmt::formatter<std::string_view> {
+template <> struct fmt::formatter<service::hint_wrapper> : fmt::formatter<string_view> {
     auto format(const service::hint_wrapper& h, fmt::format_context& ctx) const {
         return fmt::format_to(ctx.out(), "hint_wrapper{{{}}}", h.mut);
     }
 };
 
 template <>
-struct fmt::formatter<service::read_repair_mutation> : fmt::formatter<std::string_view> {
+struct fmt::formatter<service::read_repair_mutation> : fmt::formatter<string_view> {
     auto format(const service::read_repair_mutation& m, fmt::format_context& ctx) const {
         return fmt::format_to(ctx.out(), "{}", m.value);
     }
@@ -5360,21 +5362,6 @@ public:
     }
 };
 
-db::read_repair_decision storage_proxy::new_read_repair_decision(const schema& s) {
-    if (s.dc_local_read_repair_chance() > 0 || s.read_repair_chance() > 0) {
-        double chance = _read_repair_chance(_urandom);
-        if (s.read_repair_chance() > chance) {
-            return db::read_repair_decision::GLOBAL;
-        }
-
-        if (s.dc_local_read_repair_chance() > chance) {
-            return db::read_repair_decision::DC_LOCAL;
-        }
-    }
-
-    return db::read_repair_decision::NONE;
-}
-
 result<::shared_ptr<abstract_read_executor>> storage_proxy::get_read_executor(lw_shared_ptr<query::read_command> cmd,
         locator::effective_replication_map_ptr erm,
         schema_ptr schema,
@@ -5551,7 +5538,7 @@ storage_proxy::query_singular(lw_shared_ptr<query::read_command> cmd,
     auto erm = table.get_effective_replication_map();
 
     db::read_repair_decision repair_decision = query_options.read_repair_decision
-        ? *query_options.read_repair_decision : new_read_repair_decision(*schema);
+        ? *query_options.read_repair_decision : db::read_repair_decision::NONE;
 
     // Update reads_coordinator_outside_replica_set once per request,
     // not once per partition.
@@ -6483,17 +6470,12 @@ future<db::hints::sync_point> storage_proxy::create_hint_sync_point(std::vector<
         const auto members_set = remote().gossiper().get_live_members();
         std::copy(members_set.begin(), members_set.end(), std::back_inserter(target_hosts));
     }
-    co_await coroutine::parallel_for_each(boost::irange<unsigned>(0, smp::count), [this, &target_hosts, &spoint] (unsigned shard) -> future<> {
-        const auto& sharded_sp = container();
-        // sharded::invoke_on does not have a const-method version, so we cannot use it here
-        auto p = co_await smp::submit_to(shard, [&sharded_sp, &target_hosts] {
-            const storage_proxy& sp = sharded_sp.local();
-            auto regular_rp = sp._hints_manager.calculate_current_sync_point(target_hosts);
-            auto mv_rp = sp._hints_for_views_manager.calculate_current_sync_point(target_hosts);
-            return std::make_pair(std::move(regular_rp), std::move(mv_rp));
-        });
-        spoint.regular_per_shard_rps[shard] = std::move(p.first);
-        spoint.mv_per_shard_rps[shard] = std::move(p.second);
+    // sharded::invoke_on does not have a const-method version, so we cannot use it here
+    co_await smp::invoke_on_all([&sharded_sp = container(), &target_hosts, &spoint] {
+        const storage_proxy& sp = sharded_sp.local();
+        auto shard = this_shard_id();
+        spoint.regular_per_shard_rps[shard] = sp._hints_manager.calculate_current_sync_point(target_hosts);
+        spoint.mv_per_shard_rps[shard] = sp._hints_for_views_manager.calculate_current_sync_point(target_hosts);
     });
     co_return spoint;
 }

@@ -110,7 +110,6 @@ struct experimental_features_t {
         UNUSED,
         UDF,
         ALTERNATOR_STREAMS,
-        CONSISTENT_TOPOLOGY_CHANGES,
         BROADCAST_TABLES,
         KEYSPACE_STORAGE_OPTIONS,
         TABLETS,
@@ -144,6 +143,7 @@ public:
     void add_cdc_extension();
     void add_per_partition_rate_limit_extension();
     void add_tags_extension();
+    void add_tombstone_gc_extension();
 
     /// True iff the feature is enabled.
     bool check_experimental(experimental_features_t::feature f) const;
@@ -447,6 +447,7 @@ public:
     named_value<double> index_cache_fraction;
 
     named_value<bool> consistent_cluster_management;
+    named_value<bool> force_gossip_topology_changes;
 
     named_value<double> wasm_cache_memory_fraction;
     named_value<uint32_t> wasm_cache_timeout_in_ms;

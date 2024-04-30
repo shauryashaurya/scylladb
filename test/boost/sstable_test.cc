@@ -107,14 +107,7 @@ future<> summary_query(schema_ptr schema, sstring path, sstables::generation_typ
 
 template<uint64_t Position, uint64_t EntryPosition, uint64_t EntryKeySize>
 future<> summary_query_fail(schema_ptr schema, sstring path, sstables::generation_type::int_t generation) {
-    return summary_query<Position, EntryPosition, EntryKeySize>(std::move(schema), path, generation).then_wrapped([] (auto fut) {
-        try {
-            fut.get();
-        } catch (std::out_of_range& ok) {
-            return make_ready_future<>();
-        }
-        return make_ready_future<>();
-    });
+    return summary_query<Position, EntryPosition, EntryKeySize>(std::move(schema), path, generation).handle_exception_type([] (const std::out_of_range&) {});
 }
 
 SEASTAR_TEST_CASE(small_summary_query_ok) {
@@ -810,22 +803,6 @@ BOOST_AUTO_TEST_CASE(test_empty_key_view_comparison) {
     auto lf = empty_partition_key_view.legacy_form(s);
     BOOST_CHECK_EQUAL(0, lf.size());
     BOOST_CHECK(lf.begin() == lf.end());
-}
-
-template <typename T> concept Formattable = fmt::is_formattable<T>::value;
-
-namespace sstables {
-
-template <Formattable T>
-std::ostream& boost_test_print_type(std::ostream& os, const T& v) {
-    fmt::print(os, "{}", v);
-    return os;
-}
-
-std::ostream& boost_test_print_type(std::ostream& os, sstable_format_types format_type) {
-    return os << static_cast<int>(format_type);
-}
-
 }
 
 // Test that sstables::parse_path is able to parse the paths of sstables

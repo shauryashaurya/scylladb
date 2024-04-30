@@ -22,6 +22,7 @@
 #include "message/messaging_service.hh"
 #include "log.hh"
 #include "db/system_keyspace.hh"
+#include <fmt/ranges.h>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/metrics.hh>
@@ -44,6 +45,7 @@
 #include "locator/token_metadata.hh"
 #include "utils/exceptions.hh"
 #include "utils/error_injection.hh"
+#include "utils/to_string.hh"
 
 namespace gms {
 
@@ -651,9 +653,21 @@ future<> gossiper::apply_state_locally(std::map<inet_address, endpoint_state> ma
         if (ep == this->get_broadcast_address() && !this->is_in_shadow_round()) {
             return make_ready_future<>();
         }
-        if (_just_removed_endpoints.contains(ep)) {
-            logger.trace("Ignoring gossip for {} because it is quarantined", ep);
-            return make_ready_future<>();
+        if (topo_sm) {
+            locator::host_id hid = map[ep].get_host_id();
+            if (hid == locator::host_id::create_null_id()) {
+                // If there is no host id in the new state there should be one locally
+                hid = get_host_id(ep);
+            }
+            if (topo_sm->_topology.left_nodes.contains(raft::server_id(hid.uuid()))) {
+                logger.trace("Ignoring gossip for {} because it left", ep);
+                return make_ready_future<>();
+            }
+        } else {
+            if (_just_removed_endpoints.contains(ep)) {
+                logger.trace("Ignoring gossip for {} because it is quarantined", ep);
+                return make_ready_future<>();
+            }
         }
         return seastar::with_semaphore(_apply_state_locally_semaphore, 1, [this, &ep, &map] () mutable {
             return do_apply_state_locally(ep, std::move(map[ep]), true);
@@ -1059,11 +1073,15 @@ void gossiper::run() {
             //wait on messaging service to start listening
             // MessagingService.instance().waitUntilListening();
 
-            /* Update the local heartbeat counter. */
-            heart_beat_state& hbs = my_endpoint_state().get_heart_beat_state();
-            hbs.update_heart_beat();
+            {
+                auto permit = lock_endpoint(get_broadcast_address(), null_permit_id).get();
+                /* Update the local heartbeat counter. */
+                heart_beat_state& hbs = my_endpoint_state().get_heart_beat_state();
+                hbs.update_heart_beat();
 
-            logger.trace("My heartbeat is now {}", hbs.get_heart_beat_version());
+                logger.trace("My heartbeat is now {}", hbs.get_heart_beat_version());
+            }
+
             utils::chunked_vector<gossip_digest> g_digests;
             this->make_random_gossip_digest(g_digests);
 
@@ -1122,8 +1140,9 @@ void gossiper::run() {
                         logger.trace("Failed to send gossip to unreachable members: {}", ep);
                     });
                 });
-
-                do_status_check().get();
+                if (!topo_sm) {
+                    do_status_check().get();
+                }
             }
     }).then_wrapped([this] (auto&& f) {
         try {
@@ -1257,7 +1276,10 @@ void gossiper::quarantine_endpoint(inet_address endpoint) {
 }
 
 void gossiper::quarantine_endpoint(inet_address endpoint, clk::time_point quarantine_start) {
-    _just_removed_endpoints[endpoint] = quarantine_start;
+    if (!topo_sm) {
+        // In raft topology mode the coodinator maintains banned nodes list
+        _just_removed_endpoints[endpoint] = quarantine_start;
+    }
 }
 
 void gossiper::make_random_gossip_digest(utils::chunked_vector<gossip_digest>& g_digests) const {
@@ -1298,6 +1320,9 @@ future<> gossiper::replicate(inet_address ep, endpoint_state es, permit_id pid) 
             });
         }
      });
+
+    co_await utils::get_local_injector().inject("gossiper_replicate_sleep", std::chrono::seconds{1});
+
     // Second pass: set replicated endpoint_state on all shards
     // Must not throw
     try {
@@ -2013,11 +2038,9 @@ future<> gossiper::start_gossiping(gms::generation_type generation_nbr, applicat
         local_state.add_application_state(entry.first, entry.second);
     }
 
-    auto generation = local_state.get_heart_beat_state().get_generation();
+    co_await replicate(get_broadcast_address(), local_state, permit.id());
 
-    co_await replicate(get_broadcast_address(), std::move(local_state), permit.id());
-
-    logger.trace("gossip started with generation {}", generation);
+    logger.info("Gossip started with local state: {}", local_state);
     _enabled = true;
     _nr_run = 0;
     _scheduled_gossip_task.arm(INTERVAL);
@@ -2123,10 +2146,20 @@ void gossiper::build_seeds_list() {
     }
 }
 
-future<> gossiper::add_saved_endpoint(inet_address ep, permit_id pid) {
-    if (ep == get_broadcast_address()) {
+future<> gossiper::add_saved_endpoint(locator::host_id host_id, gms::loaded_endpoint_state st, permit_id pid) {
+    if (host_id == my_host_id()) {
         logger.debug("Attempt to add self as saved endpoint");
         co_return;
+    }
+    const auto& ep = st.endpoint;
+    if (!host_id) {
+        on_internal_error(logger, format("Attempt to add {} with null host_id as saved endpoint", ep));
+    }
+    if (ep == inet_address{}) {
+        on_internal_error(logger, format("Attempt to add {} with null inet_address as saved endpoint", host_id));
+    }
+    if (ep == get_broadcast_address()) {
+        on_internal_error(logger, format("Attempt to add {} with broadcast_address {} as saved endpoint", host_id, ep));
     }
 
     auto permit = co_await lock_endpoint(ep, pid);
@@ -2148,14 +2181,18 @@ future<> gossiper::add_saved_endpoint(inet_address ep, permit_id pid) {
     // It will get updated as a whole by handle_major_state_change
     // via do_apply_state_locally when (remote_generation > local_generation)
     const auto tmptr = get_token_metadata_ptr();
-    auto host_id = tmptr->get_host_id_if_known(ep);
-    if (host_id) {
-        ep_state.add_application_state(gms::application_state::HOST_ID, versioned_value::host_id(host_id.value()));
-        auto tokens = tmptr->get_tokens(*host_id);
-        if (!tokens.empty()) {
-            std::unordered_set<dht::token> tokens_set(tokens.begin(), tokens.end());
-            ep_state.add_application_state(gms::application_state::TOKENS, versioned_value::tokens(tokens_set));
-        }
+    ep_state.add_application_state(gms::application_state::HOST_ID, versioned_value::host_id(host_id));
+    auto tokens = tmptr->get_tokens(host_id);
+    if (!tokens.empty()) {
+        std::unordered_set<dht::token> tokens_set(tokens.begin(), tokens.end());
+        ep_state.add_application_state(gms::application_state::TOKENS, versioned_value::tokens(tokens_set));
+    }
+    if (st.opt_dc_rack) {
+        ep_state.add_application_state(gms::application_state::DC, gms::versioned_value::datacenter(st.opt_dc_rack->dc));
+        ep_state.add_application_state(gms::application_state::RACK, gms::versioned_value::datacenter(st.opt_dc_rack->rack));
+    }
+    if (st.opt_status) {
+        ep_state.add_application_state(gms::application_state::STATUS, std::move(*st.opt_status));
     }
     auto generation = ep_state.get_heart_beat_state().get_generation();
     co_await replicate(ep, std::move(ep_state), permit.id());
@@ -2676,4 +2713,16 @@ locator::token_metadata_ptr gossiper::get_token_metadata_ptr() const noexcept {
     return _shared_token_metadata.get();
 }
 
+std::ostream& operator<<(std::ostream& os, const loaded_endpoint_state& st) {
+    fmt::print(os, "{}", st);
+    return os;
+}
+
 } // namespace gms
+
+auto fmt::formatter<gms::loaded_endpoint_state>::format(const gms::loaded_endpoint_state& st, fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{{ endpoint={} dc={} rack={} tokens={} }}", st.endpoint,
+            st.opt_dc_rack ? st.opt_dc_rack->dc : "",
+            st.opt_dc_rack ? st.opt_dc_rack->rack : "",
+            st.tokens);
+}

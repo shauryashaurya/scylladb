@@ -8,11 +8,14 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <fmt/ranges.h>
+
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/util/defer.hh>
 
 #include "locator/types.hh"
 #include "test/lib/scylla_test_case.hh"
+#include "test/lib/test_utils.hh"
 
 #include "locator/host_id.hh"
 #include "locator/topology.hh"
@@ -411,7 +414,7 @@ SEASTAR_THREAD_TEST_CASE(test_left_node_is_kept_outside_dc) {
     BOOST_REQUIRE(topo.get_datacenter(id3) == dc_rack1.dc);
     BOOST_REQUIRE(topo.get_rack(id3) == dc_rack1.rack);
 
-    auto topo2 = topo.clone_gently().get0();
+    auto topo2 = topo.clone_gently().get();
     {
         auto *n = topo2.find_node(id3);
         BOOST_REQUIRE(n);

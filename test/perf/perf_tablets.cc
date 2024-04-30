@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
+#include <fmt/ranges.h>
+
 #include <seastar/core/distributed.hh>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/sstring.hh>
@@ -36,7 +38,6 @@ cql_test_config tablet_cql_test_config() {
     cql_test_config c;
     c.db_config->experimental_features({
                db::experimental_features_t::feature::TABLETS,
-               db::experimental_features_t::feature::CONSISTENT_TOPOLOGY_CHANGES
        }, db::config::config_source::CommandLine);
     return c;
 }

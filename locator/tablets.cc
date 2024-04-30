@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <iterator>
 
+#include <fmt/ranges.h>
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 
@@ -80,7 +82,7 @@ read_replica_set_selector get_selector_for_reads(tablet_transition_stage stage) 
 tablet_transition_info::tablet_transition_info(tablet_transition_stage stage,
                                                tablet_transition_kind transition,
                                                tablet_replica_set next,
-                                               tablet_replica pending_replica,
+                                               std::optional<tablet_replica> pending_replica,
                                                service::session_id session_id)
     : stage(stage)
     , transition(transition)
@@ -103,9 +105,13 @@ tablet_migration_streaming_info get_migration_streaming_info(const locator::topo
             result.written_to = substract_sets(trinfo.next, tinfo.replicas);
             return result;
         case tablet_transition_kind::rebuild:
-            result.written_to.insert(trinfo.pending_replica);
+            if (!trinfo.pending_replica.has_value()) {
+                return result; // No nodes to stream to -> no nodes to stream from
+            }
+
+            result.written_to.insert(*trinfo.pending_replica);
             result.read_from = std::unordered_set<tablet_replica>(trinfo.next.begin(), trinfo.next.end());
-            result.read_from.erase(trinfo.pending_replica);
+            result.read_from.erase(*trinfo.pending_replica);
 
             erase_if(result.read_from, [&] (const tablet_replica& r) {
                 auto* n = topo.find_node(r.host);
@@ -117,10 +123,10 @@ tablet_migration_streaming_info get_migration_streaming_info(const locator::topo
     on_internal_error(tablet_logger, format("Invalid tablet transition kind: {}", static_cast<int>(trinfo.transition)));
 }
 
-tablet_replica get_leaving_replica(const tablet_info& tinfo, const tablet_transition_info& trinfo) {
+std::optional<tablet_replica> get_leaving_replica(const tablet_info& tinfo, const tablet_transition_info& trinfo) {
     auto leaving = substract_sets(tinfo.replicas, trinfo.next);
     if (leaving.empty()) {
-        throw std::runtime_error(format("No leaving replicas"));
+        return {};
     }
     if (leaving.size() > 1) {
         throw std::runtime_error(format("More than one leaving replica"));
@@ -285,8 +291,8 @@ std::optional<shard_id> tablet_map::get_shard(tablet_id tid, host_id host) const
     }
 
     auto tinfo = get_tablet_transition_info(tid);
-    if (tinfo && tinfo->pending_replica.host == host) {
-        return tinfo->pending_replica.shard;
+    if (tinfo && tinfo->pending_replica && tinfo->pending_replica->host == host) {
+        return tinfo->pending_replica->shard;
     }
 
     return std::nullopt;
@@ -527,6 +533,7 @@ future<bool> check_tablet_replica_shards(const tablet_metadata& tm, host_id this
 class tablet_effective_replication_map : public effective_replication_map {
     table_id _table;
     tablet_sharder _sharder;
+    mutable const tablet_map* _tmap = nullptr;
 private:
     inet_address_vector_replica_set to_replica_set(const tablet_replica_set& replicas) const {
         inet_address_vector_replica_set result;
@@ -551,7 +558,10 @@ private:
     }
 
     const tablet_map& get_tablet_map() const {
-        return _tmptr->tablets().get_tablet_map(_table);
+        if (!_tmap) {
+            _tmap = &_tmptr->tablets().get_tablet_map(_table);
+        }
+        return *_tmap;
     }
 
     const tablet_replica_set& get_replicas_for_write(dht::token search_token) const {
@@ -630,9 +640,12 @@ public:
             case write_replica_set_selector::previous:
                 return {};
             case write_replica_set_selector::both:
+                if (!info->pending_replica) {
+                    return {};
+                }
                 tablet_logger.trace("get_pending_endpoints({}): table={}, tablet={}, replica={}",
-                                    search_token, _table, tablet, info->pending_replica);
-                return {_tmptr->get_endpoint_for_host_id(info->pending_replica.host)};
+                                    search_token, _table, tablet, *info->pending_replica);
+                return {_tmptr->get_endpoint_for_host_id(info->pending_replica->host)};
             case write_replica_set_selector::next:
                 return {};
         }
@@ -691,7 +704,7 @@ public:
         }
 
         auto tinfo = tablets.get_tablet_transition_info(tid);
-        if (tinfo && tinfo->pending_replica.host == host && tinfo->pending_replica.shard == shard) {
+        if (tinfo && tinfo->pending_replica && tinfo->pending_replica->host == host && tinfo->pending_replica->shard == shard) {
             return std::nullopt; // routed correctly
         }
 
@@ -700,7 +713,7 @@ public:
 
     virtual bool has_pending_ranges(locator::host_id host_id) const override {
         for (const auto& [id, transition_info]: get_tablet_map().transitions()) {
-            if (transition_info.pending_replica.host == host_id) {
+            if (transition_info.pending_replica && transition_info.pending_replica->host == host_id) {
                 return true;
             }
         }

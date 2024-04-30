@@ -8,6 +8,7 @@
 
 #include <boost/algorithm/cxx11/all_of.hpp>
 #include <boost/range/combine.hpp>
+#include <fmt/ranges.h>
 #include "test/lib/scylla_test_case.hh"
 
 #include "dht/i_partitioner.hh"
@@ -16,10 +17,12 @@
 #include "schema/schema.hh"
 #include "types/types.hh"
 #include "schema/schema_builder.hh"
+#include "utils/to_string.hh"
 
 #include "test/lib/simple_schema.hh"
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
+#include "test/lib/test_utils.hh"
 #include "test/boost/total_order_check.hh"
 
 template <typename... Args>
@@ -523,14 +526,16 @@ do_test_selective_token_range_sharder(const dht::sharder& input_sharder, const s
             if (range_shard->start() && range_shard->start()->is_inclusive()) {
                 auto start_shard = input_sharder.shard_of(range_shard->start()->value());
                 if (debug) {
-                    std::cout << " start_shard " << start_shard << " shard " << shard << " range " << range_shard << "\n";
+                    fmt::print(" start_shard {} shard {} range {}\n",
+                               start_shard, shard, range_shard);
                 }
                 BOOST_REQUIRE(start_shard == shard);
             }
             if (range_shard->end() && range_shard->end()->is_inclusive()) {
                 auto end_shard = input_sharder.shard_of(range_shard->end()->value());
                 if (debug) {
-                    std::cout << " end_shard " << end_shard << " shard " << shard << " range " << range_shard << "\n";
+                    fmt::print(" end_shard {} shard range {}\n",
+                               end_shard, shard, range_shard);
                 }
                 BOOST_REQUIRE(end_shard == shard);
             }
@@ -539,7 +544,8 @@ do_test_selective_token_range_sharder(const dht::sharder& input_sharder, const s
                     range_shard->end() ? range_shard->end()->value() : dht::minimum_token());
             auto mid_shard = input_sharder.shard_of(midpoint);
             if (debug) {
-                std::cout << " mid " << mid_shard << " shard " << shard << " range " << range_shard << "\n";
+                fmt::print(" mid {} shard {} range {}\n",
+                           mid_shard, shard, range_shard);
             }
             BOOST_REQUIRE(mid_shard == shard);
 

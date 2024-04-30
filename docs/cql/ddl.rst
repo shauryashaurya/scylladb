@@ -352,8 +352,7 @@ For instance::
         common_name text,
         population varint,
         average_size int
-    ) WITH comment='Important biological records'
-       AND read_repair_chance = 1.0;
+    ) WITH comment='Important biological records';
 
     CREATE TABLE timeline (
         userid uuid,
@@ -658,14 +657,6 @@ A table supports the following options:
      - simple
      - none
      - A free-form, human-readable comment.
-   * - ``read_repair_chance``
-     - simple
-     - 0
-     - The probability that extra nodes are queried (e.g. more nodes than required by the consistency level) for the purpose of read repairs.
-   * - ``dclocal_read_repair_chance``
-     - simple
-     - 0
-     - The probability that extra nodes are queried (e.g. more nodes than required by the consistency level) belonging to the same data center as the read coordinator for the purpose of read repairs.
    * - ``speculative_retry``
      - simple
      - 99PERCENTILE
@@ -862,7 +853,8 @@ time may result in the resurrection of deleted data.
 
 The ``tombstone_gc`` option allows you to prevent data resurrection. With the ``repair`` mode configured, :term:`tombstone` 
 are only removed after :term:`repair` is performed. Unlike  ``gc_grace_seconds``, ``tombstone_gc`` has no time constraints - when 
-the ``repair`` mode is on, tombstones garbage collection will wait until repair is run. 
+the ``repair`` mode is on, tombstones garbage collection will wait until repair is run. For tables which use tablets ``repair``
+mode is set by default.
 
 You can enable the after-repair tombstone GC by setting the ``repair`` mode using 
 ``ALTER TABLE`` or ``CREATE TABLE``. For example:
@@ -934,8 +926,7 @@ For instance:
     ALTER TABLE addamsFamily ADD gravesite varchar;
 
     ALTER TABLE addamsFamily
-           WITH comment = 'A most excellent and useful table'
-           AND read_repair_chance = 0.2;
+           WITH comment = 'A most excellent and useful table';
 
 
     ALTER TABLE data_atrest (

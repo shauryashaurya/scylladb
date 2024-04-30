@@ -35,15 +35,14 @@ large_data_handler::large_data_handler(uint64_t partition_threshold_bytes, uint6
         partition_threshold_bytes, row_threshold_bytes, cell_threshold_bytes, rows_count_threshold, _collection_elements_count_threshold);
 }
 
-future<large_data_handler::partition_above_threshold> large_data_handler::maybe_record_large_partitions(const sstables::sstable& sst, const sstables::key& key, uint64_t partition_size, uint64_t rows) {
+future<large_data_handler::partition_above_threshold> large_data_handler::maybe_record_large_partitions(const sstables::sstable& sst, const sstables::key& key, uint64_t partition_size, uint64_t rows, uint64_t range_tombstones) {
     assert(running());
     partition_above_threshold above_threshold{partition_size > _partition_threshold_bytes, rows > _rows_count_threshold};
-    if (above_threshold.size) [[unlikely]] {
-        ++_stats.partitions_bigger_than_threshold;
-    }
+    static_assert(std::is_same_v<decltype(above_threshold.size), bool>);
+    _stats.partitions_bigger_than_threshold += above_threshold.size; // increment if true
     if (above_threshold.size || above_threshold.rows) [[unlikely]] {
-        return with_sem([&sst, &key, partition_size, rows, this] {
-            return record_large_partitions(sst, key, partition_size, rows);
+        return with_sem([&sst, &key, partition_size, rows, range_tombstones, this] {
+            return record_large_partitions(sst, key, partition_size, rows, range_tombstones);
         }).then([above_threshold] {
             return above_threshold;
         });
@@ -155,7 +154,7 @@ future<> cql_table_large_data_handler::try_record(std::string_view large_table, 
     const auto sstable_name = large_data_handler::sst_filename(sst);
     std::string pk_str = key_to_str(partition_key.to_partition_key(s), s);
     auto timestamp = db_clock::now();
-    large_data_logger.warn("Writing large {} {}/{}: {}{} ({} bytes) to {}", desc, ks_name, cf_name, pk_str, extra_path, size, sstable_name);
+    large_data_logger.warn("Writing large {} {}/{}: {} ({} bytes) to {}", desc, ks_name, cf_name, extra_path, size, sstable_name);
     return _sys_ks->execute_cql(req, ks_name, cf_name, sstable_name, size, pk_str, timestamp, args...)
             .discard_result()
             .handle_exception([ks_name, cf_name, large_table, sstable_name] (std::exception_ptr ep) {
@@ -165,8 +164,8 @@ future<> cql_table_large_data_handler::try_record(std::string_view large_table, 
             .finally([ p = _sys_ks ] {});
 }
 
-future<> cql_table_large_data_handler::record_large_partitions(const sstables::sstable& sst, const sstables::key& key, uint64_t partition_size, uint64_t rows) const {
-    return try_record("partition", sst, key, int64_t(partition_size), "partition", "", {"rows"}, data_value((int64_t)rows));
+future<> cql_table_large_data_handler::record_large_partitions(const sstables::sstable& sst, const sstables::key& key, uint64_t partition_size, uint64_t rows, uint64_t range_tombstones) const {
+    return try_record("partition", sst, key, int64_t(partition_size), "partition", "", {"rows", "range_tombstones"}, data_value((int64_t)rows), data_value((int64_t)range_tombstones));
 }
 
 future<> cql_table_large_data_handler::record_large_cells(const sstables::sstable& sst, const sstables::key& partition_key,
@@ -182,10 +181,10 @@ future<> cql_table_large_data_handler::internal_record_large_cells(const sstable
     if (clustering_key) {
         const schema &s = *sst.get_schema();
         auto ck_str = key_to_str(*clustering_key, s);
-        return try_record("cell", sst, partition_key, int64_t(cell_size), cell_type, format("/{}/{}", ck_str, column_name), extra_fields, ck_str, column_name);
+        return try_record("cell", sst, partition_key, int64_t(cell_size), cell_type, column_name, extra_fields, ck_str, column_name);
     } else {
         auto desc = format("static {}", cell_type);
-        return try_record("cell", sst, partition_key, int64_t(cell_size), desc, format("//{}", column_name), extra_fields, data_value::make_null(utf8_type), column_name);
+        return try_record("cell", sst, partition_key, int64_t(cell_size), desc, column_name, extra_fields, data_value::make_null(utf8_type), column_name);
     }
 }
 
@@ -197,10 +196,10 @@ future<> cql_table_large_data_handler::internal_record_large_cells_and_collectio
     if (clustering_key) {
         const schema &s = *sst.get_schema();
         auto ck_str = key_to_str(*clustering_key, s);
-        return try_record("cell", sst, partition_key, int64_t(cell_size), cell_type, format("/{}/{}", ck_str, column_name), extra_fields, ck_str, column_name, data_value((int64_t)collection_elements));
+        return try_record("cell", sst, partition_key, int64_t(cell_size), cell_type, column_name, extra_fields, ck_str, column_name, data_value((int64_t)collection_elements));
     } else {
         auto desc = format("static {}", cell_type);
-        return try_record("cell", sst, partition_key, int64_t(cell_size), desc, format("//{}", column_name), extra_fields, data_value::make_null(utf8_type), column_name, data_value((int64_t)collection_elements));
+        return try_record("cell", sst, partition_key, int64_t(cell_size), desc, column_name, extra_fields, data_value::make_null(utf8_type), column_name, data_value((int64_t)collection_elements));
     }
 }
 
@@ -210,7 +209,7 @@ future<> cql_table_large_data_handler::record_large_rows(const sstables::sstable
     if (clustering_key) {
         const schema &s = *sst.get_schema();
         std::string ck_str = key_to_str(*clustering_key, s);
-        return try_record("row", sst, partition_key, int64_t(row_size), "row", format("/{}", ck_str), extra_fields,  ck_str);
+        return try_record("row", sst, partition_key, int64_t(row_size), "row", "", extra_fields, ck_str);
     } else {
         return try_record("row", sst, partition_key, int64_t(row_size), "static row", "", extra_fields, data_value::make_null(utf8_type));
     }

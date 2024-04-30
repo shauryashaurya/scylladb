@@ -36,6 +36,7 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/scheduling.hh>
 #include "locator/token_metadata.hh"
+#include "locator/types.hh"
 
 namespace db {
 class config;
@@ -75,6 +76,15 @@ struct gossip_config {
     uint32_t shutdown_announce_ms = 2 * 1000;
     uint32_t skip_wait_for_gossip_to_settle = -1;
 };
+
+struct loaded_endpoint_state {
+    gms::inet_address endpoint;
+    std::unordered_set<dht::token> tokens;
+    std::optional<locator::endpoint_dc_rack> opt_dc_rack;
+    std::optional<gms::versioned_value> opt_status;
+};
+
+std::ostream& operator<<(std::ostream& os, const loaded_endpoint_state& st);
 
 /**
  * This module is responsible for Gossiping information for the local endpoint. This abstraction
@@ -139,6 +149,9 @@ public:
         return _gcfg.partitioner;
     }
 
+    locator::host_id my_host_id() const noexcept {
+        return get_token_metadata_ptr()->get_topology().my_host_id();
+    }
     inet_address get_broadcast_address() const noexcept {
         return get_token_metadata_ptr()->get_topology().my_address();
     }
@@ -246,6 +259,8 @@ private:
 
     bool _in_shadow_round = false;
 
+    service::topology_state_machine* topo_sm = nullptr;
+
     // Must be called on shard 0.
     future<semaphore_units<>> lock_endpoint_update_semaphore();
 
@@ -316,6 +331,11 @@ public:
      */
     version_type get_max_endpoint_state_version(const endpoint_state& state) const noexcept;
 
+    void set_topology_state_machine(service::topology_state_machine* m) {
+        topo_sm = m;
+        // In raft topology mode the coodinator maintains banned nodes list
+        _just_removed_endpoints.clear();
+    }
 
 private:
     /**
@@ -468,6 +488,8 @@ public:
      * @return the rpc address
      */
     sstring get_rpc_address(const inet_address& endpoint) const;
+
+    future<> real_mark_alive(inet_address addr);
 private:
     // FIXME: for now, allow modifying the endpoint_state's heartbeat_state in place
     // Gets or creates endpoint_state for this node
@@ -484,8 +506,6 @@ private:
     void update_timestamp_for_nodes(const std::map<inet_address, endpoint_state>& map);
 
     void mark_alive(inet_address addr);
-
-    future<> real_mark_alive(inet_address addr);
 
     // Must be called under lock_endpoint.
     future<> mark_dead(inet_address addr, endpoint_state_ptr local_state, permit_id);
@@ -608,7 +628,7 @@ public:
     /**
      * Add an endpoint we knew about previously, but whose state is unknown
      */
-    future<> add_saved_endpoint(inet_address ep, permit_id);
+    future<> add_saved_endpoint(locator::host_id host_id, loaded_endpoint_state st, permit_id);
 
     future<> add_local_application_state(application_state state, versioned_value value);
 
@@ -704,3 +724,9 @@ struct gossip_get_endpoint_states_response {
 };
 
 } // namespace gms
+
+template <>
+struct fmt::formatter<gms::loaded_endpoint_state> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const gms::loaded_endpoint_state&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

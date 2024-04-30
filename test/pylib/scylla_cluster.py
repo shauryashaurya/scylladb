@@ -86,7 +86,6 @@ def make_scylla_conf(mode: str, workdir: pathlib.Path, host_addr: str, seed_addr
         'enable_user_defined_functions': True,
         'experimental_features': ['udf',
                                   'alternator-streams',
-                                  'consistent-topology-changes',
                                   'broadcast-tables',
                                   'keyspace-storage-options'],
 
@@ -137,6 +136,7 @@ SCYLLA_CMDLINE_OPTIONS = [
     '--abort-on-internal-error', '1',
     '--abort-on-ebadf', '1',
     '--logger-log-level', 'raft_topology=debug',
+    '--logger-log-level', 'query_processor=debug',
 ]
 
 # [--smp, 1], [--smp, 2] -> [--smp, 2]

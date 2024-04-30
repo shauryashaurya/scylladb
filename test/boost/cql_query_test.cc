@@ -14,6 +14,8 @@
 #include <boost/test/unit_test.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 
+#include <fmt/ranges.h>
+
 #include <seastar/net/inet_address.hh>
 
 #include "test/lib/scylla_test_case.hh"
@@ -4113,13 +4115,11 @@ SEASTAR_TEST_CASE(test_describe_simple_schema) {
                 "    AND compaction = {'class': 'SizeTieredCompactionStrategy'}\n"
                 "    AND compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}\n"
                 "    AND crc_check_chance = 1\n"
-                "    AND dclocal_read_repair_chance = 0.1\n"
                 "    AND default_time_to_live = 0\n"
                 "    AND gc_grace_seconds = 864000\n"
                 "    AND max_index_interval = 2048\n"
                 "    AND memtable_flush_period_in_ms = 0\n"
                 "    AND min_index_interval = 128\n"
-                "    AND read_repair_chance = 0\n"
                 "    AND speculative_retry = '99.0PERCENTILE'\n"
                 "    AND paxos_grace_seconds = 43200\n"
                 "    AND tombstone_gc = {'mode': 'timeout', 'propagation_delay_in_seconds': '3600'};\n"
@@ -4137,13 +4137,11 @@ SEASTAR_TEST_CASE(test_describe_simple_schema) {
                 "    AND compaction = {'class': 'SizeTieredCompactionStrategy'}\n"
                 "    AND compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}\n"
                 "    AND crc_check_chance = 1\n"
-                "    AND dclocal_read_repair_chance = 0.1\n"
                 "    AND default_time_to_live = 0\n"
                 "    AND gc_grace_seconds = 864000\n"
                 "    AND max_index_interval = 2048\n"
                 "    AND memtable_flush_period_in_ms = 0\n"
                 "    AND min_index_interval = 128\n"
-                "    AND read_repair_chance = 0\n"
                 "    AND speculative_retry = '99.0PERCENTILE'\n"
                 "    AND paxos_grace_seconds = 43200\n"
                 "    AND tombstone_gc = {'mode': 'timeout', 'propagation_delay_in_seconds': '3600'};\n"
@@ -4161,13 +4159,11 @@ SEASTAR_TEST_CASE(test_describe_simple_schema) {
                 "    AND compaction = {'class': 'SizeTieredCompactionStrategy'}\n"
                 "    AND compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}\n"
                 "    AND crc_check_chance = 1\n"
-                "    AND dclocal_read_repair_chance = 0.2\n"
                 "    AND default_time_to_live = 0\n"
                 "    AND gc_grace_seconds = 954000\n"
                 "    AND max_index_interval = 3048\n"
                 "    AND memtable_flush_period_in_ms = 10\n"
                 "    AND min_index_interval = 128\n"
-                "    AND read_repair_chance = 0\n"
                 "    AND speculative_retry = '99.0PERCENTILE'\n"
                 "    AND paxos_grace_seconds = 43200\n"
                 "    AND tombstone_gc = {'mode': 'timeout', 'propagation_delay_in_seconds': '3600'};\n"
@@ -4186,13 +4182,11 @@ SEASTAR_TEST_CASE(test_describe_simple_schema) {
                 "    AND compaction = {'class': 'SizeTieredCompactionStrategy'}\n"
                 "    AND compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}\n"
                 "    AND crc_check_chance = 1\n"
-                "    AND dclocal_read_repair_chance = 0.2\n"
                 "    AND default_time_to_live = 0\n"
                 "    AND gc_grace_seconds = 954000\n"
                 "    AND max_index_interval = 3048\n"
                 "    AND memtable_flush_period_in_ms = 10\n"
                 "    AND min_index_interval = 128\n"
-                "    AND read_repair_chance = 0\n"
                 "    AND speculative_retry = '99.0PERCENTILE'\n"
                 "    AND paxos_grace_seconds = 43200\n"
                 "    AND tombstone_gc = {'mode': 'timeout', 'propagation_delay_in_seconds': '3600'};\n"
@@ -4210,13 +4204,11 @@ SEASTAR_TEST_CASE(test_describe_simple_schema) {
                 "    AND compaction = {'class': 'SizeTieredCompactionStrategy'}\n"
                 "    AND compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}\n"
                 "    AND crc_check_chance = 1\n"
-                "    AND dclocal_read_repair_chance = 0.2\n"
                 "    AND default_time_to_live = 0\n"
                 "    AND gc_grace_seconds = 954000\n"
                 "    AND max_index_interval = 3048\n"
                 "    AND memtable_flush_period_in_ms = 10\n"
                 "    AND min_index_interval = 128\n"
-                "    AND read_repair_chance = 0\n"
                 "    AND speculative_retry = '99.0PERCENTILE'\n"
                 "    AND paxos_grace_seconds = 43200\n"
                 "    AND tombstone_gc = {'mode': 'timeout', 'propagation_delay_in_seconds': '3600'};\n"
@@ -4255,13 +4247,11 @@ SEASTAR_TEST_CASE(test_describe_view_schema) {
                 "    AND compaction = {'class': 'SizeTieredCompactionStrategy'}\n"
                 "    AND compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}\n"
                 "    AND crc_check_chance = 1\n"
-                "    AND dclocal_read_repair_chance = 0.1\n"
                 "    AND default_time_to_live = 0\n"
                 "    AND gc_grace_seconds = 864000\n"
                 "    AND max_index_interval = 2048\n"
                 "    AND memtable_flush_period_in_ms = 0\n"
                 "    AND min_index_interval = 128\n"
-                "    AND read_repair_chance = 0\n"
                 "    AND speculative_retry = '99.0PERCENTILE'\n"
                 "    AND paxos_grace_seconds = 43200\n"
                 "    AND tombstone_gc = {'mode': 'timeout', 'propagation_delay_in_seconds': '3600'};\n";
@@ -4279,13 +4269,11 @@ SEASTAR_TEST_CASE(test_describe_view_schema) {
               "    AND compaction = {'class': 'SizeTieredCompactionStrategy'}\n"
               "    AND compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}\n"
               "    AND crc_check_chance = 1\n"
-              "    AND dclocal_read_repair_chance = 0.1\n"
               "    AND default_time_to_live = 0\n"
               "    AND gc_grace_seconds = 864000\n"
               "    AND max_index_interval = 2048\n"
               "    AND memtable_flush_period_in_ms = 0\n"
               "    AND min_index_interval = 128\n"
-              "    AND read_repair_chance = 0\n"
               "    AND speculative_retry = '99.0PERCENTILE'\n"
               "    AND paxos_grace_seconds = 43200\n"
               "    AND tombstone_gc = {'mode': 'timeout', 'propagation_delay_in_seconds': '3600'};\n"},
@@ -5710,7 +5698,6 @@ cql_test_config tablet_cql_test_config() {
     cql_test_config c;
     c.db_config->experimental_features({
             db::experimental_features_t::feature::TABLETS,
-            db::experimental_features_t::feature::CONSISTENT_TOPOLOGY_CHANGES,
         }, db::config::config_source::CommandLine);
     return c;
 }

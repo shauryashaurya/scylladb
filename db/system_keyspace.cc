@@ -11,6 +11,7 @@
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/functional/hash.hpp>
 #include <boost/icl/interval_map.hpp>
+#include <fmt/ranges.h>
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
@@ -666,7 +667,8 @@ schema_ptr system_keyspace::size_estimates() {
         // regular columns
         {
             {"rows", long_type},
-            {"compaction_time", timestamp_type}
+            {"compaction_time", timestamp_type},
+            {"range_tombstones", long_type}
         },
         // static columns
         {},
@@ -1239,13 +1241,11 @@ schema_ptr system_keyspace::legacy::column_families() {
          {"gc_grace_seconds", int32_type},
          {"is_dense", boolean_type},
          {"key_validator", utf8_type},
-         {"local_read_repair_chance", double_type},
          {"max_compaction_threshold", int32_type},
          {"max_index_interval", int32_type},
          {"memtable_flush_period_in_ms", int32_type},
          {"min_compaction_threshold", int32_type},
          {"min_index_interval", int32_type},
-         {"read_repair_chance", double_type},
          {"speculative_retry", utf8_type},
          {"subcomparator", utf8_type},
          {"type", utf8_type},
@@ -1509,25 +1509,6 @@ future<> system_keyspace::peers_table_read_fixup() {
             it->second = {peer, ts};
         }
     }
-}
-
-future<std::unordered_map<gms::inet_address, locator::endpoint_dc_rack>> system_keyspace::load_dc_rack_info() {
-    co_await peers_table_read_fixup();
-
-    const auto msg = co_await execute_cql(format("SELECT peer, data_center, rack from system.{}", PEERS));
-
-    std::unordered_map<gms::inet_address, locator::endpoint_dc_rack> ret;
-    for (const auto& row : *msg) {
-        if (!row.has("data_center") || !row.has("rack")) {
-            continue;
-        }
-        ret.emplace(row.get_as<net::inet_address>("peer"), locator::endpoint_dc_rack {
-            row.get_as<sstring>("data_center"),
-            row.get_as<sstring>("rack")
-        });
-    }
-
-    co_return ret;
 }
 
 future<> system_keyspace::build_bootstrap_info() {
@@ -1807,6 +1788,50 @@ future<std::unordered_map<gms::inet_address, locator::host_id>> system_keyspace:
         ret.emplace(gms::inet_address(row.get_as<net::inet_address>("peer")),
             locator::host_id(row.get_as<utils::UUID>("host_id")));
     }
+    co_return ret;
+}
+
+future<std::unordered_map<locator::host_id, gms::loaded_endpoint_state>> system_keyspace::load_endpoint_state() {
+    co_await peers_table_read_fixup();
+
+    const auto msg = co_await execute_cql(format("SELECT peer, host_id, tokens, data_center, rack from system.{}", PEERS));
+
+    std::unordered_map<locator::host_id, gms::loaded_endpoint_state> ret;
+    for (const auto& row : *msg) {
+        gms::loaded_endpoint_state st;
+        auto ep = row.get_as<net::inet_address>("peer");
+        if (!row.has("host_id")) {
+            // Must never happen after `peers_table_read_fixup` call above
+            on_internal_error_noexcept(slogger, format("load_endpoint_state: node {} has no host_id in system.{}", ep, PEERS));
+        }
+        auto host_id = locator::host_id(row.get_as<utils::UUID>("host_id"));
+        if (row.has("tokens")) {
+            st.tokens = decode_tokens(deserialize_set_column(*peers(), row, "tokens"));
+            if (st.tokens.empty()) {
+                slogger.error("load_endpoint_state: node {}/{} has tokens column present but tokens are empty", host_id, ep);
+                continue;
+            }
+        } else {
+            slogger.warn("Endpoint {} has no tokens in system.{}", ep, PEERS);
+        }
+        if (row.has("data_center") && row.has("rack")) {
+            st.opt_dc_rack.emplace(locator::endpoint_dc_rack {
+                row.get_as<sstring>("data_center"),
+                row.get_as<sstring>("rack")
+            });
+            if (st.opt_dc_rack->dc.empty() || st.opt_dc_rack->rack.empty()) {
+                slogger.error("load_endpoint_state: node {}/{} has empty dc={} or rack={}", host_id, ep, st.opt_dc_rack->dc, st.opt_dc_rack->rack);
+                continue;
+            }
+        } else {
+            slogger.warn("Endpoint {} has no {} in system.{}", ep,
+                    !row.has("data_center") && !row.has("rack") ? "data_center nor rack" : !row.has("data_center") ? "data_center" : "rack",
+                    PEERS);
+        }
+        st.endpoint = ep;
+        ret.emplace(host_id, std::move(st));
+    }
+
     co_return ret;
 }
 
@@ -2119,18 +2144,12 @@ std::vector<schema_ptr> system_keyspace::all_tables(const db::config& cfg) {
                     v3::truncated(),
                     v3::commitlog_cleanups(),
                     v3::cdc_local(),
+                    raft(), raft_snapshots(), raft_snapshot_config(), group0_history(), discovery(),
+                    topology(), cdc_generations_v3(), topology_requests(), service_levels_v2(),
     });
 
-    r.insert(r.end(), {raft(), raft_snapshots(), raft_snapshot_config(), group0_history(), discovery()});
-
-    if (cfg.check_experimental(db::experimental_features_t::feature::CONSISTENT_TOPOLOGY_CHANGES)) {
-        r.insert(r.end(), {topology(), cdc_generations_v3(), topology_requests(), service_levels_v2()});
-    }
-
-    if (cfg.check_experimental(db::experimental_features_t::feature::CONSISTENT_TOPOLOGY_CHANGES)) {
-        auto auth_tables = db::system_auth_keyspace::all_tables();
-        std::copy(auth_tables.begin(), auth_tables.end(), std::back_inserter(r));
-    }
+    auto auth_tables = db::system_auth_keyspace::all_tables();
+    std::copy(auth_tables.begin(), auth_tables.end(), std::back_inserter(r));
 
     if (cfg.check_experimental(db::experimental_features_t::feature::BROADCAST_TABLES)) {
         r.insert(r.end(), {broadcast_kv_store()});
@@ -2669,10 +2688,25 @@ future<std::optional<mutation>> system_keyspace::get_group0_schema_version() {
     return get_scylla_local_mutation(_db, "group0_schema_version");
 }
 
-static constexpr auto SERVICE_LEVELS_VERSION_KEY = "service_level_version";
+static constexpr auto AUTH_VERSION_KEY = "auth_version";
 
-future<std::optional<mutation>> system_keyspace::get_service_levels_version_mutation() {
-    return get_scylla_local_mutation(_db, SERVICE_LEVELS_VERSION_KEY);
+future<system_auth_keyspace::version_t> system_keyspace::get_auth_version() {
+    auto str_opt = co_await get_scylla_local_param(AUTH_VERSION_KEY);
+    if (!str_opt) {
+        co_return db::system_auth_keyspace::version_t::v1;
+    }
+    auto& str = *str_opt;
+    if (str == "" || str == "1") {
+        co_return db::system_auth_keyspace::version_t::v1;
+    }
+    if (str == "2") {
+        co_return db::system_auth_keyspace::version_t::v2;
+    }
+    on_internal_error(slogger, fmt::format("unexpected auth_version in scylla_local got {}", str));
+}
+
+future<std::optional<mutation>> system_keyspace::get_auth_version_mutation() {
+    return get_scylla_local_mutation(_db, AUTH_VERSION_KEY);
 }
 
 static service::query_state& internal_system_query_state() {
@@ -2683,6 +2717,21 @@ static service::query_state& internal_system_query_state() {
     static thread_local service::query_state qs(cs, empty_service_permit());
     return qs;
 };
+
+future<mutation> system_keyspace::make_auth_version_mutation(api::timestamp_type ts, db::system_auth_keyspace::version_t version) {
+    static sstring query = format("INSERT INTO {}.{} (key, value) VALUES (?, ?);", db::system_keyspace::NAME, db::system_keyspace::SCYLLA_LOCAL);
+    auto muts = co_await _qp.get_mutations_internal(query, internal_system_query_state(), ts, {AUTH_VERSION_KEY, std::to_string(int64_t(version))});
+    if (muts.size() != 1) {
+         on_internal_error(slogger, fmt::format("expected 1 auth_version mutation got {}", muts.size()));
+    }
+    co_return std::move(muts[0]);
+}
+
+static constexpr auto SERVICE_LEVELS_VERSION_KEY = "service_level_version";
+
+future<std::optional<mutation>> system_keyspace::get_service_levels_version_mutation() {
+    return get_scylla_local_mutation(_db, SERVICE_LEVELS_VERSION_KEY);
+}
 
 future<mutation> system_keyspace::make_service_levels_version_mutation(int8_t version, const service::group0_guard& guard) {
     static sstring query = format("INSERT INTO {}.{} (key, value) VALUES (?, ?);", db::system_keyspace::NAME, db::system_keyspace::SCYLLA_LOCAL);

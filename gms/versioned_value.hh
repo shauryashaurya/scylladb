@@ -17,7 +17,6 @@
 #include "gms/inet_address.hh"
 #include "dht/token.hh"
 #include "schema/schema_fwd.hh"
-#include "utils/to_string.hh"
 #include "version.hh"
 #include "cdc/generation_id.hh"
 #include <unordered_set>
@@ -198,7 +197,7 @@ public:
 
 } // namespace gms
 
-template <> struct fmt::formatter<gms::versioned_value> : fmt::formatter<std::string_view> {
+template <> struct fmt::formatter<gms::versioned_value> : fmt::formatter<string_view> {
     auto format(const gms::versioned_value& v, fmt::format_context& ctx) const {
         return fmt::format_to(ctx.out(), "Value({},{})", v.value(), v.version());
     }

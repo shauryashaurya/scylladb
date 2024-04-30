@@ -409,7 +409,6 @@ public:
         seastar::scheduling_group streaming_scheduling_group;
         bool enable_metrics_reporting = false;
         bool enable_node_aggregated_table_metrics = true;
-        db::timeout_semaphore* view_update_concurrency_semaphore;
         size_t view_update_concurrency_semaphore_limit;
         db::data_listeners* data_listeners = nullptr;
         // Not really table-specific (it's a global configuration parameter), but stored here
@@ -421,10 +420,7 @@ public:
         utils::updateable_value<bool> enable_compacting_data_for_streaming_and_repair;
     };
 
-    struct snapshot_details {
-        int64_t total;
-        int64_t live;
-    };
+    using snapshot_details = db::snapshot_ctl::table_snapshot_details;
     struct cache_hit_rate {
         cache_temperature rate;
         lowres_clock::time_point last_updated;
@@ -591,6 +587,8 @@ private:
     // Select a compaction group from a given token.
     std::pair<size_t, locator::tablet_range_side> storage_group_of(dht::token token) const noexcept;
     storage_group* storage_group_for_token(dht::token token) const noexcept;
+    // FIXME: Cannot return nullptr, signature can be changed to return storage_group&.
+    storage_group* storage_group_for_id(size_t i) const;
 
     std::unique_ptr<storage_group_manager> make_storage_group_manager();
     // Return compaction group if table owns a single one. Otherwise, null is returned.
@@ -607,7 +605,7 @@ private:
     // Returns a list of all compaction groups.
     compaction_group_list& compaction_groups() const noexcept;
     // Returns a list of all storage groups.
-    const storage_group_vector& storage_groups() const noexcept;
+    const storage_group_map& storage_groups() const noexcept;
     // Safely iterate through compaction groups, while performing async operations on them.
     future<> parallel_foreach_compaction_group(std::function<future<>(compaction_group&)> action);
 
@@ -934,6 +932,7 @@ public:
     static future<> snapshot_on_all_shards(sharded<database>& sharded_db, const global_table_ptr& table_shards, sstring name);
 
     future<std::unordered_map<sstring, snapshot_details>> get_snapshot_details();
+    static future<snapshot_details> get_snapshot_details(std::filesystem::path snapshot_dir, std::filesystem::path datadir);
 
     /*!
      * \brief write the schema to a 'schema.cql' file at the given directory.
@@ -1026,7 +1025,11 @@ public:
         return _view_stats;
     }
 
-    replica::cf_stats* cf_stats() {
+    db::view::stats& view_stats() const noexcept {
+        return _view_stats;
+    }
+
+    replica::cf_stats* cf_stats() const {
         return _config.cf_stats;
     }
 
@@ -1143,14 +1146,6 @@ public:
         return _sstables_manager;
     }
 
-    // Reader's schema must be the same as the base schema of each of the views.
-    future<> populate_views(
-            shared_ptr<db::view::view_update_generator> gen,
-            std::vector<db::view::view_and_base>,
-            dht::token base_token,
-            flat_mutation_reader_v2&&,
-            gc_clock::time_point);
-
     reader_concurrency_semaphore& streaming_read_concurrency_semaphore() {
         return *_config.streaming_read_concurrency_semaphore;
     }
@@ -1165,13 +1160,6 @@ private:
     future<row_locker::lock_holder> do_push_view_replica_updates(shared_ptr<db::view::view_update_generator> gen, schema_ptr s, mutation m, db::timeout_clock::time_point timeout, mutation_source source,
             tracing::trace_state_ptr tr_state, reader_concurrency_semaphore& sem, query::partition_slice::option_set custom_opts) const;
     std::vector<view_ptr> affected_views(shared_ptr<db::view::view_update_generator> gen, const schema_ptr& base, const mutation& update) const;
-    future<> generate_and_propagate_view_updates(shared_ptr<db::view::view_update_generator> gen, const schema_ptr& base,
-            reader_permit permit,
-            std::vector<db::view::view_and_base>&& views,
-            mutation&& m,
-            flat_mutation_reader_v2_opt existings,
-            tracing::trace_state_ptr tr_state,
-            gc_clock::time_point now) const;
 
     mutable row_locker _row_locker;
     future<row_locker::lock_holder> local_base_lock(
@@ -1271,7 +1259,6 @@ public:
         seastar::scheduling_group statement_scheduling_group;
         seastar::scheduling_group streaming_scheduling_group;
         bool enable_metrics_reporting = false;
-        db::timeout_semaphore* view_update_concurrency_semaphore = nullptr;
         size_t view_update_concurrency_semaphore_limit;
     };
 private:
@@ -1509,8 +1496,6 @@ private:
     const locator::shared_token_metadata& _shared_token_metadata;
     wasm::manager& _wasm;
 
-    sharded<sstables::directory_semaphore>& _sst_dir_semaphore;
-
     utils::cross_shard_barrier _stop_barrier;
 
     db::rate_limiter _rate_limiter;
@@ -1599,7 +1584,7 @@ public:
     future<> parse_system_tables(distributed<service::storage_proxy>&, sharded<db::system_keyspace>&);
 
     database(const db::config&, database_config dbcfg, service::migration_notifier& mn, gms::feature_service& feat, const locator::shared_token_metadata& stm,
-            compaction_manager& cm, sstables::storage_manager& sstm, wasm::manager& wasm, sharded<sstables::directory_semaphore>& sst_dir_sem, utils::cross_shard_barrier barrier = utils::cross_shard_barrier(utils::cross_shard_barrier::solo{}) /* for single-shard usage */);
+            compaction_manager& cm, sstables::storage_manager& sstm, wasm::manager& wasm, sstables::directory_semaphore& sst_dir_sem, utils::cross_shard_barrier barrier = utils::cross_shard_barrier(utils::cross_shard_barrier::solo{}) /* for single-shard usage */);
     database(database&&) = delete;
     ~database();
 
@@ -1746,13 +1731,8 @@ public:
      */
     future<> clear_snapshot(sstring tag, std::vector<sstring> keyspace_names, const sstring& table_name);
 
-    struct snapshot_details_result {
-        sstring snapshot_name;
-        db::snapshot_ctl::snapshot_details details;
-        bool operator==(const snapshot_details_result&) const = default;
-    };
-
-    future<std::vector<snapshot_details_result>> get_snapshot_details();
+    using snapshot_details = db::snapshot_ctl::db_snapshot_details;
+    future<std::unordered_map<sstring, snapshot_details>> get_snapshot_details();
 
     friend std::ostream& operator<<(std::ostream& out, const database& db);
     const flat_hash_map<sstring, keyspace>& get_keyspaces() const {
@@ -1885,12 +1865,11 @@ public:
     future<reader_permit> obtain_reader_permit(schema_ptr schema, const char* const op_name, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr);
 
     bool is_internal_query() const;
-
-    sharded<sstables::directory_semaphore>& get_sharded_sst_dir_semaphore() {
-        return _sst_dir_semaphore;
-    }
-
     bool is_user_semaphore(const reader_concurrency_semaphore& semaphore) const;
+
+    db::timeout_semaphore& view_update_sem() {
+        return _view_update_concurrency_sem;
+    }
 };
 
 } // namespace replica

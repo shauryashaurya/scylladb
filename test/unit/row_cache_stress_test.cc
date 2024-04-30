@@ -16,6 +16,7 @@
 #include "partition_slice_builder.hh"
 #include "utils/int_range.hh"
 #include "utils/div_ceil.hh"
+#include "utils/to_string.hh"
 #include "test/lib/memtable_snapshot_source.hh"
 #include <seastar/core/reactor.hh>
 #include <fmt/core.h>
@@ -187,7 +188,7 @@ struct reader_id {
 } // namespace row_cache_stress_test
 
 // TODO: use format_as() after {fmt} v10
-template <> struct fmt::formatter<row_cache_stress_test::reader_id> : fmt::formatter<std::string_view> {
+template <> struct fmt::formatter<row_cache_stress_test::reader_id> : fmt::formatter<string_view> {
     auto format(const row_cache_stress_test::reader_id& id, fmt::format_context& ctx) const {
         return fmt::format_to(ctx.out(), "{}", id.name);
     }

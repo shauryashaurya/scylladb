@@ -84,6 +84,7 @@ class range_streamer;
 namespace gms {
 class feature_service;
 class gossiper;
+class loaded_endpoint_state;
 };
 
 namespace service {
@@ -207,7 +208,7 @@ public:
 
     // Needed by distributed<>
     future<> stop();
-    void init_messaging_service(bool raft_topology_change_enabled);
+    void init_messaging_service();
     future<> uninit_messaging_service();
 
     future<> load_tablet_metadata();
@@ -337,6 +338,7 @@ private:
         locator::endpoint_dc_rack dc_rack;
         locator::host_id host_id;
         gms::inet_address address;
+        std::unordered_map<locator::host_id, gms::loaded_endpoint_state> ignore_nodes;
     };
     future<replacement_info> prepare_replacement_info(std::unordered_set<gms::inet_address> initial_contact_nodes,
             const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features);
@@ -348,7 +350,7 @@ private:
 
 public:
 
-    static std::unordered_set<gms::inet_address> parse_node_list(sstring comma_separated_list, const locator::token_metadata& tm);
+    static std::list<locator::host_id_or_endpoint> parse_node_list(sstring comma_separated_list);
 
     future<> check_for_endpoint_collision(std::unordered_set<gms::inet_address> initial_contact_nodes,
             const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features);
@@ -356,7 +358,7 @@ public:
     future<> join_cluster(sharded<db::system_distributed_keyspace>& sys_dist_ks, sharded<service::storage_proxy>& proxy,
             sharded<gms::gossiper>& gossiper_ptr, start_hint_manager start_hm, gms::generation_type new_generation);
 
-    void set_group0(service::raft_group0&, bool raft_experimental_topology);
+    void set_group0(service::raft_group0&);
 
     future<> init_address_map(raft_address_map& address_map, gms::generation_type new_generation);
 
@@ -377,7 +379,7 @@ private:
             sharded<service::storage_proxy>& proxy,
             sharded<gms::gossiper>& gossiper,
             std::unordered_set<gms::inet_address> initial_contact_nodes,
-            std::unordered_set<gms::inet_address> loaded_endpoints,
+            std::unordered_map<locator::host_id, gms::loaded_endpoint_state> loaded_endpoints,
             std::unordered_map<gms::inet_address, sstring> loaded_peer_features,
             std::chrono::milliseconds,
             start_hint_manager start_hm,
@@ -748,7 +750,6 @@ private:
 
     friend class group0_state_machine;
 
-    bool _raft_experimental_topology = false;
     enum class topology_change_kind {
         // The node is still starting and didn't determine yet which ops kind to use
         unknown,
@@ -827,6 +828,7 @@ private:
     future<> raft_rebuild(sstring source_dc);
     future<> raft_check_and_repair_cdc_streams();
     future<> update_topology_with_local_metadata(raft::server&);
+    void set_topology_change_kind(topology_change_kind kind);
 
 public:
     // This is called on all nodes for each new command received through raft
@@ -854,8 +856,11 @@ private:
     future<> _upgrade_to_topology_coordinator_fiber = make_ready_future<>();
     future<> track_upgrade_progress_to_topology_coordinator(sharded<db::system_distributed_keyspace>& sys_dist_ks, sharded<service::storage_proxy>& proxy);
 
+    future<> transit_tablet(table_id, dht::token, noncopyable_function<std::tuple<std::vector<canonical_mutation>, sstring>(const locator::tablet_map& tmap, api::timestamp_type)> prepare_mutations);
 public:
     future<> move_tablet(table_id, dht::token, locator::tablet_replica src, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
+    future<> add_tablet_replica(table_id, dht::token, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
+    future<> del_tablet_replica(table_id, dht::token, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
     future<> set_tablet_balancing_enabled(bool);
 
     // In the maintenance mode, other nodes won't be available thus we disabled joining
@@ -905,7 +910,7 @@ private:
 }
 
 template <>
-struct fmt::formatter<service::storage_service::mode> : fmt::formatter<std::string_view> {
+struct fmt::formatter<service::storage_service::mode> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(service::storage_service::mode mode, FormatContext& ctx) const {
         std::string_view name;

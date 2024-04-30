@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
+#include <fmt/ranges.h>
+
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/as_future.hh>
@@ -13,9 +15,11 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/util/noncopyable_function.hh>
+#include <variant>
 
 #include "auth/service.hh"
 #include "cdc/generation.hh"
+#include "db/system_auth_keyspace.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "db/system_keyspace.hh"
 #include "dht/boot_strapper.hh"
@@ -37,6 +41,7 @@
 #include "service/topology_state_machine.hh"
 #include "topology_mutation.hh"
 #include "utils/error_injection.hh"
+#include "utils/to_string.hh"
 #include "service/endpoint_lifecycle_subscriber.hh"
 
 #include "idl/join_node.dist.hh"
@@ -299,7 +304,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
         // Leaving the scope destroys the object and releases the guard.
     }
 
-    node_to_work_on retake_node(group0_guard guard, raft::server_id id) {
+    node_to_work_on retake_node(group0_guard guard, raft::server_id id) const {
         auto& topo = _topo_sm._topology;
 
         auto it = topo.find(id);
@@ -1098,8 +1103,12 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
                     }
 
                     if (advance_in_background(gid, tablet_state.streaming, "streaming", [&] {
-                        rtlogger.info("Initiating tablet streaming ({}) of {} to {}", trinfo.transition, gid, trinfo.pending_replica);
-                        auto dst = trinfo.pending_replica.host;
+                        if (!trinfo.pending_replica) {
+                            rtlogger.info("Skipped tablet streaming ({}) of {} as no pending replica found", trinfo.transition, gid);
+                            return make_ready_future<>();
+                        }
+                        rtlogger.info("Initiating tablet streaming ({}) of {} to {}", trinfo.transition, gid, *trinfo.pending_replica);
+                        auto dst = trinfo.pending_replica->host;
                         return ser::storage_service_rpc_verbs::send_tablet_stream_data(&_messaging,
                                    netw::msg_addr(id2ip(dst)), _as, raft::server_id(dst.uuid()), gid);
                     })) {
@@ -1139,7 +1148,12 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
                     break;
                 case locator::tablet_transition_stage::cleanup:
                     if (advance_in_background(gid, tablet_state.cleanup, "cleanup", [&] {
-                        locator::tablet_replica dst = locator::get_leaving_replica(tmap.get_tablet_info(gid.tablet), trinfo);
+                        auto maybe_dst = locator::get_leaving_replica(tmap.get_tablet_info(gid.tablet), trinfo);
+                        if (!maybe_dst) {
+                            rtlogger.info("Tablet cleanup of {} skipped because no replicas leaving", gid);
+                            return make_ready_future<>();
+                        }
+                        locator::tablet_replica& dst = *maybe_dst;
                         if (is_excluded(raft::server_id(dst.host.uuid()))) {
                             rtlogger.info("Tablet cleanup of {} on {} skipped because node is excluded", gid, dst);
                             return make_ready_future<>();
@@ -1153,7 +1167,11 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
                     break;
                 case locator::tablet_transition_stage::cleanup_target:
                     if (advance_in_background(gid, tablet_state.cleanup, "cleanup_target", [&] {
-                        locator::tablet_replica dst = trinfo.pending_replica;
+                        if (!trinfo.pending_replica) {
+                            rtlogger.info("Tablet cleanup of {} skipped because no replicas pending", gid);
+                            return make_ready_future<>();
+                        }
+                        locator::tablet_replica dst = *trinfo.pending_replica;
                         if (is_excluded(raft::server_id(dst.host.uuid()))) {
                             rtlogger.info("Tablet cleanup of {} on {} skipped because node is excluded and doesn't need to revert migration", gid, dst);
                             return make_ready_future<>();
@@ -1464,6 +1482,22 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
                         break;
                     case node_state::replacing: {
                         assert(!node.rs->ring);
+                        // Make sure all nodes are no longer trying to write to a node being replaced. This is important if the new node have the same IP, so that old write will not
+                        // go to the new node by mistake
+                        try {
+                            node = retake_node(co_await global_token_metadata_barrier(std::move(node.guard), get_excluded_nodes(node)), node.id);
+                        } catch (term_changed_error&) {
+                            throw;
+                        } catch (group0_concurrent_modification&) {
+                            throw;
+                        } catch (...) {
+                            rtlogger.error("transition_state::join_group0, "
+                                            "global_token_metadata_barrier failed, error {}",
+                                            std::current_exception());
+                            _rollback = fmt::format("global_token_metadata_barrier failed in join_group0 state {}", std::current_exception());
+                            break;
+                        }
+
                         auto replaced_id = std::get<replace_param>(node.req_param.value()).replaced_id;
                         auto it = _topo_sm._topology.normal_nodes.find(replaced_id);
                         assert(it != _topo_sm._topology.normal_nodes.end());
@@ -1635,7 +1669,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
                         co_await _group0.make_nonvoter(replaced_node_id, _as);
                     }
                 }
-
+                utils::get_local_injector().inject("crash_coordinator_before_stream", [] { abort(); });
                 raft_topology_cmd cmd{raft_topology_cmd::command::stream_ranges};
                 auto state = node.rs->state;
                 try {
@@ -1949,7 +1983,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
                         }
                     }
 
-                    if (auto* reject = std::get_if<join_node_response_params::rejected>(&validation_result)) {
+                    if (std::holds_alternative<join_node_response_params::rejected>(validation_result)) {
                         // Transition to left
                         topology_mutation_builder builder(node.guard.write_timestamp());
                         topology_request_tracking_mutation_builder rtbuilder(node.rs->request_id);
@@ -2405,9 +2439,12 @@ future<> topology_coordinator::build_coordinator_state(group0_guard guard) {
     release_guard(std::move(guard));
     co_await _group0.wait_for_all_nodes_to_finish_upgrade(_as);
 
-    rtlogger.info("migrating system_auth keyspace data");
-    co_await auth::migrate_to_auth_v2(_sys_ks.query_processor(), _group0.client(),
-            [this] (abort_source*) { return start_operation();}, _as);
+    auto auth_version = co_await _sys_ks.get_auth_version();
+    if (auth_version < db::system_auth_keyspace::version_t::v2) {
+        rtlogger.info("migrating system_auth keyspace data");
+        co_await auth::migrate_to_auth_v2(_sys_ks, _group0.client(),
+                [this] (abort_source*) { return start_operation();}, _as);
+    }
 
     auto sl_version = co_await _sys_ks.get_service_levels_version();
     if (!sl_version || *sl_version < 2) {

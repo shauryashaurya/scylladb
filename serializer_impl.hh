@@ -8,6 +8,9 @@
 
 #pragma once
 
+#include <list>
+#include <unordered_set>
+
 #include "serializer.hh"
 #include "enum_set.hh"
 #include "utils/chunked_vector.hh"

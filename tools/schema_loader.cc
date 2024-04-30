@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
+#include <fmt/ranges.h>
 #include <seastar/core/fstream.hh>
 #include <seastar/http/short_streams.hh>
 #include <seastar/util/closeable.hh>
@@ -198,6 +199,9 @@ private:
     }
     virtual replica::database& real_database(data_dictionary::database db) const override {
         throw std::bad_function_call();
+    }
+    virtual replica::database* real_database_ptr(data_dictionary::database db) const override {
+        return nullptr;
     }
 };
 
@@ -681,9 +685,7 @@ schema_ptr load_system_schema(const db::config& cfg, std::string_view keyspace, 
         {db::system_distributed_keyspace::NAME, db::system_distributed_keyspace::all_distributed_tables()},
         {db::system_distributed_keyspace::NAME_EVERYWHERE, db::system_distributed_keyspace::all_everywhere_tables()},
     };
-    if (cfg.check_experimental(db::experimental_features_t::feature::CONSISTENT_TOPOLOGY_CHANGES)) {
-        schemas[db::system_auth_keyspace::NAME] = db::system_auth_keyspace::all_tables();
-    }
+    schemas[db::system_auth_keyspace::NAME] = db::system_auth_keyspace::all_tables();
     auto ks_it = schemas.find(keyspace);
     if (ks_it == schemas.end()) {
         throw std::invalid_argument(fmt::format("unknown system keyspace: {}", keyspace));

@@ -16,6 +16,8 @@
 #include <boost/program_options.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <fmt/ranges.h>
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/print.hh>
 #include <seastar/util/log.hh>
@@ -1120,6 +1122,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , index_cache_fraction(this, "index_cache_fraction", liveness::LiveUpdate, value_status::Used, 0.2,
         "The maximum fraction of cache memory permitted for use by index cache. Clamped to the [0.0; 1.0] range. Must be small enough to not deprive the row cache of memory, but should be big enough to fit a large fraction of the index. The default value 0.2 means that at least 80\% of cache memory is reserved for the row cache, while at most 20\% is usable by the index cache.")
     , consistent_cluster_management(this, "consistent_cluster_management", value_status::Deprecated, true, "Use RAFT for cluster management and DDL.")
+    , force_gossip_topology_changes(this, "force_gossip_topology_changes", value_status::Used, false, "Force gossip-based topology operations in a fresh cluster. Only the first node in the cluster must use it. The rest will fall back to gossip-based operations anyway. This option should be used only for testing.")
     , wasm_cache_memory_fraction(this, "wasm_cache_memory_fraction", value_status::Used, 0.01, "Maximum total size of all WASM instances stored in the cache as fraction of total shard memory.")
     , wasm_cache_timeout_in_ms(this, "wasm_cache_timeout_in_ms", value_status::Used, 5000, "Time after which an instance is evicted from the cache.")
     , wasm_cache_instance_size_limit(this, "wasm_cache_instance_size_limit", value_status::Used, 1024*1024, "Instances with size above this limit will not be stored in the cache.")
@@ -1155,7 +1158,9 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , log_to_stdout(this, "log_to_stdout", value_status::Used)
     , log_to_syslog(this, "log_to_syslog", value_status::Used)
     , _extensions(std::move(exts))
-{}
+{
+    add_tombstone_gc_extension();
+}
 
 db::config::config()
     : config(std::make_shared<db::extensions>())
@@ -1174,6 +1179,10 @@ void db::config::add_per_partition_rate_limit_extension() {
 
 void db::config::add_tags_extension() {
     _extensions->add_schema_extension<db::tags_extension>(db::tags_extension::NAME);
+}
+
+void db::config::add_tombstone_gc_extension() {
+    _extensions->add_schema_extension<tombstone_gc_extension>(tombstone_gc_extension::NAME);
 }
 
 void db::config::setup_directories() {
@@ -1336,7 +1345,7 @@ std::map<sstring, db::experimental_features_t::feature> db::experimental_feature
         {"cdc", feature::UNUSED},
         {"alternator-streams", feature::ALTERNATOR_STREAMS},
         {"alternator-ttl", feature::UNUSED },
-        {"consistent-topology-changes", feature::CONSISTENT_TOPOLOGY_CHANGES},
+        {"consistent-topology-changes", feature::UNUSED},
         {"broadcast-tables", feature::BROADCAST_TABLES},
         {"keyspace-storage-options", feature::KEYSPACE_STORAGE_OPTIONS},
         {"tablets", feature::TABLETS},
@@ -1429,12 +1438,7 @@ future<gms::inet_address> resolve(const config_file::named_value<sstring>& addre
     co_return coroutine::exception(std::move(ex));
 }
 
-static future<std::vector<seastar::metrics::relabel_config>> get_relable_from_file(const std::string& name) {
-    file f = co_await seastar::open_file_dma(name, open_flags::ro);
-    size_t s = co_await f.size();
-    seastar::input_stream<char> in = seastar::make_file_input_stream(f);
-    temporary_buffer<char> buf = co_await in.read_exactly(s);
-    auto yaml = YAML::Load(sstring(buf.begin(), buf.end()));
+static std::vector<seastar::metrics::relabel_config> get_relable_from_yaml(const YAML::Node& yaml, const std::string& name) {
     std::vector<seastar::metrics::relabel_config> relabels;
     const YAML::Node& relabel_configs = yaml["relabel_configs"];
     relabels.resize(relabel_configs.size());
@@ -1467,17 +1471,51 @@ static future<std::vector<seastar::metrics::relabel_config>> get_relable_from_fi
             }
         }
     }
-    co_return relabels;
+    return relabels;
+}
+
+static std::vector<seastar::metrics::metric_family_config> get_metric_configs_from_yaml(const YAML::Node& yaml, const std::string& name) {
+    std::vector<seastar::metrics::metric_family_config> metric_config;
+    const YAML::Node& metric_family_configs = yaml["metric_family_configs"];
+    metric_config.resize(metric_family_configs.size());
+    size_t i = 0;
+    for (auto it = metric_family_configs.begin(); it != metric_family_configs.end(); ++it, i++) {
+        const YAML::Node& element = *it;
+        for(YAML::const_iterator e_it = element.begin(); e_it != element.end(); ++e_it) {
+            std::string key = e_it->first.as<std::string>();
+            if (key == "aggregate_labels") {
+                auto labels = e_it->second;
+                std::vector<std::string> aggregate_labels;
+                aggregate_labels.resize(labels.size());
+                size_t j = 0;
+                for (auto label_it = labels.begin(); label_it !=  labels.end(); ++label_it, j++) {
+                    aggregate_labels[j] = label_it->as<std::string>();
+                }
+                metric_config[i].aggregate_labels = aggregate_labels;
+            } else if (key == "name") {
+                metric_config[i].name = e_it->second.as<std::string>();
+            } else if (key == "regex") {
+                metric_config[i].regex_name = e_it->second.as<std::string>();
+            }
+        }
+    }
+    return metric_config;
 }
 
 future<> update_relabel_config_from_file(const std::string& name) {
     if (name.empty()) {
         co_return;
     }
-
-    std::vector<seastar::metrics::relabel_config> relabels = co_await  get_relable_from_file(name);
+    file f = co_await seastar::open_file_dma(name, open_flags::ro);
+    size_t s = co_await f.size();
+    seastar::input_stream<char> in = seastar::make_file_input_stream(f);
+    temporary_buffer<char> buf = co_await in.read_exactly(s);
+    auto yaml = YAML::Load(sstring(buf.begin(), buf.end()));
+    std::vector<seastar::metrics::relabel_config> relabels = get_relable_from_yaml(yaml, name);
+    std::vector<seastar::metrics::metric_family_config> metric_configs = get_metric_configs_from_yaml(yaml, name);
     bool failed = false;
-    co_await smp::invoke_on_all([&relabels, &failed] {
+    co_await smp::invoke_on_all([&relabels, &failed, &metric_configs] {
+        metrics::set_metric_family_configs(metric_configs);
         return metrics::set_relabel_configs(relabels).then([&failed](const metrics::metric_relabeling_result& result) {
             if (result.metrics_relabeled_due_to_collision > 0) {
                 failed = true;

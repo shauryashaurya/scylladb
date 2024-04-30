@@ -42,8 +42,6 @@ else()
         COMMENT "List configured modes")
 endif()
 
-add_compile_definitions(
-    FMT_DEPRECATED_OSTREAM)
 include(limit_jobs)
 # Configure Seastar compile options to align with Scylla
 set(CMAKE_CXX_STANDARD "20" CACHE INTERNAL "")
@@ -69,6 +67,7 @@ find_package(Lua REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(ICU COMPONENTS uc i18n REQUIRED)
 find_package(absl COMPONENTS hash raw_hash_set REQUIRED)
+find_package(fmt 9.0.0 REQUIRED)
 find_package(libdeflate REQUIRED)
 find_package(libxcrypt REQUIRED)
 find_package(Snappy REQUIRED)

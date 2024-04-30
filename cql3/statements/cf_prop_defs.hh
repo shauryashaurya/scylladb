@@ -36,8 +36,6 @@ namespace statements {
 class cf_prop_defs : public property_definitions {
 public:
     static const sstring KW_COMMENT;
-    static const sstring KW_READREPAIRCHANCE;
-    static const sstring KW_DCLOCALREADREPAIRCHANCE;
     static const sstring KW_GCGRACESECONDS;
     static const sstring KW_PAXOSGRACESECONDS;
     static const sstring KW_MINCOMPACTIONTHRESHOLD;
@@ -103,7 +101,7 @@ public:
     std::optional<table_id> get_id() const;
     bool get_synchronous_updates_flag() const;
 
-    void apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions) const;
+    void apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions, const data_dictionary::database& db, sstring ks_name) const;
     void validate_minimum_int(const sstring& field, int32_t minimum_value, int32_t default_value) const;
 };
 

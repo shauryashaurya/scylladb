@@ -10,6 +10,7 @@
 #include <concepts>
 #include <vector>
 #include <limits>
+#include <fmt/ranges.h>
 #include <seastar/core/future.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/sstring.hh>
@@ -32,6 +33,7 @@
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/as_future.hh>
 
+#include "utils/to_string.hh"
 #include "data_dictionary/storage_options.hh"
 #include "dht/sharder.hh"
 #include "writer.hh"
@@ -1364,9 +1366,8 @@ future<> sstable::create_data() noexcept {
 }
 
 future<> sstable::drop_caches() {
-    return _cached_index_file->evict_gently().then([this] {
-        return _index_cache->evict_gently();
-    });
+    co_await _cached_index_file->evict_gently();
+    co_await _index_cache->evict_gently();
 }
 
 future<> sstable::read_filter(sstable_open_config cfg) {
@@ -1413,9 +1414,9 @@ size_t sstable::reclaim_memory_from_components() {
     if (_components->filter) {
         auto filter_memory_size = _components->filter->memory_size();
         if (filter_memory_size > 0) {
-            // discard it from memory by replacing it with an always present variant
+            // Discard it from memory by replacing it with an always present variant.
+            // No need to remove it from _recognized_components as the filter is still in disk.
             _components->filter = std::make_unique<utils::filter::always_present_filter>();
-            _recognized_components.erase(component_type::Filter);
             total_memory_reclaimed += filter_memory_size;
         }
     }

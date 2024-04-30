@@ -36,6 +36,7 @@
 #include "test/lib/sstable_utils.hh"
 #include "utils/throttle.hh"
 
+#include <fmt/ranges.h>
 #include <boost/range/algorithm/min_element.hpp>
 #include "readers/from_mutations_v2.hh"
 #include "readers/delegating_v2.hh"
@@ -2531,6 +2532,7 @@ SEASTAR_TEST_CASE(test_exception_safety_of_update_from_memtable) {
             snap->fill_buffer().get();
 
             cache.update(row_cache::external_updater([&] {
+                memory::scoped_critical_alloc_section dfg;
                 auto mt2 = make_memtable(cache.schema(), muts2);
                 underlying.apply(std::move(mt2));
             }), *mt).get();

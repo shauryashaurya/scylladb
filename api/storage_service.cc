@@ -26,6 +26,7 @@
 #include <boost/algorithm/string/trim_all.hpp>
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/functional/hash.hpp>
+#include <fmt/ranges.h>
 #include "service/raft/raft_group0_client.hh"
 #include "service/storage_service.hh"
 #include "service/load_meter.hh"
@@ -63,6 +64,7 @@ namespace api {
 
 namespace ss = httpd::storage_service_json;
 namespace sp = httpd::storage_proxy_json;
+namespace cf = httpd::column_family_json;
 using namespace json;
 
 sstring validate_keyspace(const http_context& ctx, sstring ks_name) {
@@ -103,7 +105,7 @@ static bool any_of_keyspaces_use_tablets(const http_context& ctx) {
 
 locator::host_id validate_host_id(const sstring& param) {
     auto hoep = locator::host_id_or_endpoint(param, locator::host_id_or_endpoint::param_type::host_id);
-    return hoep.id;
+    return hoep.id();
 }
 
 bool validate_bool(const sstring& param) {
@@ -206,7 +208,6 @@ static auto wrap_ks_cf(http_context &ctx, ks_cf_func f) {
 }
 
 seastar::future<json::json_return_type> run_toppartitions_query(db::toppartitions_query& q, http_context &ctx, bool legacy_request) {
-    namespace cf = httpd::column_family_json;
     return q.scatter().then([&q, legacy_request] {
         return sleep(q.duration()).then([&q, legacy_request] {
             return q.gather(q.capacity()).then([&q, legacy_request] (auto topk_results) {
@@ -414,7 +415,7 @@ void unset_rpc_controller(http_context& ctx, routes& r) {
 }
 
 void set_repair(http_context& ctx, routes& r, sharded<repair_service>& repair) {
-    ss::repair_async.set(r, [&ctx, &repair](std::unique_ptr<http::request> req) {
+    ss::repair_async.set(r, [&ctx, &repair](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
         static std::unordered_set<sstring> options = {"primaryRange", "parallelism", "incremental",
                 "jobThreads", "ranges", "columnFamilies", "dataCenters", "hosts", "ignore_nodes", "trace",
                 "startToken", "endToken", "ranges_parallelism", "small_table_optimization"};
@@ -427,8 +428,7 @@ void set_repair(http_context& ctx, routes& r, sharded<repair_service>& repair) {
                 continue;
             }
             if (!options.contains(x.first)) {
-                return make_exception_future<json::json_return_type>(
-                        httpd::bad_param_exception(format("option {} is not supported", x.first)));
+                throw httpd::bad_param_exception(format("option {} is not supported", x.first));
             }
         }
         std::unordered_map<sstring, sstring> options_map;
@@ -443,10 +443,14 @@ void set_repair(http_context& ctx, routes& r, sharded<repair_service>& repair) {
         // returns immediately, not waiting for the repair to finish. The user
         // then has other mechanisms to track the ongoing repair's progress,
         // or stop it.
-        return repair_start(repair, validate_keyspace(ctx, req->param),
-                options_map).then([] (int i) {
-                    return make_ready_future<json::json_return_type>(i);
-                });
+        try {
+            int res = co_await repair_start(repair, validate_keyspace(ctx, req->param), options_map);
+            co_return json::json_return_type(res);
+        } catch (const std::invalid_argument& e) {
+            // if the option is not sane, repair_start() throws immediately, so
+            // convert the exception to an HTTP error
+            throw httpd::bad_param_exception(e.what());
+        }
     });
 
     ss::get_active_repair_async.set(r, [&repair] (std::unique_ptr<http::request> req) {
@@ -1569,12 +1573,47 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
         auto token = dht::token::from_int64(validate_int(req->get_query_param("token")));
         auto ks = req->get_query_param("ks");
         auto table = req->get_query_param("table");
+        validate_table(ctx, ks, table);
         auto table_id = ctx.db.local().find_column_family(ks, table).schema()->id();
         auto force_str = req->get_query_param("force");
         auto force = service::loosen_constraints(force_str == "" ? false : validate_bool(force_str));
 
         co_await ss.local().move_tablet(table_id, token,
             locator::tablet_replica{src_host_id, src_shard_id},
+            locator::tablet_replica{dst_host_id, dst_shard_id},
+            force);
+
+        co_return json_void();
+    });
+
+    ss::add_tablet_replica.set(r, [&ctx, &ss] (std::unique_ptr<http::request> req) -> future<json_return_type> {
+        auto dst_host_id = validate_host_id(req->get_query_param("dst_host"));
+        shard_id dst_shard_id = validate_int(req->get_query_param("dst_shard"));
+        auto token = dht::token::from_int64(validate_int(req->get_query_param("token")));
+        auto ks = req->get_query_param("ks");
+        auto table = req->get_query_param("table");
+        auto table_id = ctx.db.local().find_column_family(ks, table).schema()->id();
+        auto force_str = req->get_query_param("force");
+        auto force = service::loosen_constraints(force_str == "" ? false : validate_bool(force_str));
+
+        co_await ss.local().add_tablet_replica(table_id, token,
+            locator::tablet_replica{dst_host_id, dst_shard_id},
+            force);
+
+        co_return json_void();
+    });
+
+    ss::del_tablet_replica.set(r, [&ctx, &ss] (std::unique_ptr<http::request> req) -> future<json_return_type> {
+        auto dst_host_id = validate_host_id(req->get_query_param("host"));
+        shard_id dst_shard_id = validate_int(req->get_query_param("shard"));
+        auto token = dht::token::from_int64(validate_int(req->get_query_param("token")));
+        auto ks = req->get_query_param("ks");
+        auto table = req->get_query_param("table");
+        auto table_id = ctx.db.local().find_column_family(ks, table).schema()->id();
+        auto force_str = req->get_query_param("force");
+        auto force = service::loosen_constraints(force_str == "" ? false : validate_bool(force_str));
+
+        co_await ss.local().del_tablet_replica(table_id, token,
             locator::tablet_replica{dst_host_id, dst_shard_id},
             force);
 
@@ -1687,45 +1726,42 @@ void unset_storage_service(http_context& ctx, routes& r) {
     ss::upgrade_to_raft_topology.unset(r);
     ss::raft_topology_upgrade_status.unset(r);
     ss::move_tablet.unset(r);
+    ss::add_tablet_replica.unset(r);
+    ss::del_tablet_replica.unset(r);
     ss::tablet_balancing_enable.unset(r);
     sp::get_schema_versions.unset(r);
 }
 
 void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_ctl) {
-    ss::get_snapshot_details.set(r, [&snap_ctl](std::unique_ptr<http::request> req) {
-        return snap_ctl.local().get_snapshot_details().then([] (std::unordered_map<sstring, std::vector<db::snapshot_ctl::snapshot_details>>&& result) {
-            std::function<future<>(output_stream<char>&&)> f = [result = std::move(result)](output_stream<char>&& s) {
-                return do_with(output_stream<char>(std::move(s)), true, [&result] (output_stream<char>& s, bool& first){
-                    return s.write("[").then([&s, &first, &result] {
-                        return do_for_each(result, [&s, &first](std::tuple<sstring, std::vector<db::snapshot_ctl::snapshot_details>>&& map){
-                            return do_with(ss::snapshots(), [&s, &first, &map](ss::snapshots& all_snapshots) {
-                                all_snapshots.key = std::get<0>(map);
-                                future<> f = first ? make_ready_future<>() : s.write(", ");
-                                first = false;
-                                std::vector<ss::snapshot> snapshot;
-                                for (auto& cf: std::get<1>(map)) {
-                                    ss::snapshot snp;
-                                    snp.ks = cf.ks;
-                                    snp.cf = cf.cf;
-                                    snp.live = cf.live;
-                                    snp.total = cf.total;
-                                    snapshot.push_back(std::move(snp));
-                                }
-                                all_snapshots.value = std::move(snapshot);
-                                return f.then([&s, &all_snapshots] {
-                                    return all_snapshots.write(s);
-                                });
-                            });
-                        });
-                    }).then([&s] {
-                        return s.write("]").then([&s] {
-                            return s.close();
-                        });
-                    });
-                });
-            };
+    ss::get_snapshot_details.set(r, [&snap_ctl](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto result = co_await snap_ctl.local().get_snapshot_details();
+        co_return std::function([res = std::move(result)] (output_stream<char>&& o) -> future<> {
+            auto result = std::move(res);
+            output_stream<char> out = std::move(o);
+            bool first = true;
 
-            return make_ready_future<json::json_return_type>(std::move(f));
+            co_await out.write("[");
+            for (auto& [name, details] : result) {
+                if (!first) {
+                    co_await out.write(", ");
+                }
+                std::vector<ss::snapshot> snapshot;
+                for (auto& cf : details) {
+                    ss::snapshot snp;
+                    snp.ks = cf.ks;
+                    snp.cf = cf.cf;
+                    snp.live = cf.details.live;
+                    snp.total = cf.details.total;
+                    snapshot.push_back(std::move(snp));
+                }
+                ss::snapshots all_snapshots;
+                all_snapshots.key = name;
+                all_snapshots.value = std::move(snapshot);
+                co_await all_snapshots.write(out);
+                first = false;
+            }
+            co_await out.write("]");
+            co_await out.close();
         });
     });
 
@@ -1804,6 +1840,20 @@ void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_
 
         co_return json::json_return_type(static_cast<int>(scrub_status::successful));
     });
+
+    cf::get_true_snapshots_size.set(r, [&snap_ctl] (std::unique_ptr<http::request> req) {
+        auto [ks, cf] = parse_fully_qualified_cf_name(req->param["name"]);
+        return snap_ctl.local().true_snapshots_size(std::move(ks), std::move(cf)).then([] (int64_t res) {
+            return make_ready_future<json::json_return_type>(res);
+        });
+    });
+
+    cf::get_all_true_snapshots_size.set(r, [] (std::unique_ptr<http::request> req) {
+        //TBD
+        unimplemented();
+        return make_ready_future<json::json_return_type>(0);
+    });
+
 }
 
 void unset_snapshot(http_context& ctx, routes& r) {
@@ -1812,6 +1862,8 @@ void unset_snapshot(http_context& ctx, routes& r) {
     ss::del_snapshot.unset(r);
     ss::true_snapshots_size.unset(r);
     ss::scrub.unset(r);
+    cf::get_true_snapshots_size.unset(r);
+    cf::get_all_true_snapshots_size.unset(r);
 }
 
 }

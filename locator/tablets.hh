@@ -202,7 +202,7 @@ struct tablet_transition_info {
     tablet_transition_stage stage;
     tablet_transition_kind transition;
     tablet_replica_set next;
-    tablet_replica pending_replica; // Optimization (next - tablet_info::replicas)
+    std::optional<tablet_replica> pending_replica; // Optimization (next - tablet_info::replicas)
     service::session_id session_id;
     write_replica_set_selector writes;
     read_replica_set_selector reads;
@@ -210,14 +210,14 @@ struct tablet_transition_info {
     tablet_transition_info(tablet_transition_stage stage,
                            tablet_transition_kind kind,
                            tablet_replica_set next,
-                           tablet_replica pending_replica,
+                           std::optional<tablet_replica> pending_replica,
                            service::session_id session_id = {});
 
     bool operator==(const tablet_transition_info&) const = default;
 };
 
 // Returns the leaving replica for a given transition.
-tablet_replica get_leaving_replica(const tablet_info&, const tablet_transition_info&);
+std::optional<tablet_replica> get_leaving_replica(const tablet_info&, const tablet_transition_info&);
 
 /// Represents intention to move a single tablet replica from src to dst.
 struct tablet_migration_info {
@@ -514,40 +514,40 @@ public:
 }
 
 template <>
-struct fmt::formatter<locator::tablet_transition_stage> : fmt::formatter<std::string_view> {
+struct fmt::formatter<locator::tablet_transition_stage> : fmt::formatter<string_view> {
     auto format(const locator::tablet_transition_stage&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 
 template <>
-struct fmt::formatter<locator::tablet_transition_kind> : fmt::formatter<std::string_view> {
+struct fmt::formatter<locator::tablet_transition_kind> : fmt::formatter<string_view> {
     auto format(const locator::tablet_transition_kind&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 
 template <>
-struct fmt::formatter<locator::global_tablet_id> : fmt::formatter<std::string_view> {
+struct fmt::formatter<locator::global_tablet_id> : fmt::formatter<string_view> {
     auto format(const locator::global_tablet_id&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 
 template <>
-struct fmt::formatter<locator::tablet_id> : fmt::formatter<std::string_view> {
+struct fmt::formatter<locator::tablet_id> : fmt::formatter<string_view> {
     auto format(locator::tablet_id  id, fmt::format_context& ctx) const {
         return fmt::format_to(ctx.out(), "{}", id.value());
     }
 };
 
 template <>
-struct fmt::formatter<locator::tablet_replica> : fmt::formatter<std::string_view> {
+struct fmt::formatter<locator::tablet_replica> : fmt::formatter<string_view> {
     auto format(const locator::tablet_replica& r, fmt::format_context& ctx) const {
         return fmt::format_to(ctx.out(), "{}:{}", r.host, r.shard);
     }
 };
 
 template <>
-struct fmt::formatter<locator::tablet_map> : fmt::formatter<std::string_view> {
+struct fmt::formatter<locator::tablet_map> : fmt::formatter<string_view> {
     auto format(const locator::tablet_map&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 
 template <>
-struct fmt::formatter<locator::tablet_metadata> : fmt::formatter<std::string_view> {
+struct fmt::formatter<locator::tablet_metadata> : fmt::formatter<string_view> {
     auto format(const locator::tablet_metadata&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
