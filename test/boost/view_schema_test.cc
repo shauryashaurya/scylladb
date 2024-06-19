@@ -20,6 +20,7 @@
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
+#include "test/lib/eventually.hh"
 #include "exceptions/unrecognized_entity_exception.hh"
 #include "db/config.hh"
 #include "types/set.hh"
@@ -2572,13 +2573,22 @@ SEASTAR_TEST_CASE(test_unselected_column) {
 }
 
 SEASTAR_THREAD_TEST_CASE(node_view_update_backlog) {
-    db::view::node_update_backlog b(2, 10ms);
+    db::view::node_update_backlog b(2, 100ms);
     auto backlog = [] (size_t size) { return db::view::update_backlog{size, 1000}; };
-    b.add_fetch(0, backlog(10));
-    b.add_fetch(1, backlog(50));
+    smp::submit_to(0, [&b, &backlog] {
+        b.add(backlog(10));
+        b.fetch();
+    }).get();
+    smp::submit_to(1, [&b, &backlog] {
+        b.add(backlog(50));
+        b.fetch();
+    }).get();
     BOOST_REQUIRE(b.load() == backlog(10));
-    sleep(11ms).get();
-    b.add_fetch(1, backlog(100));
+    sleep(101ms).get();
+    smp::submit_to(1, [&b, &backlog] {
+        b.add(backlog(100));
+        b.fetch();
+    }).get();
     BOOST_REQUIRE(b.load() == backlog(100));
 }
 

@@ -137,6 +137,7 @@ static std::unordered_map<topology::transition_state, sstring> transition_state_
     {topology::transition_state::write_both_read_old, "write both read old"},
     {topology::transition_state::write_both_read_new, "write both read new"},
     {topology::transition_state::tablet_migration, "tablet migration"},
+    {topology::transition_state::tablet_split_finalization, "tablet split finalization"},
     {topology::transition_state::tablet_draining, "tablet draining"},
     {topology::transition_state::left_token_ring, "left token ring"},
     {topology::transition_state::rollback_to_normal, "rollback to normal"},
@@ -191,6 +192,7 @@ topology_request topology_request_from_string(const sstring& s) {
 static std::unordered_map<global_topology_request, sstring> global_topology_request_to_name_map = {
     {global_topology_request::new_cdc_generation, "new_cdc_generation"},
     {global_topology_request::cleanup, "cleanup"},
+    {global_topology_request::keyspace_rf_change, "keyspace_rf_change"},
 };
 
 global_topology_request global_topology_request_from_string(const sstring& s) {
@@ -231,6 +233,12 @@ topology::upgrade_state_type upgrade_state_from_string(const sstring& s) {
         }
     }
     on_internal_error(tsmlogger, format("cannot map name {} to upgrade_state", s));
+}
+
+future<> topology_state_machine::await_not_busy() {
+    while (_topology.is_busy()) {
+        co_await event.wait();
+    }
 }
 
 }

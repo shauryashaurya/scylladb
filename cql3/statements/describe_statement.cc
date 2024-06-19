@@ -11,6 +11,8 @@
 #include <boost/range/algorithm/sort.hpp>
 #include <boost/range/iterator_range_core.hpp>
 
+#include "cdc/cdc_options.hh"
+#include "cdc/log.hh"
 #include "cql3/column_specification.hh"
 #include "cql3/functions/function_name.hh"
 #include "cql3/statements/prepared_statement.hh"
@@ -42,6 +44,9 @@
 #include "utils/overloaded_functor.hh"
 #include "data_dictionary/keyspace_element.hh"
 #include "db/system_keyspace.hh"
+#include "db/extensions.hh"
+#include "utils/sorting.hh"
+#include "replica/database.hh"
 
 static logging::logger dlogger("describe");
 
@@ -84,6 +89,12 @@ struct description {
         _create_statement = os.str();
     }
 
+    description(replica::database& db, const keyspace_element& element, sstring create_statement)
+        : _keyspace(util::maybe_quote(element.keypace_name()))
+        , _type(element.element_type(db))
+        , _name(util::maybe_quote(element.element_name()))
+        , _create_statement(std::move(create_statement)) {}
+
     std::vector<bytes_opt> serialize() const {
         auto desc = std::vector<bytes_opt>{
             {to_bytes(_keyspace)},
@@ -102,13 +113,16 @@ struct description {
 future<std::vector<description>> generate_descriptions(
     replica::database& db, 
     std::vector<shared_ptr<const keyspace_element>> elements,
-    std::optional<bool> with_internals = std::nullopt) 
+    std::optional<bool> with_internals = std::nullopt,
+    bool sort_by_name = true) 
 {
     std::vector<description> descs;
     descs.reserve(elements.size());
-    boost::sort(elements, [] (const auto& a, const auto& b) {
-        return a->element_name() < b->element_name();
-    });
+    if (sort_by_name) {
+        boost::sort(elements, [] (const auto& a, const auto& b) {
+            return a->element_name() < b->element_name();
+        });
+    }
 
     for (auto& e: elements) {
         auto desc = (with_internals.has_value()) 
@@ -157,14 +171,31 @@ description type(replica::database& db, const lw_shared_ptr<keyspace_metadata>& 
     return description(db, *udt, true);
 }
 
-future<std::vector<description>> types(replica::database& db, const lw_shared_ptr<keyspace_metadata>& ks, bool with_stmt = false) {
-    auto user_types_map = ks->user_types().get_all_types();
-    auto user_types = boost::copy_range<std::vector<shared_ptr<const keyspace_element>>>(user_types_map | boost::adaptors::transformed([] (const auto& e) {
-        // return static_pointer_cast<const keyspace_element>(e.second);
-        return e.second;
-    }));
+// Because UDTs can depend on each other, we need to sort them topologically
+future<std::vector<shared_ptr<const keyspace_element>>> get_sorted_types(const lw_shared_ptr<keyspace_metadata>& ks) {
+    struct udts_comparator {
+        inline bool operator()(const user_type& a, const user_type& b) const {
+            return a->get_name_as_string() < b->get_name_as_string();
+        }
+    };
 
-    co_return co_await generate_descriptions(db, user_types, (with_stmt) ? std::optional(true) : std::nullopt);
+    std::vector<user_type> all_udts;
+    std::multimap<user_type, user_type, udts_comparator> adjacency;
+
+    for (auto& [_, udt]: ks->user_types().get_all_types()) {
+        all_udts.push_back(udt);
+        for (auto& ref_udt: udt->get_all_referenced_user_types()) {
+            adjacency.insert({ref_udt, udt});
+        }
+    }
+
+    auto sorted = co_await utils::topological_sort(all_udts, adjacency);
+    co_return boost::copy_range<std::vector<shared_ptr<const keyspace_element>>>(sorted);
+}
+
+future<std::vector<description>> types(replica::database& db, const lw_shared_ptr<keyspace_metadata>& ks, bool with_stmt = false) {
+    auto udts = co_await get_sorted_types(ks);
+    co_return co_await generate_descriptions(db, udts, (with_stmt) ? std::optional(true) : std::nullopt, false);
 }
     
 future<std::vector<description>> function(replica::database& db, const sstring& ks, const sstring& name) {
@@ -244,10 +275,28 @@ description index(const data_dictionary::database& db, const sstring& ks, const 
     return description(db.real_database(), **idx, with_internals);
 }
 
+// `base_name` should be a table with enabled cdc
+std::optional<description> describe_cdc_log_table(const data_dictionary::database& db, const sstring& ks, const sstring& base_name) {
+    auto table = db.try_find_table(ks, cdc::log_name(base_name));
+    if (!table) {
+        dlogger.warn("Couldn't find cdc log table for base table {}.{}", ks, base_name);
+        return std::nullopt;
+    }
+
+    std::ostringstream os;
+    auto schema = table->schema();
+    schema->describe_alter_with_properties(db.real_database(), os);
+    return description(db.real_database(), *schema, std::move(os.str()));
+}
+
 future<std::vector<description>> table(const data_dictionary::database& db, const sstring& ks, const sstring& name, bool with_internals) {
     auto table = db.try_find_table(ks, name);
     if (!table) {
         throw exceptions::invalid_request_exception(format("Table '{}' not found in keyspace '{}'", name, ks));
+    }
+    if (cdc::is_log_for_some_table(db.real_database(), ks, name)) {
+        // we want to hide cdc log table from the user
+        throw exceptions::invalid_request_exception(format("{}.{} is a cdc log table and it cannot be described directly. Try `DESC TABLE {}.{}` to describe cdc base table and it's log table.", ks, name, ks, cdc::base_name(name)));
     }
 
     auto schema = table->schema();
@@ -278,11 +327,21 @@ future<std::vector<description>> table(const data_dictionary::database& db, cons
         co_await coroutine::maybe_yield();
     }
 
+    if (schema->cdc_options().enabled()) {
+        auto cdc_log_alter = describe_cdc_log_table(db, ks, name);
+        if (cdc_log_alter) {
+            result.push_back(*cdc_log_alter);
+        }
+    }
+
     co_return result;
 }
 
 future<std::vector<description>> tables(const data_dictionary::database& db, const lw_shared_ptr<keyspace_metadata>& ks, std::optional<bool> with_internals = std::nullopt) {
-    auto tables = ks->tables();
+    auto& replica_db = db.real_database();
+    auto tables = boost::copy_range<std::vector<schema_ptr>>(ks->tables() | boost::adaptors::filtered([&replica_db] (const schema_ptr& s) {
+        return !cdc::is_log_for_some_table(replica_db, s->ks_name(), s->cf_name());
+    }));
     boost::sort(tables, [] (const auto& a, const auto& b) {
         return a->cf_name() < b->cf_name();
     });
@@ -298,7 +357,6 @@ future<std::vector<description>> tables(const data_dictionary::database& db, con
         co_return result;
     }
 
-    auto& replica_db = db.real_database();
     co_return boost::copy_range<std::vector<description>>(tables | boost::adaptors::transformed([&replica_db] (auto&& t) {
         return description(replica_db, *t);
     }));
@@ -566,6 +624,9 @@ future<std::vector<std::vector<bytes_opt>>> schema_describe_statement::describe(
             std::vector<description> schema_result;
 
             for (auto&& ks: keyspaces) {
+                if (!config.full_schema && db.extensions().is_extension_internal_keyspace(ks)) {
+                    continue;
+                }
                 auto ks_result = co_await describe_all_keyspace_elements(db, ks, _with_internals);
                 schema_result.insert(schema_result.end(), ks_result.begin(), ks_result.end());
             }

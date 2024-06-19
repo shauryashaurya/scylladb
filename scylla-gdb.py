@@ -589,8 +589,52 @@ class flat_hash_map:
         return self.__nonzero__()
 
 
+class absl_container:
+    # absl_container is the underlying type for flat_hash_map and flat_hash_set
+    # if we need to print flat_hash_set, we should yield the element of set
+    # instead of <key, value> tuple in `__iter__()`
+    def __init__(self, ref):
+        self.val = ref
+        HasInfozShift = 1
+        self.size = ref["settings_"]["value"]["size_"] >> HasInfozShift
+
+    def __len__(self):
+        return self.size
+
+    def __iter__(self):
+        if self.size == 0:
+            return
+        capacity = int(self.val["settings_"]["value"]["capacity_"])
+        control = self.val["settings_"]["value"]["control_"]
+        # for the map the slot_type is std::pair<K, V>
+        slot_type = gdb.lookup_type(str(self.val.type.strip_typedefs()) + "::slot_type")
+        slots = self.val["settings_"]["value"]["slots_"].cast(slot_type.pointer())
+        for i in range(capacity):
+            ctrl_t = int(control[i])
+            # if the control is empty or deleted, its value is less than -1, see
+            # https://github.com/abseil/abseil-cpp/blob/c1e1b47d989978cde8c5a2a219df425b785a0c47/absl/container/internal/raw_hash_set.h#L487-L503
+            if ctrl_t == -1:
+                break
+            if ctrl_t >= 0:
+                # NOTE: this only works for flat_hash_map
+                yield slots[i]['key'], slots[i]['value']
+
+    def __nonzero__(self):
+        return self.size > 0
+
+    def __bool__(self):
+        return self.size > 0
+
+
 def unordered_map(ref):
-    return flat_hash_map(ref) if ref.type.name.startswith('flat_hash_map') else std_unordered_map(ref)
+    if ref.type.name.startswith('flat_hash_map'):
+        try:
+            return flat_hash_map(ref)
+        except gdb.error:
+            # newer absl container uses a different memory layout
+            return absl_container(ref)
+    else:
+        return std_unordered_map(ref)
 
 
 def std_priority_queue(ref):
@@ -1753,9 +1797,7 @@ def find_single_sstable_readers():
 
     types = []
     try:
-        # For Scylla < 2.1
-        # FIXME: this only finds range readers
-        types = [_lookup_type(['sstable_range_wrapping_reader'])]
+        return intrusive_list(gdb.parse_and_eval('sstables::_reader_tracker._readers'), link='_tracker_link')
     except gdb.error:
         try:
             # for Scylla <= 4.5
@@ -1811,7 +1853,7 @@ class schema_ptr:
         return self.ptr[item]
 
     def is_system(self):
-        return self.ks_name in ["system", "system_schema", "system_distributed", "system_traces", "system_auth", "system_auth_v2", "audit"]
+        return self.ks_name in ["system", "system_schema", "system_distributed", "system_traces", "system_auth", "audit"]
 
 
 class scylla_active_sstables(gdb.Command):
@@ -3820,6 +3862,17 @@ class scylla_fiber(gdb.Command):
             self._maybe_log("\t\t\tSymbol name doesn't match whitelisted symbols\n", verbose)
             return
 
+        # The promise object starts on the third `uintptr_t` in the frame.
+        # The resume_fn pointer is the first `uintptr_t`.
+        # So if the task is a coroutine, we should be able to find the resume function via offsetting by -2.
+        # AFAIK both major compilers respect this convention.
+        if resolved_symbol.startswith('vtable for seastar::internal::coroutine_traits_base'):
+            coroutine_resume_fn = resolve((gdb.Value(ptr).cast(self._vptr_type) - 2).dereference())
+            if coroutine_resume_fn:
+                resolved_symbol += f" (.resume is {coroutine_resume_fn})"
+            else:
+                resolved_symbol += f" (.resume is unknown)"
+
         if using_seastar_allocator:
             if ptr_meta is None:
                 ptr_meta = scylla_ptr.analyze(ptr)
@@ -4308,7 +4361,7 @@ def find_sstables():
         system_sstables_manager = std_unique_ptr(db["_system_sstables_manager"]).get()
         for manager in (user_sstables_manager, system_sstables_manager):
             for sst_list_name in ("_active", "_undergoing_close"):
-                for sst in intrusive_list(manager[sst_list_name], link="_manager_link"):
+                for sst in intrusive_list(manager[sst_list_name], link="_manager_list_link"):
                     yield sst.address
     except gdb.error:
         # Scylla Enterprise 2020.1 compatibility

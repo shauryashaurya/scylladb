@@ -13,7 +13,7 @@
 #include "repair/repair.hh"
 #include "message/messaging_service.hh"
 #include "repair/task_manager_module.hh"
-#include "seastar/coroutine/exception.hh"
+#include <seastar/coroutine/exception.hh>
 #include "sstables/sstables.hh"
 #include "sstables/sstables_manager.hh"
 #include "mutation/mutation_fragment.hh"
@@ -44,6 +44,7 @@
 #include "streaming/consumer.hh"
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/all.hh>
+#include "db/config.hh"
 #include "db/system_keyspace.hh"
 #include "service/storage_proxy.hh"
 #include "service/raft/raft_address_map.hh"
@@ -323,7 +324,7 @@ flat_mutation_reader_v2 repair_reader::make_reader(
             _permit.release_base_resources();
             return make_filtering_reader(make_multishard_streaming_reader(db, _schema, _permit, _range, compaction_time),
                 [&remote_sharder, remote_shard](const dht::decorated_key& k) {
-                    return remote_sharder.shard_of(k.token()) == remote_shard;
+                    return remote_sharder.shard_for_reads(k.token()) == remote_shard;
                 });
         }
         default:
@@ -338,7 +339,7 @@ repair_reader::repair_reader(
     schema_ptr s,
     reader_permit permit,
     dht::token_range range,
-    const dht::sharder& remote_sharder,
+    const dht::static_sharder& remote_sharder,
     unsigned remote_shard,
     uint64_t seed,
     read_strategy strategy,
@@ -417,8 +418,7 @@ class repair_writer_impl : public repair_writer::impl {
     std::optional<future<>> _writer_done;
     mutation_fragment_queue _mq;
     sharded<replica::database>& _db;
-    sharded<db::system_distributed_keyspace>& _sys_dist_ks;
-    sharded<db::view::view_update_generator>& _view_update_generator;
+    sharded<db::view::view_builder>& _view_builder;
     streaming::stream_reason _reason;
     flat_mutation_reader_v2 _queue_reader;
 public:
@@ -426,8 +426,7 @@ public:
         schema_ptr schema,
         reader_permit permit,
         sharded<replica::database>& db,
-        sharded<db::system_distributed_keyspace>& sys_dist_ks,
-        sharded<db::view::view_update_generator>& view_update_generator,
+        sharded<db::view::view_builder>& view_builder,
         streaming::stream_reason reason,
         mutation_fragment_queue queue,
         flat_mutation_reader_v2 queue_reader)
@@ -435,8 +434,7 @@ public:
         , _permit(std::move(permit))
         , _mq(std::move(queue))
         , _db(db)
-        , _sys_dist_ks(sys_dist_ks)
-        , _view_update_generator(view_update_generator)
+        , _view_builder(view_builder)
         , _reason(reason)
         , _queue_reader(std::move(queue_reader))
     {}
@@ -513,7 +511,7 @@ void repair_writer_impl::create_writer(lw_shared_ptr<repair_writer> w) {
     auto erm = t.get_effective_replication_map();
     auto& sharder = erm->get_sharder(*(w->schema()));
     _writer_done = mutation_writer::distribute_reader_and_consume_on_shards(_schema, sharder, std::move(_queue_reader),
-            streaming::make_streaming_consumer(sstables::repair_origin, _db, _sys_dist_ks, _view_update_generator, w->get_estimated_partitions(), _reason, is_offstrategy_supported(_reason), topo_guard),
+            streaming::make_streaming_consumer(sstables::repair_origin, _db, _view_builder, w->get_estimated_partitions(), _reason, is_offstrategy_supported(_reason), topo_guard),
     t.stream_in_progress()).then([w, erm] (uint64_t partitions) {
         rlogger.debug("repair_writer: keyspace={}, table={}, managed to write partitions={} to sstable",
             w->schema()->ks_name(), w->schema()->cf_name(), partitions);
@@ -530,11 +528,10 @@ lw_shared_ptr<repair_writer> make_repair_writer(
             reader_permit permit,
             streaming::stream_reason reason,
             sharded<replica::database>& db,
-            sharded<db::system_distributed_keyspace>& sys_dist_ks,
-            sharded<db::view::view_update_generator>& view_update_generator) {
+            sharded<db::view::view_builder>& view_builder) {
     auto [queue_reader, queue_handle] = make_queue_reader_v2(schema, permit);
     auto queue = make_mutation_fragment_queue(schema, permit, std::move(queue_handle));
-    auto i = std::make_unique<repair_writer_impl>(schema, permit, db, sys_dist_ks, view_update_generator, reason, std::move(queue), std::move(queue_reader));
+    auto i = std::make_unique<repair_writer_impl>(schema, permit, db, view_builder, reason, std::move(queue), std::move(queue_reader));
     return make_lw_shared<repair_writer>(schema, permit, std::move(i));
 }
 
@@ -734,8 +731,6 @@ private:
     repair_service& _rs;
     seastar::sharded<replica::database>& _db;
     netw::messaging_service& _messaging;
-    seastar::sharded<db::system_distributed_keyspace>& _sys_dist_ks;
-    seastar::sharded<db::view::view_update_generator>& _view_update_generator;
     schema_ptr _schema;
     reader_permit _permit;
     dht::token_range _range;
@@ -746,13 +741,12 @@ private:
     size_t _max_row_buf_size;
     uint64_t _seed = 0;
     repair_master _repair_master;
-    gms::inet_address _myip;
     uint32_t _repair_meta_id;
     streaming::stream_reason _reason;
     // Repair master's sharding configuration
     shard_config _master_node_shard_config;
     // sharding info of repair master
-    dht::sharder _remote_sharder;
+    dht::static_sharder _remote_sharder;
     bool _same_sharding_config = false;
     struct local_range_estimation {
         size_t master_subranges_count;
@@ -811,7 +805,7 @@ public:
         return _stats;
     }
     gms::inet_address myip() const {
-        return _myip;
+        return _rs.my_address();
     }
     uint32_t repair_meta_id() const {
         return _repair_meta_id;
@@ -852,8 +846,6 @@ public:
             : _rs(rs)
             , _db(rs.get_db())
             , _messaging(rs.get_messaging())
-            , _sys_dist_ks(rs.get_sys_dist_ks())
-            , _view_update_generator(rs.get_view_update_generator())
             , _schema(s)
             , _permit(std::move(permit))
             , _range(range)
@@ -862,14 +854,13 @@ public:
             , _max_row_buf_size(max_row_buf_size)
             , _seed(seed)
             , _repair_master(master)
-            , _myip(_db.local().get_token_metadata().get_topology().my_address())
             , _repair_meta_id(repair_meta_id)
             , _reason(reason)
             , _master_node_shard_config(std::move(master_node_shard_config))
             , _remote_sharder(make_remote_sharder())
             , _same_sharding_config(is_same_sharding_config(cf))
             , _nr_peer_nodes(nr_peer_nodes)
-            , _repair_writer(make_repair_writer(_schema, _permit, _reason, _db, _sys_dist_ks, _view_update_generator))
+            , _repair_writer(make_repair_writer(_schema, _permit, _reason, _db, rs.get_view_builder()))
             , _sink_source_for_get_full_row_hashes(_repair_meta_id, _nr_peer_nodes,
                     [&rs] (uint32_t repair_meta_id, std::optional<shard_id> dst_cpu_id_opt, netw::messaging_service::msg_addr addr) {
                         auto dst_cpu_id = dst_cpu_id_opt.value_or(repair_unspecified_shard);
@@ -899,7 +890,7 @@ public:
                 add_to_repair_meta_for_followers(*this);
             }
             assert(all_live_peer_shards.size() == all_live_peer_nodes.size());
-            _all_node_states.push_back(repair_node_state(_myip, this_shard_id()));
+            _all_node_states.push_back(repair_node_state(myip(), this_shard_id()));
             for (unsigned i = 0; i < all_live_peer_nodes.size(); i++) {
                 _all_node_states.push_back(repair_node_state(all_live_peer_nodes[i], all_live_peer_shards[i].value_or(repair_unspecified_shard)));
             }
@@ -1077,8 +1068,8 @@ private:
         });
     }
 
-    dht::sharder make_remote_sharder() {
-        return dht::sharder(_master_node_shard_config.shard_count, _master_node_shard_config.ignore_msb);
+    dht::static_sharder make_remote_sharder() {
+        return dht::static_sharder(_master_node_shard_config.shard_count, _master_node_shard_config.ignore_msb);
     }
 
     bool is_same_sharding_config(replica::column_family& cf) {
@@ -1483,7 +1474,7 @@ public:
     // Return the hashes of the rows in _working_row_buf
     future<repair_hash_set>
     get_full_row_hashes(gms::inet_address remote_node, shard_id dst_cpu_id) {
-        if (remote_node == _myip) {
+        if (remote_node == myip()) {
             return get_full_row_hashes_handler();
         }
         return _messaging.send_repair_get_full_row_hashes(msg_addr(remote_node),
@@ -1538,7 +1529,7 @@ private:
 public:
     future<repair_hash_set>
     get_full_row_hashes_with_rpc_stream(gms::inet_address remote_node, unsigned node_idx, shard_id dst_cpu_id) {
-        if (remote_node == _myip) {
+        if (remote_node == myip()) {
             return get_full_row_hashes_handler();
         }
         auto current_hashes = make_lw_shared<repair_hash_set>();
@@ -1567,7 +1558,7 @@ public:
     // Return the combined hashes of the current working row buf
     future<get_combined_row_hash_response>
     get_combined_row_hash(std::optional<repair_sync_boundary> common_sync_boundary, gms::inet_address remote_node, shard_id dst_cpu_id) {
-        if (remote_node == _myip) {
+        if (remote_node == myip()) {
             return get_combined_row_hash_handler(common_sync_boundary);
         }
         return _messaging.send_repair_get_combined_row_hash(msg_addr(remote_node),
@@ -1595,7 +1586,7 @@ public:
     // RPC API
     future<>
     repair_row_level_start(gms::inet_address remote_node, sstring ks_name, sstring cf_name, dht::token_range range, table_schema_version schema_version, streaming::stream_reason reason, gc_clock::time_point compaction_time, shard_id dst_cpu_id) {
-        if (remote_node == _myip) {
+        if (remote_node == myip()) {
             return make_ready_future<>();
         }
         stats().rpc_call_nr++;
@@ -1624,7 +1615,7 @@ public:
             uint64_t seed, shard_config master_node_shard_config, table_schema_version schema_version, streaming::stream_reason reason,
             gc_clock::time_point compaction_time, abort_source& as) {
         rlogger.debug(">>> Started Row Level Repair (Follower): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, schema_version={}, range={}, seed={}, max_row_buf_siz={}",
-            repair.get_db().local().get_token_metadata().get_topology().my_address(), from, repair_meta_id, ks_name, cf_name, schema_version, range, seed, max_row_buf_size);
+                repair.my_address(), from, repair_meta_id, ks_name, cf_name, schema_version, range, seed, max_row_buf_size);
         return repair.insert_repair_meta(from, src_cpu_id, repair_meta_id, std::move(range), algo, max_row_buf_size, seed, std::move(master_node_shard_config), std::move(schema_version), reason, compaction_time, as).then([] {
             return repair_row_level_start_response{repair_row_level_start_status::ok};
         }).handle_exception_type([] (replica::no_such_column_family&) {
@@ -1634,7 +1625,7 @@ public:
 
     // RPC API
     future<> repair_row_level_stop(gms::inet_address remote_node, sstring ks_name, sstring cf_name, dht::token_range range, shard_id dst_cpu_id) {
-        if (remote_node == _myip) {
+        if (remote_node == myip()) {
             return stop();
         }
         stats().rpc_call_nr++;
@@ -1646,7 +1637,7 @@ public:
     static future<>
     repair_row_level_stop_handler(repair_service& rs, gms::inet_address from, uint32_t repair_meta_id, sstring ks_name, sstring cf_name, dht::token_range range) {
         rlogger.debug("<<< Finished Row Level Repair (Follower): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, range={}",
-            rs.get_db().local().get_token_metadata().get_topology().my_address(), from, repair_meta_id, ks_name, cf_name, range);
+                rs.my_address(), from, repair_meta_id, ks_name, cf_name, range);
         auto rm = rs.get_repair_meta(from, repair_meta_id);
         rm->set_repair_state_for_local_node(repair_state::row_level_stop_started);
         return rs.remove_repair_meta(from, repair_meta_id, std::move(ks_name), std::move(cf_name), std::move(range)).then([rm] {
@@ -1656,7 +1647,7 @@ public:
 
     // RPC API
     future<uint64_t> repair_get_estimated_partitions(gms::inet_address remote_node, shard_id dst_cpu_id) {
-        if (remote_node == _myip) {
+        if (remote_node == myip()) {
             return get_estimated_partitions();
         }
         stats().rpc_call_nr++;
@@ -1676,7 +1667,7 @@ public:
 
     // RPC API
     future<> repair_set_estimated_partitions(gms::inet_address remote_node, uint64_t estimated_partitions, shard_id dst_cpu_id) {
-        if (remote_node == _myip) {
+        if (remote_node == myip()) {
             return set_estimated_partitions(estimated_partitions);
         }
         stats().rpc_call_nr++;
@@ -1697,7 +1688,7 @@ public:
     // Return the largest sync point contained in the _row_buf , current _row_buf checksum, and the _row_buf size
     future<get_sync_boundary_response>
     get_sync_boundary(gms::inet_address remote_node, std::optional<repair_sync_boundary> skipped_sync_boundary, shard_id dst_cpu_id) {
-        if (remote_node == _myip) {
+        if (remote_node == myip()) {
             return get_sync_boundary_handler(skipped_sync_boundary);
         }
         stats().rpc_call_nr++;
@@ -1719,7 +1710,7 @@ public:
     // Must run inside a seastar thread
     void get_row_diff(repair_hash_set set_diff, needs_all_rows_t needs_all_rows, gms::inet_address remote_node, unsigned node_idx, shard_id dst_cpu_id) {
         if (needs_all_rows || !set_diff.empty()) {
-            if (remote_node == _myip) {
+            if (remote_node == myip()) {
                 return;
             }
             if (needs_all_rows) {
@@ -1739,7 +1730,7 @@ public:
 
     // Must run inside a seastar thread
     void get_row_diff_and_update_peer_row_hash_sets(gms::inet_address remote_node, unsigned node_idx, shard_id dst_cpu_id) {
-        if (remote_node == _myip) {
+        if (remote_node == myip()) {
             return;
         }
         stats().rpc_call_nr++;
@@ -1824,7 +1815,7 @@ public:
             unsigned node_idx,
             shard_id dst_cpu_id) {
         if (needs_all_rows || !set_diff.empty()) {
-            if (remote_node == _myip) {
+            if (remote_node == myip()) {
                 return;
             }
             if (needs_all_rows) {
@@ -1856,7 +1847,7 @@ public:
     // Send rows in the _working_row_buf with hash within the given sef_diff
     future<> put_row_diff(repair_hash_set set_diff, needs_all_rows_t needs_all_rows, gms::inet_address remote_node, shard_id dst_cpu_id) {
         if (!set_diff.empty()) {
-            if (remote_node == _myip) {
+            if (remote_node == myip()) {
                 return make_ready_future<>();
             }
             size_t sz = set_diff.size();
@@ -1938,7 +1929,7 @@ public:
         if (set_diff.empty()) {
             co_return;
         }
-        if (remote_node == _myip) {
+        if (remote_node == myip()) {
             co_return;
         }
         size_t sz = set_diff.size();
@@ -2463,9 +2454,9 @@ future<> repair_service::init_ms_handlers() {
         auto from = cinfo.retrieve_auxiliary<gms::inet_address>("baddr");
         return container().invoke_on(shard, [from, src_cpu_id, repair_meta_id, ks_name, cf_name,
                 range, algo, max_row_buf_size, seed, remote_shard, remote_shard_count, remote_ignore_msb, schema_version, reason, compaction_time, this] (repair_service& local_repair) mutable {
-            if (!local_repair._sys_dist_ks.local_is_initialized() || !local_repair._view_update_generator.local_is_initialized()) {
+            if (!local_repair._view_builder.local_is_initialized()) {
                 return make_exception_future<repair_row_level_start_response>(std::runtime_error(format("Node {} is not fully initialized for repair, try again later",
-                        local_repair.get_db().local().get_token_metadata().get_topology().my_address())));
+                        local_repair.my_address())));
             }
             streaming::stream_reason r = reason ? *reason : streaming::stream_reason::repair;
             const gc_clock::time_point ct = compaction_time ? *compaction_time : gc_clock::now();
@@ -2656,7 +2647,7 @@ private:
 
     inet_address_vector_replica_set sort_peer_nodes(const std::vector<gms::inet_address>& nodes) {
         inet_address_vector_replica_set sorted_nodes(nodes.begin(), nodes.end());
-        auto& topology = _shard_task.db.local().get_token_metadata().get_topology();
+        auto& topology = get_erm()->get_topology();
         topology.sort_by_proximity(topology.my_address(), sorted_nodes);
         return sorted_nodes;
     }
@@ -3045,16 +3036,17 @@ public:
                     _estimated_partitions /= master.all_nodes().size();
 
                     // In addition, estimate the difference between nodes is
-                    // less than 10% for regular repair. Underestimation will
-                    // not be a big problem since those sstables produced by
-                    // repair will go through off-strategy later anyway. The
-                    // worst case is that we have a worse false positive ratio
-                    // than expected temporarily when the sstable is still in
-                    // maintenance set.
+                    // less than the specified ratio for regular repair.
+                    // Underestimation will not be a big problem since those
+                    // sstables produced by repair will go through off-strategy
+                    // later anyway. The worst case is that we have a worse
+                    // false positive ratio than expected temporarily when the
+                    // sstable is still in maintenance set.
                     //
                     // To save memory and have less different conditions, we
-                    // use the 10% estimation for RBNO repair as well.
-                    _estimated_partitions /= 10;
+                    // use the estimation for RBNO repair as well.
+
+                    _estimated_partitions *= _shard_task.db.local().get_config().repair_partition_count_estimation_ratio();
                 }
 
                 parallel_for_each(master.all_nodes(), [&, this] (repair_node_state& ns) {
@@ -3178,27 +3170,27 @@ public:
     }
 };
 
-repair_service::repair_service(distributed<gms::gossiper>& gossiper,
+repair_service::repair_service(sharded<service::topology_state_machine>& tsm,
+        distributed<gms::gossiper>& gossiper,
         netw::messaging_service& ms,
         sharded<replica::database>& db,
         sharded<service::storage_proxy>& sp,
         sharded<service::raft_address_map>& addr_map,
         sharded<db::batchlog_manager>& bm,
-        sharded<db::system_distributed_keyspace>& sys_dist_ks,
         sharded<db::system_keyspace>& sys_ks,
-        sharded<db::view::view_update_generator>& vug,
+        sharded<db::view::view_builder>& vb,
         tasks::task_manager& tm,
         service::migration_manager& mm,
         size_t max_repair_memory)
-    : _gossiper(gossiper)
+    : _tsm(tsm)
+    , _gossiper(gossiper)
     , _messaging(ms)
     , _db(db)
     , _sp(sp)
     , _addr_map(addr_map)
     , _bm(bm)
-    , _sys_dist_ks(sys_dist_ks)
     , _sys_ks(sys_ks)
-    , _view_update_generator(vug)
+    , _view_builder(vb)
     , _repair_module(seastar::make_shared<repair::task_manager_module>(tm, *this, max_repair_memory))
     , _mm(mm)
     , _node_ops_metrics(_repair_module)
@@ -3218,13 +3210,22 @@ future<> repair_service::start() {
 }
 
 future<> repair_service::stop() {
+  try {
+    rlogger.debug("Stopping repair task module");
     co_await _repair_module->stop();
+    rlogger.debug("Waiting on load_history_done");
     co_await std::move(_load_history_done);
+    rlogger.debug("Uninitializing messaging service handlers");
     co_await uninit_ms_handlers();
     if (this_shard_id() == 0) {
+        rlogger.debug("Unregistering gossiper helper");
         co_await _gossiper.local().unregister_(_gossip_helper);
     }
     _stopped = true;
+    rlogger.info("Stopped repair_service");
+  } catch (...) {
+    on_fatal_internal_error(rlogger, format("Failed stopping repair_service: {}", std::current_exception()));
+  }
 }
 
 repair_service::~repair_service() {
@@ -3267,6 +3268,7 @@ future<> repair_service::cleanup_history(tasks::task_id repair_id) {
 }
 
 future<> repair_service::load_history() {
+  try {
     co_await get_db().local().get_tables_metadata().parallel_for_each_table(coroutine::lambda([&] (table_id table_uuid, lw_shared_ptr<replica::table> table) -> future<> {
         auto shard = utils::uuid_xor_to_uint32(table_uuid.uuid()) % smp::count;
         if (shard != this_shard_id()) {
@@ -3295,6 +3297,11 @@ future<> repair_service::load_history() {
             }
         });
     }));
+  } catch (const abort_requested_exception&) {
+    // Ignore
+  } catch (...) {
+    rlogger.warn("Failed to update repair history time: {}.  Ignored", std::current_exception());
+  }
 }
 
 repair_meta_ptr repair_service::get_repair_meta(gms::inet_address from, uint32_t repair_meta_id) {
@@ -3435,4 +3442,8 @@ future<uint32_t> repair_service::get_next_repair_meta_id() {
     return container().invoke_on(0, [] (repair_service& local_repair) {
         return local_repair._next_repair_meta_id++;
     });
+}
+
+gms::inet_address repair_service::my_address() const noexcept {
+    return _sp.local().my_address();
 }

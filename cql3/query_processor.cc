@@ -13,10 +13,13 @@
 #include <seastar/core/metrics.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 
+#include "seastar/core/shared_ptr.hh"
 #include "service/storage_proxy.hh"
+#include "service/topology_mutation.hh"
 #include "service/migration_manager.hh"
 #include "service/forward_service.hh"
 #include "service/raft/raft_group0_client.hh"
+#include "service/storage_service.hh"
 #include "cql3/CqlParser.hpp"
 #include "cql3/statements/batch_statement.hh"
 #include "cql3/statements/modification_statement.hh"
@@ -42,21 +45,27 @@ const sstring query_processor::CQL_VERSION = "3.3.1";
 const std::chrono::minutes prepared_statements_cache::entry_expiry = std::chrono::minutes(60);
 
 struct query_processor::remote {
-    remote(service::migration_manager& mm, service::forward_service& fwd, service::raft_group0_client& group0_client)
-            : mm(mm), forwarder(fwd), group0_client(group0_client) {}
+    remote(service::migration_manager& mm, service::forward_service& fwd,
+           service::storage_service& ss, service::raft_group0_client& group0_client)
+            : mm(mm), forwarder(fwd), ss(ss), group0_client(group0_client) {}
 
     service::migration_manager& mm;
     service::forward_service& forwarder;
+    service::storage_service& ss;
     service::raft_group0_client& group0_client;
 
     seastar::gate gate;
 };
 
+bool query_processor::topology_global_queue_empty() {
+    return remote().first.get().ss.topology_global_queue_empty();
+}
+
 static service::query_state query_state_for_internal_call() {
     return {service::client_state::for_internal_calls(), empty_service_permit()};
 }
 
-query_processor::query_processor(service::storage_proxy& proxy, data_dictionary::database db, service::migration_notifier& mn, query_processor::memory_config mcfg, cql_config& cql_cfg, utils::loading_cache_config auth_prep_cache_cfg, wasm::manager& wasm)
+query_processor::query_processor(service::storage_proxy& proxy, data_dictionary::database db, service::migration_notifier& mn, query_processor::memory_config mcfg, cql_config& cql_cfg, utils::loading_cache_config auth_prep_cache_cfg, lang::manager& langm)
         : _migration_subscriber{std::make_unique<migration_subscriber>(this)}
         , _proxy(proxy)
         , _db(db)
@@ -69,7 +78,7 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
         , _authorized_prepared_cache_config_action([this] { update_authorized_prepared_cache_config(); return make_ready_future<>(); })
         , _authorized_prepared_cache_update_interval_in_ms_observer(_db.get_config().permissions_update_interval_in_ms.observe(_auth_prepared_cache_cfg_cb))
         , _authorized_prepared_cache_validity_in_ms_observer(_db.get_config().permissions_validity_in_ms.observe(_auth_prepared_cache_cfg_cb))
-        , _wasm(wasm)
+        , _lang_manager(langm)
         {
     namespace sm = seastar::metrics;
     namespace stm = statements;
@@ -498,8 +507,8 @@ query_processor::~query_processor() {
 }
 
 void query_processor::start_remote(service::migration_manager& mm, service::forward_service& forwarder,
-                                  service::raft_group0_client& group0_client) {
-    _remote = std::make_unique<struct remote>(mm, forwarder, group0_client);
+                                   service::storage_service& ss, service::raft_group0_client& group0_client) {
+    _remote = std::make_unique<struct remote>(mm, forwarder, ss, group0_client);
 }
 
 future<> query_processor::stop_remote() {
@@ -512,9 +521,9 @@ future<> query_processor::stop_remote() {
 }
 
 future<> query_processor::stop() {
-    return _mnotifier.unregister_listener(_migration_subscriber.get()).then([this] {
-        return _authorized_prepared_cache.stop().finally([this] { return _prepared_cache.stop(); });
-    });
+    co_await _mnotifier.unregister_listener(_migration_subscriber.get());
+    co_await _authorized_prepared_cache.stop();
+    co_await _prepared_cache.stop();
 }
 
 future<::shared_ptr<cql_transport::messages::result_message>> query_processor::execute_with_guard(
@@ -646,24 +655,17 @@ query_processor::process_authorized_statement(const ::shared_ptr<cql_statement> 
 future<::shared_ptr<cql_transport::messages::result_message::prepared>>
 query_processor::prepare(sstring query_string, service::query_state& query_state) {
     auto& client_state = query_state.get_client_state();
-    return prepare(std::move(query_string), client_state, client_state.is_thrift());
+    return prepare(std::move(query_string), client_state);
 }
 
 future<::shared_ptr<cql_transport::messages::result_message::prepared>>
-query_processor::prepare(sstring query_string, const service::client_state& client_state, bool for_thrift) {
+query_processor::prepare(sstring query_string, const service::client_state& client_state) {
     using namespace cql_transport::messages;
-    if (for_thrift) {
-        return prepare_one<result_message::prepared::thrift>(
-                std::move(query_string),
-                client_state,
-                compute_thrift_id, prepared_cache_key_type::thrift_id);
-    } else {
-        return prepare_one<result_message::prepared::cql>(
-                std::move(query_string),
-                client_state,
-                compute_id,
-                prepared_cache_key_type::cql_id);
-    }
+    return prepare_one<result_message::prepared::cql>(
+            std::move(query_string),
+            client_state,
+            compute_id,
+            prepared_cache_key_type::cql_id);
 }
 
 static std::string hash_target(std::string_view query_string, std::string_view keyspace) {
@@ -676,16 +678,6 @@ prepared_cache_key_type query_processor::compute_id(
         std::string_view query_string,
         std::string_view keyspace) {
     return prepared_cache_key_type(md5_hasher::calculate(hash_target(query_string, keyspace)));
-}
-
-prepared_cache_key_type query_processor::compute_thrift_id(
-        const std::string_view& query_string,
-        const sstring& keyspace) {
-    uint32_t h = 0;
-    for (auto&& c : hash_target(query_string, keyspace)) {
-        h = 31*h + c;
-    }
-    return prepared_cache_key_type(static_cast<int32_t>(h));
 }
 
 std::unique_ptr<prepared_statement>
@@ -1003,33 +995,26 @@ query_processor::forward(query::forward_request req, tracing::trace_state_ptr tr
 }
 
 future<::shared_ptr<messages::result_message>>
-query_processor::execute_schema_statement(const statements::schema_altering_statement& stmt, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) {
-    ::shared_ptr<cql_transport::event::schema_change> ce;
-
+query_processor::execute_schema_statement(const statements::schema_altering_statement& stmt, service::query_state& state, const query_options& options, service::group0_batch& mc) {
     if (this_shard_id() != 0) {
         on_internal_error(log, "DDL must be executed on shard 0");
     }
 
-    if (!guard) {
-        on_internal_error(log, "Guard must be present when executing DDL");
+    // TODO: remove this field, it should be injected directly as prepare_schema_mutations argument
+    stmt.global_req_id = mc.new_group0_state_id();
+
+    auto [ce, warnings] = co_await stmt.prepare_schema_mutations(*this, state, options, mc);
+    // We are creating something.
+    if (!mc.empty()) {
+        // Internal queries don't trigger auto-grant. Statements which don't require
+        // auto-grant use default nop grant_permissions_to_creator implementation.
+        // Additional implicit assumption is that prepare_schema_mutations returns
+        // empty mutations vector when resource doesn't need to be created (e.g. already exists).
+        auto& client_state = state.get_client_state();
+        if (!client_state.is_internal()) {
+            co_await stmt.grant_permissions_to_creator(client_state, mc);
+        }
     }
-
-    auto [remote_, holder] = remote();
-
-    cql3::cql_warnings_vec warnings;
-
-    auto [ret, m, cql_warnings] = co_await stmt.prepare_schema_mutations(*this, guard->write_timestamp());
-    warnings = std::move(cql_warnings);
-
-    if (!m.empty()) {
-        auto description = format("CQL DDL statement: \"{}\"", stmt.raw_cql_statement);
-        co_await remote_.get().mm.announce(std::move(m), std::move(*guard), description);
-    }
-
-    ce = std::move(ret);
-
-    // If an IF [NOT] EXISTS clause was used, this may not result in an actual schema change.  To avoid doing
-    // extra work in the drivers to handle schema changes, we return an empty message in this case. (CASSANDRA-7600)
     ::shared_ptr<messages::result_message> result;
     if (!ce) {
         result = ::make_shared<messages::result_message::void_message>();
@@ -1044,20 +1029,27 @@ query_processor::execute_schema_statement(const statements::schema_altering_stat
     co_return result;
 }
 
-future<std::string>
-query_processor::execute_thrift_schema_command(
-        std::function<future<std::vector<mutation>>(data_dictionary::database, api::timestamp_type)> prepare_schema_mutations,
-        std::string_view description) {
-    assert(this_shard_id() == 0);
-
+future<> query_processor::announce_schema_statement(const statements::schema_altering_statement& stmt, service::group0_batch& mc) {
+    auto description = format("CQL DDL statement: \"{}\"", stmt.raw_cql_statement);
     auto [remote_, holder] = remote();
-    auto& mm = remote_.get().mm;
-    auto group0_guard = co_await mm.start_group0_operation();
-    auto ts = group0_guard.write_timestamp();
-
-    co_await mm.announce(co_await prepare_schema_mutations(db(), ts), std::move(group0_guard), description);
-
-    co_return std::string(db().get_version().to_sstring());
+    auto [m, guard] = co_await std::move(mc).extract();
+    if (m.empty()) {
+        co_return;
+    }
+    auto alter_ks_stmt_ptr = dynamic_cast<const statements::alter_keyspace_statement*>(&stmt);
+    if (alter_ks_stmt_ptr && alter_ks_stmt_ptr->changes_tablets(*this)) {
+        auto request_id = guard.new_group0_state_id();
+        co_await remote_.get().mm.announce<service::topology_change>(std::move(m), std::move(guard), description);
+        // TODO: eliminate timeout from alter ks statement on the cqlsh/driver side
+        auto error = co_await remote_.get().ss.wait_for_topology_request_completion(request_id);
+        co_await remote_.get().ss.wait_for_topology_not_busy();
+        if (!error.empty()) {
+            log.error("CQL statement \"{}\" with topology request_id \"{}\" failed with error: \"{}\"", stmt.raw_cql_statement, request_id, error);
+            throw exceptions::request_execution_exception(exceptions::exception_code::INVALID, error);
+        }
+        co_return;
+    }
+    co_await remote_.get().mm.announce(std::move(m), std::move(guard), description);
 }
 
 query_processor::migration_subscriber::migration_subscriber(query_processor* qp) : _qp{qp} {

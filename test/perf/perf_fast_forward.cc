@@ -44,6 +44,14 @@ namespace sstables {
     extern bool use_binary_search_in_promoted_index;
 } // namespace sstables
 
+namespace std {
+// required by boost::lexical_cast<std::string>(vector<string>), which is in turn used
+// by boost::program_option for printing out the default value of an option
+std::ostream& operator<<(std::ostream& os, const std::vector<string>& v) {
+    return os << fmt::format("{}", v);
+}
+}
+
 reactor::io_stats s;
 
 static bool errors_found = false;
@@ -1762,7 +1770,7 @@ void populate(const std::vector<dataset*>& datasets, cql_test_env& env, const ta
 
         output_mgr->set_test_param_names({{"flush@ (MiB)", "{:<12}"}}, test_result::stats_names());
 
-        db.get_compaction_manager().run_with_compaction_disabled(cf.as_table_state(), [&] {
+        db.get_compaction_manager().run_with_compaction_disabled(cf.try_get_table_state_with_static_sharding(), [&] {
             return seastar::async([&] {
                 auto gen = ds.make_generator(s, cfg);
                 while (auto mopt = gen()) {
@@ -1869,7 +1877,7 @@ auto make_compaction_disabling_guard(replica::database& db, std::vector<replica:
     shared_promise<> pr;
     for (auto&& t : tables) {
         // FIXME: discarded future.
-        (void)db.get_compaction_manager().run_with_compaction_disabled(t->as_table_state(), [f = shared_future<>(pr.get_shared_future())] {
+        (void)db.get_compaction_manager().run_with_compaction_disabled(t->try_get_table_state_with_static_sharding(), [f = shared_future<>(pr.get_shared_future())] {
             return f.get_future();
         });
     }
@@ -1965,8 +1973,8 @@ int scylla_fast_forward_main(int argc, char** argv) {
             logging::logger_registry().set_logger_level("sstable", seastar::log_level::trace);
         }
 
-        std::cout << "Data directory: " << db_cfg.data_file_directories() << "\n";
-        std::cout << "Output directory: " << output_dir << "\n";
+        fmt::print("Data directory: {}\n", db_cfg.data_file_directories());
+        fmt::print("Output directory: {}\n", output_dir);
 
         auto init = [&app] {
             auto conf_seed = app.configuration()["random-seed"];

@@ -4,11 +4,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
 
-import pytest
-from rest_api_mock import expected_request
-import subprocess
-
-import utils
+from test.nodetool.rest_api_mock import expected_request
+from test.nodetool.utils import check_nodetool_fails_with
 
 
 # These are simple smoke tests, because automatically testing help is next to impossible.
@@ -31,7 +28,7 @@ def test_help_command(nodetool):
 
 def test_help_nonexistent_command(request, nodetool):
     if request.config.getoption("nodetool") == "scylla":
-        utils.check_nodetool_fails_with(
+        check_nodetool_fails_with(
                 nodetool,
                 ("help", "foo",),
                 {},
@@ -42,7 +39,7 @@ def test_help_nonexistent_command(request, nodetool):
 
 
 def test_help_command_too_many_args(nodetool, scylla_only):
-    utils.check_nodetool_fails_with(
+    check_nodetool_fails_with(
             nodetool,
             ("help", "compact", "foo", "bar"),
             {},
@@ -52,9 +49,5 @@ def test_help_command_too_many_args(nodetool, scylla_only):
 def test_help_consistent(nodetool, scylla_only):
     for command in ("version", "compact", "settraceprobability"):
         res1 = nodetool("help", command)
-        # seastar returns 1 when --help is invoked
-        with pytest.raises(subprocess.CalledProcessError) as e:
-            nodetool(command, "--help")
-        assert e.value.returncode == 1
-        out2 = e.value.stdout
-        assert res1.stdout == out2
+        res2 = nodetool(command, "--help")
+        assert res1.stdout == res2.stdout

@@ -12,9 +12,9 @@
 
 #include "cql3/cql3_type.hh"
 #include "mutation/mutation.hh"
-#include "mutation/mutation_fragment.hh"
 #include "schema/schema_builder.hh"
 #include "test/lib/cql_test_env.hh"
+#include "test/lib/eventually.hh"
 #include "test/lib/random_schema.hh"
 #include "test/lib/random_utils.hh"
 #include "types/list.hh"
@@ -179,7 +179,6 @@ public:
         , _static_column_count_dist(static_column_count_dist)
         , _type_generator(*this) {
         assert(_partition_column_count_dist.a() > 0);
-        assert(_regular_column_count_dist.a() > 0);
     }
     virtual sstring table_name(std::mt19937& engine) override {
         return format("table{}", generate_unique_id(engine, _used_table_ids));
@@ -826,7 +825,6 @@ schema_ptr build_random_schema(uint32_t seed, random_schema_specification& spec)
     }
 
     const auto regular_columns = spec.regular_columns(engine);
-    assert(!regular_columns.empty()); // Let's not pull in boost::test here
     for (size_t r = 0; r < regular_columns.size(); ++r) {
         builder.with_column(to_bytes(format("v{}", r)), std::move(regular_columns[r]), column_kind::regular_column);
     }

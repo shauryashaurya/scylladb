@@ -14,7 +14,6 @@
 #include "db/data_listeners.hh"
 
 namespace cql_transport { class controller; }
-class thrift_controller;
 namespace db {
 class snapshot_ctl;
 namespace view {
@@ -40,7 +39,11 @@ sstring validate_keyspace(const http_context& ctx, sstring ks_name);
 
 // verify that the keyspace parameter is found, otherwise a bad_param_exception exception is thrown
 // containing the description of the respective keyspace error.
-sstring validate_keyspace(const http_context& ctx, const httpd::parameters& param);
+sstring validate_keyspace(const http_context& ctx, const std::unique_ptr<http::request>& req);
+
+// verify that the table parameter is found, otherwise a bad_param_exception exception is thrown
+// containing the description of the respective table error.
+void validate_table(const http_context& ctx, sstring ks_name, sstring table_name);
 
 // splits a request parameter assumed to hold a comma-separated list of table names
 // verify that the tables are found, otherwise a bad_param_exception exception is thrown
@@ -76,8 +79,8 @@ void set_repair(http_context& ctx, httpd::routes& r, sharded<repair_service>& re
 void unset_repair(http_context& ctx, httpd::routes& r);
 void set_transport_controller(http_context& ctx, httpd::routes& r, cql_transport::controller& ctl);
 void unset_transport_controller(http_context& ctx, httpd::routes& r);
-void set_rpc_controller(http_context& ctx, httpd::routes& r, thrift_controller& ctl);
-void unset_rpc_controller(http_context& ctx, httpd::routes& r);
+void set_thrift_controller(http_context& ctx, httpd::routes& r);
+void unset_thrift_controller(http_context& ctx, httpd::routes& r);
 void set_snapshot(http_context& ctx, httpd::routes& r, sharded<db::snapshot_ctl>& snap_ctl);
 void unset_snapshot(http_context& ctx, httpd::routes& r);
 seastar::future<json::json_return_type> run_toppartitions_query(db::toppartitions_query& q, http_context &ctx, bool legacy_request = false);

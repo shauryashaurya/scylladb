@@ -114,6 +114,12 @@ using error_injection_parameters = std::unordered_map<sstring, sstring>;
  *      co_await inject(name, [&value](auto& handler) { value = handler.get("value"); }
  *    The function simply returns the 'value' parameter.
  *    Expected use case: adjusting system parameters for tests.
+ * 6. set_parameter(injection_name, parameter_name, parameter_value)
+ *    Enable tests to observe the value of internal parameters, without having to
+ *    publicly expose said parameters.
+ *    This is the opposite of inject_parameter(name).
+ *    Expected use case: validate that certain code path was taken, and/or the
+ *    value of some parameter is the expected value, on given code-path.
  */
 
 template <bool injection_enabled>
@@ -403,7 +409,7 @@ public:
     // Avoid adding a sleep continuation in the chain for disabled error injection
     template <typename Clock, typename Duration, typename Func>
     [[gnu::always_inline]]
-    std::result_of_t<Func()> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline,
+    std::invoke_result_t<Func> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline,
                 Func&& func) {
         if (is_enabled(name)) {
             if (is_one_shot(name)) {
@@ -473,6 +479,29 @@ public:
             return std::nullopt;
         }
         return data->shared_data->template get<T>("value");
+    }
+
+    // \brief Export the value of the parameter with the given name
+    // \param injection_name the name of the error injection
+    // \param parameter_name the name of the exported parameter
+    // \param parameter_value the value of the exported parameter
+    //
+    // This method is inject_parameter() in the other direction, allows external
+    // code to observe internal values.
+    void set_parameter(std::string_view injection_name, sstring parameter_name, sstring parameter_value) {
+        if (auto data = get_data(injection_name); data) {
+            data->shared_data->parameters[std::move(parameter_name)] = std::move(parameter_value);
+        }
+        if (is_one_shot(injection_name)) {
+            disable(injection_name);
+        }
+    }
+
+    error_injection_parameters get_injection_parameters(std::string_view name) {
+        if (auto data = get_data(name); data) {
+            return data->shared_data->parameters;
+        }
+        return {};
     }
 
     future<> enable_on_all(const std::string_view& injection_name, bool one_shot = false, error_injection_parameters parameters = {}) {
@@ -573,7 +602,7 @@ public:
     // Avoid adding a continuation in the chain for disabled error injections
     template <typename Clock, typename Duration, typename Func>
     [[gnu::always_inline]]
-    std::result_of_t<Func()> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline,
+    std::invoke_result_t<Func> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline,
                 Func&& func) {
         return func();
     }
@@ -602,6 +631,14 @@ public:
     }
 
     [[gnu::always_inline]]
+    void set_parameter(std::string_view injection_name, sstring parameter_name, sstring parameter_value) { }
+
+    [[gnu::always_inline]]
+    error_injection_parameters get_injection_parameters(std::string_view name) {
+        return {};
+    }
+
+    [[gnu::always_inline]]
     static future<> enable_on_all(const std::string_view& injection_name, const bool one_shot = false, const error_injection_parameters& parameters = {}) {
         return make_ready_future<>();
     }
@@ -620,6 +657,9 @@ public:
     static future<> receive_message_on_all(const std::string_view& injection_name) {
         return make_ready_future<>();
     }
+
+    [[gnu::always_inline]]
+    static void receive_message(const std::string_view& injection_name) {}
 
     [[gnu::always_inline]]
     static std::vector<sstring> enabled_injections_on_all() { return {}; }

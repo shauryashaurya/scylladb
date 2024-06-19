@@ -17,6 +17,8 @@
 #include <set>
 #include <deque>
 
+#include <fmt/ranges.h>
+
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future-util.hh>
@@ -42,15 +44,9 @@
 #include "test/lib/sstable_utils.hh"
 #include "test/lib/mutation_source_test.hh"
 #include "test/lib/key_utils.hh"
+#include "test/lib/test_utils.hh"
 
 using namespace db;
-
-namespace db {
-std::ostream& boost_test_print_type(std::ostream& os, const replay_position& p) {
-    fmt::print(os, "{}", p);
-    return os;
-}
-}
 
 static future<> cl_test(commitlog::config cfg, noncopyable_function<future<> (commitlog&)> f) {
     // enable as needed.
@@ -940,7 +936,7 @@ SEASTAR_TEST_CASE(test_commitlog_replay_invalid_key){
             auto fm = freeze(m);
             commitlog_entry_writer cew(s, fm, db::commitlog::force_sync::yes);
             cl.add_entry(m.column_family_id(), cew, db::no_timeout).get();
-            return sharder.shard_of(m.token());
+            return sharder.shard_for_reads(m.token());
         };
 
         const auto shard = add_entry(partition_key::make_empty());

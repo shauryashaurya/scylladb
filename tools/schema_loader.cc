@@ -29,7 +29,6 @@
 #include "db/large_data_handler.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "db/schema_tables.hh"
-#include "db/system_auth_keyspace.hh"
 #include "db/system_keyspace.hh"
 #include "partition_slice_builder.hh"
 #include "readers/combined.hh"
@@ -326,8 +325,7 @@ std::vector<schema_ptr> do_load_schemas(const db::config& cfg, std::string_view 
             }
             it->schema = std::move(new_base_schema);
             it->secondary_idx_man.reload();
-            const bool new_token_column_computation = db.features().correct_idx_token_in_secondary_index;
-            auto view = it->secondary_idx_man.create_view_for_index(index, new_token_column_computation);
+            auto view = it->secondary_idx_man.create_view_for_index(index);
             real_db.tables.emplace_back(dd_impl, dd_impl.unwrap(ks), view, true);
         } else if (auto p = dynamic_cast<cql3::statements::update_statement*>(statement)) {
             if (p->keyspace() != db::schema_tables::NAME && p->column_family() != db::schema_tables::DROPPED_COLUMNS) {
@@ -628,7 +626,8 @@ schema_ptr do_load_schema_from_schema_tables(const db::config& dbcfg, std::files
             ut_builder.add(name, field_names, field_types);
         }
 
-        for (auto&& ut : ut_builder.build()) {
+        auto user_types = ut_builder.build().get();
+        for (auto&& ut : user_types) {
             utm.add_type(std::move(ut));
         }
     }
@@ -648,6 +647,89 @@ schema_ptr do_load_schema_from_schema_tables(const db::config& dbcfg, std::files
     } else {
         return db::schema_tables::create_table_from_mutations(ctxt, muts);
     }
+}
+
+schema_ptr do_load_schema_from_sstable(const db::config& dbcfg, std::filesystem::path sstable_path, sstring keyspace, sstring table) {
+    if (keyspace.empty()) {
+        keyspace = "my_keyspace";
+    }
+    if (table.empty()) {
+        table = "my_table";
+    }
+
+    db::nop_large_data_handler large_data_handler;
+    gms::feature_service feature_service(gms::feature_config_from_db_config(dbcfg));
+    cache_tracker tracker;
+    sstables::directory_semaphore dir_sem(1);
+    sstables::sstables_manager sst_man("tools::load_schema_from_sstable", large_data_handler, dbcfg, feature_service, tracker,
+        memory::stats().total_memory(), dir_sem,
+        [host_id = locator::host_id::create_random_id()] { return host_id; });
+    auto close_sst_man = deferred_close(sst_man);
+
+    schema_ptr bootstrap_schema = schema_builder(keyspace, table).with_column("pk", int32_type, column_kind::partition_key).build();
+
+    const auto ed = sstables::parse_path(sstable_path, keyspace, table);
+    const auto dir_path = sstable_path.parent_path();
+    data_dictionary::storage_options local;
+    auto bootstrap_sst = sst_man.make_sstable(bootstrap_schema, dir_path.c_str(), local, ed.generation, sstables::sstable_state::normal, ed.version, ed.format);
+
+    bootstrap_sst->load_metadata({}, false).get();
+
+    const auto& serialization_header = bootstrap_sst->get_serialization_header();
+    const auto& compression = bootstrap_sst->get_compression();
+
+    auto builder = schema_builder(keyspace, table);
+
+    const auto to_string_view = [] (bytes_view b) {
+        return std::string_view(reinterpret_cast<const char*>(b.data()), b.size());
+    };
+    const auto parse_type = [&to_string_view] (bytes_view type_name) {
+        return db::marshal::type_parser::parse(to_string_view(type_name));
+    };
+
+    // partition key
+    {
+        const auto pk_type_name = serialization_header.pk_type_name.value;
+
+        const bytes composite_prefix = "org.apache.cassandra.db.marshal.CompositeType(";
+
+        if (pk_type_name.starts_with(composite_prefix)) {
+            const auto composite_content = pk_type_name.substr(composite_prefix.size(), pk_type_name.size() - composite_prefix.size() - 1);
+
+            db::marshal::type_parser parser(to_string_view(composite_content));
+            unsigned i = 0;
+
+            while (!parser.is_eos()) {
+                builder.with_column(to_bytes(format("$pk{}", i++)), parser.parse(), column_kind::partition_key);
+                parser.skip_blank_and_comma();
+            }
+        } else {
+            builder.with_column("$pk", parse_type(pk_type_name), column_kind::partition_key);
+        }
+    }
+
+    // clustering key
+    {
+        unsigned i = 0;
+        for (const auto& type_name : serialization_header.clustering_key_types_names.elements) {
+            builder.with_column(to_bytes(format("$ck{}", i++)), parse_type(type_name.value), column_kind::clustering_key);
+        }
+    }
+
+    // static columns
+    for (const auto& col_desc : serialization_header.static_columns.elements) {
+        builder.with_column(col_desc.name.value, parse_type(col_desc.type_name.value), column_kind::static_column);
+    }
+
+    // regular columns
+    for (const auto& col_desc : serialization_header.regular_columns.elements) {
+        builder.with_column(col_desc.name.value, parse_type(col_desc.type_name.value), column_kind::regular_column);
+    }
+
+    // compression options
+    builder.set_compressor_params(sstables::get_sstable_compressor(compression));
+
+    return builder.build();
 }
 
 } // anonymous namespace
@@ -685,7 +767,6 @@ schema_ptr load_system_schema(const db::config& cfg, std::string_view keyspace, 
         {db::system_distributed_keyspace::NAME, db::system_distributed_keyspace::all_distributed_tables()},
         {db::system_distributed_keyspace::NAME_EVERYWHERE, db::system_distributed_keyspace::all_everywhere_tables()},
     };
-    schemas[db::system_auth_keyspace::NAME] = db::system_auth_keyspace::all_tables();
     auto ks_it = schemas.find(keyspace);
     if (ks_it == schemas.end()) {
         throw std::invalid_argument(fmt::format("unknown system keyspace: {}", keyspace));
@@ -702,6 +783,12 @@ schema_ptr load_system_schema(const db::config& cfg, std::string_view keyspace, 
 future<schema_ptr> load_schema_from_schema_tables(const db::config& cfg, std::filesystem::path scylla_data_path, std::string_view keyspace, std::string_view table) {
     return async([=, &cfg] () mutable {
         return do_load_schema_from_schema_tables(cfg, scylla_data_path, keyspace, table);
+    });
+}
+
+future<schema_ptr> load_schema_from_sstable(const db::config& cfg, std::filesystem::path sstable_path, std::string_view keyspace, std::string_view table) {
+    return async([=, &cfg, sstable_path = std::move(sstable_path)] () mutable {
+        return do_load_schema_from_sstable(cfg, std::move(sstable_path), sstring(keyspace), sstring(table));
     });
 }
 

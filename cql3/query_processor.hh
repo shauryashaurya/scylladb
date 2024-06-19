@@ -28,12 +28,11 @@
 #include "service/client_state.hh"
 #include "service/broadcast_tables/experimental/query_result.hh"
 #include "utils/observable.hh"
-#include "lang/wasm.hh"
 #include "service/raft/raft_group0_client.hh"
 #include "types/types.hh"
-#include "db/system_auth_keyspace.hh"
 
 
+namespace lang { class manager; }
 namespace service {
 class migration_manager;
 class query_state;
@@ -132,7 +131,7 @@ private:
     // don't bother with expiration on those.
     std::unordered_map<sstring, std::unique_ptr<statements::prepared_statement>> _internal_statements;
 
-    wasm::manager& _wasm;
+    lang::manager& _lang_manager;
 public:
     static const sstring CQL_VERSION;
 
@@ -140,18 +139,15 @@ public:
             std::string_view query_string,
             std::string_view keyspace);
 
-    static prepared_cache_key_type compute_thrift_id(
-            const std::string_view& query_string,
-            const sstring& keyspace);
-
     static std::unique_ptr<statements::raw::parsed_statement> parse_statement(const std::string_view& query);
     static std::vector<std::unique_ptr<statements::raw::parsed_statement>> parse_statements(std::string_view queries);
 
-    query_processor(service::storage_proxy& proxy, data_dictionary::database db, service::migration_notifier& mn, memory_config mcfg, cql_config& cql_cfg, utils::loading_cache_config auth_prep_cache_cfg, wasm::manager& wasm);
+    query_processor(service::storage_proxy& proxy, data_dictionary::database db, service::migration_notifier& mn, memory_config mcfg, cql_config& cql_cfg, utils::loading_cache_config auth_prep_cache_cfg, lang::manager& langm);
 
     ~query_processor();
 
-    void start_remote(service::migration_manager&, service::forward_service&, service::raft_group0_client&);
+    void start_remote(service::migration_manager&, service::forward_service&,
+                      service::storage_service& ss, service::raft_group0_client&);
     future<> stop_remote();
 
     data_dictionary::database db() {
@@ -174,9 +170,9 @@ public:
         return _cql_stats;
     }
 
-    wasm::manager& wasm() { return _wasm; }
+    lang::manager& lang() { return _lang_manager; }
 
-    db::system_auth_keyspace::version_t auth_version;
+    db::system_keyspace::auth_version_t auth_version;
 
     statements::prepared_statement::checked_weak_ptr get_prepared(const std::optional<auth::authenticated_user>& user, const prepared_cache_key_type& key) {
         if (user) {
@@ -404,7 +400,7 @@ public:
     prepare(sstring query_string, service::query_state& query_state);
 
     future<::shared_ptr<cql_transport::messages::result_message::prepared>>
-    prepare(sstring query_string, const service::client_state& client_state, bool for_thrift);
+    prepare(sstring query_string, const service::client_state& client_state);
 
     future<> stop();
 
@@ -442,12 +438,8 @@ public:
     struct retry_statement_execution_error : public std::exception {};
 
     future<::shared_ptr<cql_transport::messages::result_message>>
-    execute_schema_statement(const statements::schema_altering_statement&, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard);
-
-    future<std::string>
-    execute_thrift_schema_command(
-            std::function<future<std::vector<mutation>>(data_dictionary::database, api::timestamp_type)> prepare_schema_mutations,
-            std::string_view description);
+    execute_schema_statement(const statements::schema_altering_statement&, service::query_state& state, const query_options& options, service::group0_batch& mc);
+    future<> announce_schema_statement(const statements::schema_altering_statement&, service::group0_batch& mc);
 
     std::unique_ptr<statements::prepared_statement> get_statement(
             const std::string_view& query,
@@ -460,6 +452,8 @@ public:
     void update_authorized_prepared_cache_config();
 
     void reset_cache();
+
+    bool topology_global_queue_empty();
 
 private:
     // Keep the holder until you stop using the `remote` services.
@@ -517,10 +511,10 @@ private:
         ::shared_ptr<cql_statement> statement, service::query_state& query_state, const query_options& options);
 
     ///
-    /// \tparam ResultMsgType type of the returned result message (CQL or Thrift)
+    /// \tparam ResultMsgType type of the returned result message (CQL)
     /// \tparam PreparedKeyGenerator a function that generates the prepared statement cache key for given query and
     ///         keyspace
-    /// \tparam IdGetter a function that returns the corresponding prepared statement ID (CQL or Thrift) for a given
+    /// \tparam IdGetter a function that returns the corresponding prepared statement ID (CQL) for a given
     ////        prepared statement cache key
     /// \param query_string
     /// \param client_state

@@ -25,7 +25,6 @@
 #include "bytes.hh"
 #include "schema/schema.hh"
 #include "service/tablet_allocator.hh"
-#include "test/lib/eventually.hh"
 
 namespace replica {
 class database;
@@ -140,6 +139,8 @@ public:
 
     virtual replica::database& local_db() = 0;
 
+    virtual sharded<locator::shared_token_metadata>& shared_token_metadata() = 0;
+
     virtual cql3::query_processor& local_qp() = 0;
 
     virtual distributed<replica::database>& db() = 0;
@@ -183,5 +184,8 @@ public:
 
 future<> do_with_cql_env(std::function<future<>(cql_test_env&)> func, cql_test_config = {}, std::optional<cql_test_init_configurables> = {});
 future<> do_with_cql_env_thread(std::function<void(cql_test_env&)> func, cql_test_config = {}, thread_attributes thread_attr = {}, std::optional<cql_test_init_configurables> = {});
+
+// this function should be called in seastar thread
+void do_with_mc(cql_test_env& env, std::function<void(service::group0_batch&)> func);
 
 reader_permit make_reader_permit(cql_test_env&);

@@ -7,6 +7,7 @@
  */
 
 #include <seastar/coroutine/parallel_for_each.hh>
+#include <seastar/coroutine/switch_to.hh>
 #include "log.hh"
 #include "sstables/sstables_manager.hh"
 #include "sstables/sstables_registry.hh"
@@ -23,7 +24,7 @@ namespace sstables {
 logging::logger smlogger("sstables_manager");
 
 sstables_manager::sstables_manager(
-    sstring name, db::large_data_handler& large_data_handler, const db::config& dbcfg, gms::feature_service& feat, cache_tracker& ct, size_t available_memory, directory_semaphore& dir_sem, noncopyable_function<locator::host_id()>&& resolve_host_id, storage_manager* shared)
+    sstring name, db::large_data_handler& large_data_handler, const db::config& dbcfg, gms::feature_service& feat, cache_tracker& ct, size_t available_memory, directory_semaphore& dir_sem, noncopyable_function<locator::host_id()>&& resolve_host_id, scheduling_group maintenance_sg, storage_manager* shared)
     : _storage(shared)
     , _available_memory(available_memory)
     , _large_data_handler(large_data_handler), _db_config(dbcfg), _features(feat), _cache_tracker(ct)
@@ -37,7 +38,9 @@ sstables_manager::sstables_manager(
         reader_concurrency_semaphore::register_metrics::no)
     , _dir_semaphore(dir_sem)
     , _resolve_host_id(std::move(resolve_host_id))
+    , _maintenance_sg(std::move(maintenance_sg))
 {
+    _components_reloader_status = components_reloader_fiber();
 }
 
 sstables_manager::~sstables_manager() {
@@ -165,7 +168,59 @@ void sstables_manager::increment_total_reclaimable_memory_and_maybe_reclaim(ssta
     auto memory_reclaimed = sst_with_max_memory->reclaim_memory_from_components();
     _total_memory_reclaimed += memory_reclaimed;
     _total_reclaimable_memory -= memory_reclaimed;
+    _reclaimed.insert(*sst_with_max_memory);
     smlogger.info("Reclaimed {} bytes of memory from SSTable components. Total memory reclaimed so far is {} bytes", memory_reclaimed, _total_memory_reclaimed);
+}
+
+size_t sstables_manager::get_memory_available_for_reclaimable_components() {
+    size_t memory_reclaim_threshold = _available_memory * _db_config.components_memory_reclaim_threshold();
+    return memory_reclaim_threshold - _total_reclaimable_memory;
+}
+
+future<> sstables_manager::components_reloader_fiber() {
+    co_await coroutine::switch_to(_maintenance_sg);
+
+    sstlog.trace("components_reloader_fiber start");
+    while (true) {
+        co_await _sstable_deleted_event.when();
+
+        if (_closing) {
+            co_return;
+        }
+
+        // Reload bloom filters from the smallest to largest so as to maximize
+        // the number of bloom filters being reloaded.
+        auto memory_available = get_memory_available_for_reclaimable_components();
+        while (!_reclaimed.empty() && memory_available > 0) {
+            auto sstable_to_reload = _reclaimed.begin();
+            const size_t reclaimed_memory = sstable_to_reload->total_memory_reclaimed();
+            if (reclaimed_memory > memory_available) {
+                // cannot reload anymore sstables
+                break;
+            }
+
+            // Increment the total memory before reloading to prevent any parallel
+            // fibers from loading new bloom filters into memory.
+            _total_reclaimable_memory += reclaimed_memory;
+            _reclaimed.erase(sstable_to_reload);
+            // Use a lw_shared_ptr to prevent the sstable from getting deleted when
+            // the components are being reloaded.
+            auto sstable_ptr = sstable_to_reload->shared_from_this();
+            try {
+                co_await sstable_ptr->reload_reclaimed_components();
+            } catch (...) {
+                // reload failed due to some reason
+                sstlog.warn("Failed to reload reclaimed SSTable components : {}", std::current_exception());
+                // revert back changes made before the reload
+                _total_reclaimable_memory -= reclaimed_memory;
+                _reclaimed.insert(*sstable_to_reload);
+                break;
+            }
+
+            _total_memory_reclaimed -= reclaimed_memory;
+            memory_available = get_memory_available_for_reclaimable_components();
+        }
+    }
 }
 
 void sstables_manager::add(sstable* sst) {
@@ -175,6 +230,8 @@ void sstables_manager::add(sstable* sst) {
 void sstables_manager::deactivate(sstable* sst) {
     // Remove SSTable from the reclaimable memory tracking
     _total_reclaimable_memory -= sst->total_reclaimable_memory_size();
+    _total_memory_reclaimed -= sst->total_memory_reclaimed();
+    _reclaimed.erase(*sst);
 
     // At this point, sst has a reference count of zero, since we got here from
     // lw_shared_ptr_deleter<sstables::sstable>::dispose().
@@ -191,6 +248,7 @@ void sstables_manager::deactivate(sstable* sst) {
 void sstables_manager::remove(sstable* sst) {
     _undergoing_close.erase(_undergoing_close.iterator_to(*sst));
     delete sst;
+    _sstable_deleted_event.signal();
     maybe_done();
 }
 
@@ -224,6 +282,9 @@ future<> sstables_manager::close() {
     maybe_done();
     co_await _done.get_future();
     co_await _sstable_metadata_concurrency_sem.stop();
+    // stop the components reload fiber
+    _sstable_deleted_event.signal();
+    co_await std::move(_components_reloader_status);
 }
 
 void sstables_manager::plug_sstables_registry(std::unique_ptr<sstables::sstables_registry> sr) noexcept {

@@ -53,7 +53,7 @@ using can_yield = utils::can_yield;
 
 using replication_strategy_config_options = std::map<sstring, sstring>;
 struct replication_strategy_params {
-    const replication_strategy_config_options& options;
+    const replication_strategy_config_options options;
     std::optional<unsigned> initial_tablets;
     explicit replication_strategy_params(const replication_strategy_config_options& o, std::optional<unsigned> it) noexcept : options(o), initial_tablets(it) {}
 };
@@ -264,8 +264,12 @@ public:
     // Note: must be called after token_metadata has been initialized.
     virtual dht::token_range_vector get_ranges(inet_address ep) const = 0;
 
-    shard_id shard_of(const schema& s, dht::token t) const {
-        return get_sharder(s).shard_of(t);
+    shard_id shard_for_reads(const schema& s, dht::token t) const {
+        return get_sharder(s).shard_for_reads(t);
+    }
+
+    dht::shard_replica_set shard_for_writes(const schema& s, dht::token t) const {
+        return get_sharder(s).shard_for_writes(t);
     }
 };
 
@@ -309,8 +313,6 @@ public:
         factory_key(const factory_key&) = default;
 
         bool operator==(const factory_key& o) const = default;
-
-        sstring to_sstring() const;
     };
 private:
     replication_map _replication_map;

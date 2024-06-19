@@ -90,7 +90,7 @@
          "operations":[
             {
                "method":"GET",
-               "summary":"Returns a list of the tokens endpoint mapping",
+               "summary":"Returns a list of the tokens endpoint mapping, provide keyspace and cf param to get tablet mapping",
                "type":"array",
                "items":{
                   "type":"mapper"
@@ -100,6 +100,22 @@
                   "application/json"
                ],
                "parameters":[
+                  {
+                     "name":"keyspace",
+                     "description":"The keyspace to provide the tablet mapping for",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"cf",
+                     "description":"The table to provide the tablet mapping for",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  }
                ]
             }
          ]
@@ -1674,32 +1690,10 @@
          "path":"/storage_service/rpc_server",
          "operations":[
             {
-               "method":"DELETE",
-               "summary":"Allows a user to disable thrift",
-               "type":"void",
-               "nickname":"stop_rpc_server",
-               "produces":[
-                  "application/json"
-               ],
-               "parameters":[
-               ]
-            },
-            {
-               "method":"POST",
-               "summary":"allows a user to re-enable thrift",
-               "type":"void",
-               "nickname":"start_rpc_server",
-               "produces":[
-                  "application/json"
-               ],
-               "parameters":[
-               ]
-            },
-            {
                "method":"GET",
                "summary":"Determine if thrift is running",
                "type":"boolean",
-               "nickname":"is_rpc_server_running",
+               "nickname":"is_thrift_server_running",
                "produces":[
                   "application/json"
                ],
@@ -2054,7 +2048,7 @@
          "operations":[
             {
                "method":"POST",
-               "summary":"Enables/Disables tracing for the whole system. Only thrift requests can start tracing currently",
+               "summary":"Enables/Disables tracing for the whole system.",
                "type":"void",
                "nickname":"set_trace_probability",
                "produces":[
@@ -2722,6 +2716,22 @@
                      "type":"boolean",
                      "paramType":"query"
                   }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/quiesce_topology",
+         "operations":[
+            {
+               "nickname":"quiesce_topology",
+               "method":"POST",
+               "summary":"Waits until there are no ongoing topology operations. Guarantees that topology operations which started before the call are finished after the call. This doesn't consider requested but not started operations. Such operations may start after the call succeeds.",
+               "type":"void",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
                ]
             }
          ]

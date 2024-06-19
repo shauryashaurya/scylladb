@@ -230,6 +230,14 @@ class ScyllaRESTAPIClient():
         await self.client.post(f"/v2/error_injection/injection/{injection}",
                                host=node_ip, params={"one_shot": str(one_shot)}, json={ key: str(value) for key, value in parameters.items() })
 
+    async def get_injection(self, node_ip: str, injection: str) -> list[dict[str, Any]]:
+        """Read the state of the error injection named `injection` on `node_ip`.
+           The returned information includes whether the error injections is
+           active, as well as any parameters it might have.
+           Note: this only has an effect in specific build modes: debug,dev,sanitize.
+        """
+        return await self.client.get_json(f"/v2/error_injection/injection/{injection}", host=node_ip)
+
     async def move_tablet(self, node_ip: str, ks: str, table: str, src_host: HostID, src_shard: int, dst_host: HostID, dst_shard: int, token: int) -> None:
         await self.client.post(f"/storage_service/tablets/move", host=node_ip, params={
             "ks": ks,
@@ -240,6 +248,9 @@ class ScyllaRESTAPIClient():
             "dst_shard": str(dst_shard),
             "token": str(token)
         })
+
+    async def quiesce_topology(self, node_ip: str) -> None:
+        await self.client.post(f"/storage_service/quiesce_topology", host=node_ip)
 
     async def add_tablet_replica(self, node_ip: str, ks: str, table: str, dst_host: HostID, dst_shard: int, token: int) -> None:
         await self.client.post(f"/storage_service/tablets/add_replica", host=node_ip, params={
@@ -301,6 +312,10 @@ class ScyllaRESTAPIClient():
         """Load sstables from upload directory"""
         primary_replica_value = 'true' if primary_replica else 'false'
         await self.client.post(f"/storage_service/sstables/{keyspace}?cf={table}&primary_replica_only={primary_replica_value}", host=node_ip)
+
+    async def drop_sstable_caches(self, node_ip: str) -> None:
+        """Drop sstable caches"""
+        await self.client.post(f"/system/drop_sstable_caches", host=node_ip)
 
     async def keyspace_flush(self, node_ip: str, keyspace: str, table: Optional[str] = None) -> None:
         """Flush the specified or all tables in the keyspace"""

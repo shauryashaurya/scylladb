@@ -70,10 +70,10 @@ public:
         return true;
     }
     const sstables::sstable_set& main_sstable_set() const override {
-        return table().as_table_state().main_sstable_set();
+        return table().try_get_table_state_with_static_sharding().main_sstable_set();
     }
     const sstables::sstable_set& maintenance_sstable_set() const override {
-        return table().as_table_state().maintenance_sstable_set();
+        return table().try_get_table_state_with_static_sharding().maintenance_sstable_set();
     }
     std::unordered_set<sstables::shared_sstable> fully_expired_sstables(const std::vector<sstables::shared_sstable>& sstables, gc_clock::time_point query_time) const override {
         return sstables::get_fully_expired_sstables(*this, sstables, query_time);
@@ -105,7 +105,7 @@ public:
     }
     bool memtable_has_key(const dht::decorated_key& key) const override { return false; }
     future<> on_compaction_completion(sstables::compaction_completion_desc desc, sstables::offstrategy offstrategy) override {
-        return table().as_table_state().on_compaction_completion(std::move(desc), offstrategy);
+        return table().try_get_table_state_with_static_sharding().on_compaction_completion(std::move(desc), offstrategy);
     }
     bool is_auto_compaction_disabled_by_user() const noexcept override {
         return table().is_auto_compaction_disabled_by_user();
@@ -213,7 +213,7 @@ test_env::impl::impl(test_env_config cfg, sstables::storage_manager* sstm)
     , feature_service(gms::feature_config_from_db_config(*db_config))
     , mgr("test_env", cfg.large_data_handler == nullptr ? nop_ld_handler : *cfg.large_data_handler, *db_config,
         feature_service, cache_tracker, cfg.available_memory, dir_sem,
-        [host_id = locator::host_id::create_random_id()]{ return host_id; }, sstm)
+        [host_id = locator::host_id::create_random_id()]{ return host_id; }, current_scheduling_group(), sstm)
     , semaphore(reader_concurrency_semaphore::no_limits{}, "sstables::test_env", reader_concurrency_semaphore::register_metrics::no)
     , use_uuid(cfg.use_uuid)
     , storage(std::move(cfg.storage))
@@ -394,7 +394,7 @@ test_env::reusable_sst(schema_ptr schema, shared_sstable sst) {
 
 future<shared_sstable>
 test_env::reusable_sst(shared_sstable sst) {
-    return reusable_sst(sst->get_schema(), std::move(sst));
+    return reusable_sst(sst->get_schema(), sst);
 }
 
 future<shared_sstable>

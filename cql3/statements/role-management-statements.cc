@@ -12,7 +12,7 @@
 
 #include "types/map.hh"
 #include "auth/authentication_options.hh"
-#include "auth/common.hh"
+#include "auth/service.hh"
 #include "auth/role_manager.hh"
 #include "cql3/column_specification.hh"
 #include "cql3/column_identifier.hh"
@@ -27,6 +27,7 @@
 #include "exceptions/exceptions.hh"
 #include "service/storage_proxy.hh"
 #include "transport/messages/result_message.hh"
+#include "service/raft/raft_group0_client.hh"
 
 namespace cql3 {
 
@@ -46,10 +47,6 @@ static auth::authentication_options extract_authentication_options(const cql3::r
     return authen_options;
 }
 
-static future<result_message_ptr> void_result_message() {
-    return make_ready_future<result_message_ptr>(nullptr);
-}
-
 //
 // `create_role_statement`
 //
@@ -59,15 +56,17 @@ std::unique_ptr<prepared_statement> create_role_statement::prepare(
     return std::make_unique<prepared_statement>(::make_shared<create_role_statement>(*this));
 }
 
-future<> create_role_statement::grant_permissions_to_creator(const service::client_state& cs) const {
-    return do_with(auth::make_role_resource(_role), [&cs](const auth::resource& r) {
-        return auth::grant_applicable_permissions(
+future<> create_role_statement::grant_permissions_to_creator(const service::client_state& cs, ::service::group0_batch& mc) const {
+    auto resource = auth::make_role_resource(_role);
+    try {
+        co_await auth::grant_applicable_permissions(
                 *cs.get_auth_service(),
                 *cs.user(),
-                r).handle_exception_type([](const auth::unsupported_authorization_operation&) {
-            // Nothing.
-        });
-    });
+                resource,
+                mc);
+    } catch (const auth::unsupported_authorization_operation&) {
+        // Nothing.
+    }
 }
 
 future<> create_role_statement::check_access(query_processor& qp, const service::client_state& state) const {
@@ -93,27 +92,23 @@ create_role_statement::execute(query_processor&,
     config.is_superuser = *_options.is_superuser;
     config.can_login = *_options.can_login;
 
-    return do_with(
-            std::move(config),
-            extract_authentication_options(_options),
-            [this, &state](const auth::role_config& config, const auth::authentication_options& authen_options) {
-        const auto& cs = state.get_client_state();
-        auto& as = *cs.get_auth_service();
+    const auto& cs = state.get_client_state();
+    auto& as = *cs.get_auth_service();
 
-        return auth::create_role(as, _role, config, authen_options).then([this, &cs] {
-            return grant_permissions_to_creator(cs);
-        }).then([] {
-            return void_result_message();
-        }).handle_exception_type([this](const auth::role_already_exists& e) {
-            if (!_if_not_exists) {
-                return make_exception_future<result_message_ptr>(exceptions::invalid_request_exception(e.what()));
-            }
+    service::group0_batch mc{std::move(guard)};
+    try {
+        co_await auth::create_role(as, _role, config, extract_authentication_options(_options), mc);
+        co_await grant_permissions_to_creator(cs, mc);
+    } catch (const auth::role_already_exists& e) {
+        if (!_if_not_exists) {
+            throw exceptions::invalid_request_exception(e.what());
+        }
+    } catch (const auth::unsupported_authentication_option& e) {
+        throw exceptions::invalid_request_exception(e.what());
+    }
 
-            return void_result_message();
-        }).handle_exception_type([](const auth::unsupported_authentication_option& e) {
-            return make_exception_future<result_message_ptr>(exceptions::invalid_request_exception(e.what()));
-        });
-    });
+    co_await auth::commit_mutations(as, std::move(mc));
+    co_return nullptr;
 }
 
 //
@@ -177,20 +172,18 @@ alter_role_statement::execute(query_processor&, service::query_state& state, con
     update.is_superuser = _options.is_superuser;
     update.can_login = _options.can_login;
 
-    return do_with(
-            std::move(update),
-            extract_authentication_options(_options),
-            [this, &state](const auth::role_config_update& update, const auth::authentication_options& authen_options) {
-        auto& as = *state.get_client_state().get_auth_service();
+    auto& as = *state.get_client_state().get_auth_service();
+    service::group0_batch mc{std::move(guard)};
+    try {
+        co_await auth::alter_role(as, _role, update, extract_authentication_options(_options), mc);
+    } catch (const auth::nonexistant_role& e) {
+        throw exceptions::invalid_request_exception(e.what());
+    } catch (const auth::unsupported_authentication_option& e) {
+        throw exceptions::invalid_request_exception(e.what());
+    }
 
-        return auth::alter_role(as, _role, update, authen_options).then([] {
-            return void_result_message();
-        }).handle_exception_type([](const auth::nonexistant_role& e) {
-            return make_exception_future<result_message_ptr>(exceptions::invalid_request_exception(e.what()));
-        }).handle_exception_type([](const auth::unsupported_authentication_option& e) {
-            return make_exception_future<result_message_ptr>(exceptions::invalid_request_exception(e.what()));
-        });
-    });
+    co_await auth::commit_mutations(as, std::move(mc));
+    co_return nullptr;
 }
 
 //
@@ -235,17 +228,17 @@ future<> drop_role_statement::check_access(query_processor& qp, const service::c
 
 future<result_message_ptr>
 drop_role_statement::execute(query_processor&, service::query_state& state, const query_options&, std::optional<service::group0_guard> guard) const {
+    service::group0_batch mc{std::move(guard)};
     auto& as = *state.get_client_state().get_auth_service();
-
-    return auth::drop_role(as, _role).then([] {
-        return void_result_message();
-    }).handle_exception_type([this](const auth::nonexistant_role& e) {
-        if (!_if_exists) {
-            return make_exception_future<result_message_ptr>(exceptions::invalid_request_exception(e.what()));
+    try {
+        co_await auth::drop_role(as, _role, mc);
+    } catch (const auth::nonexistant_role& e) {
+         if (!_if_exists) {
+            throw exceptions::invalid_request_exception(e.what());
         }
-
-        return void_result_message();
-    });
+    }
+    co_await auth::commit_mutations(as, std::move(mc));
+    co_return nullptr;
 }
 
 //
@@ -402,13 +395,15 @@ future<> grant_role_statement::check_access(query_processor& qp, const service::
 
 future<result_message_ptr>
 grant_role_statement::execute(query_processor&, service::query_state& state, const query_options&, std::optional<service::group0_guard> guard) const {
+    service::group0_batch mc{std::move(guard)};
     auto& as = *state.get_client_state().get_auth_service();
-
-    return as.underlying_role_manager().grant(_grantee, _role).then([] {
-        return void_result_message();
-    }).handle_exception_type([](const auth::roles_argument_exception& e) {
-        return make_exception_future<result_message_ptr>(exceptions::invalid_request_exception(e.what()));
-    });
+    try {
+        co_await auth::grant_role(as, _grantee, _role, mc);
+    } catch (const auth::roles_argument_exception& e) {
+        throw exceptions::invalid_request_exception(e.what());
+    }
+    co_await auth::commit_mutations(as, std::move(mc));
+    co_return nullptr;
 }
 
 //
@@ -433,13 +428,15 @@ future<result_message_ptr> revoke_role_statement::execute(
         service::query_state& state,
         const query_options&,
         std::optional<service::group0_guard> guard) const {
-    auto& rm = state.get_client_state().get_auth_service()->underlying_role_manager();
-
-    return rm.revoke(_revokee, _role).then([] {
-        return void_result_message();
-    }).handle_exception_type([](const auth::roles_argument_exception& e) {
-        return make_exception_future<result_message_ptr>(exceptions::invalid_request_exception(e.what()));
-    });
+    service::group0_batch mc{std::move(guard)};
+    auto& as = *state.get_client_state().get_auth_service();
+    try {
+        co_await auth::revoke_role(as, _revokee, _role, mc);
+    } catch (const auth::roles_argument_exception& e) {
+        throw exceptions::invalid_request_exception(e.what());
+    }
+    co_await auth::commit_mutations(as, std::move(mc));
+    co_return nullptr;
 }
 
 }

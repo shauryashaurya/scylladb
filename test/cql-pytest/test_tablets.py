@@ -92,12 +92,26 @@ def test_tablets_can_be_explicitly_disabled(cql, skip_without_tablets):
         assert len(list(res)) == 0, "tablets replication strategy turned on"
 
 
-def test_alter_changes_initial_tablets(cql, skip_without_tablets):
-    ksdef = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1};"
+def test_alter_changes_initial_tablets(cql, this_dc, skip_without_tablets):
+    ksdef = f"WITH replication = {{'class': 'NetworkTopologyStrategy', '{this_dc}': 1}} AND tablets = {{'initial': 1}};"
     with new_test_keyspace(cql, ksdef) as keyspace:
-        cql.execute(f"ALTER KEYSPACE {keyspace} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{'initial': 2}};")
+        cql.execute(f"ALTER KEYSPACE {keyspace} WITH replication = {{'class': 'NetworkTopologyStrategy', '{this_dc}': 1}} AND tablets = {{'initial': 2}};")
         res = cql.execute(f"SELECT * FROM system_schema.scylla_keyspaces WHERE keyspace_name = '{keyspace}'").one()
         assert res.initial_tablets == 2
+
+
+def test_alter_changes_initial_tablets_short(cql, skip_without_tablets):
+    ksdef = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1};"
+    with new_test_keyspace(cql, ksdef) as keyspace:
+        orig_rep = cql.execute(f"SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = '{keyspace}'").one()
+
+        cql.execute(f"ALTER KEYSPACE {keyspace} WITH tablets = {{'initial': 2}};")
+        res = cql.execute(f"SELECT * FROM system_schema.scylla_keyspaces WHERE keyspace_name = '{keyspace}'").one()
+        assert res.initial_tablets == 2
+
+        # Test that replication parameters didn't change
+        rep = cql.execute(f"SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = '{keyspace}'").one()
+        assert rep.replication == orig_rep.replication
 
 
 # Test that initial number of tablets is preserved in describe
@@ -201,3 +215,45 @@ def test_tablets_are_dropped_when_dropping_index(cql, test_keyspace, drop_index)
         except:
             pass
         raise e
+
+
+# FIXME: LWT is not supported with tablets yet. See #18066
+# Until the issue is fixed, test that a LWT query indeed fails as expected
+def test_lwt_support_with_tablets(cql, test_keyspace, skip_without_tablets):
+    with new_test_table(cql, test_keyspace, "key int PRIMARY KEY, val int") as table:
+        cql.execute(f"INSERT INTO {table} (key, val) VALUES(1, 0)")
+        with pytest.raises(InvalidRequest, match=f"{table}.*LWT is not yet supported with tablets"):
+            cql.execute(f"INSERT INTO {table} (key, val) VALUES(1, 1) IF NOT EXISTS")
+        # The query is rejected during the execution phase,
+        # so preparing the LWT query is expected to succeed.
+        stmt = cql.prepare(f"UPDATE {table} SET val = 1 WHERE KEY = ? IF EXISTS")
+        with pytest.raises(InvalidRequest, match=f"{table}.*LWT is not yet supported with tablets"):
+            cql.execute(stmt, [1])
+        with pytest.raises(InvalidRequest, match=f"{table}.*LWT is not yet supported with tablets"):
+            cql.execute(f"DELETE FROM {table} WHERE key = 1 IF EXISTS")
+        res = cql.execute(f"SELECT val FROM {table} WHERE key = 1").one()
+        assert res.val == 0
+
+
+# We want to ensure that we can only change the RF of any DC by at most 1 at a time
+# if we use tablets. That provides us with the guarantee that the old and the new QUORUM
+# overlap by at least one node.
+def test_alter_tablet_keyspace(cql, this_dc):
+    with new_test_keyspace(cql, f"WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}' : 1 }} "
+                                f"AND TABLETS = {{ 'enabled': true, 'initial': 128 }}") as keyspace:
+        def change_opt_rf(rf_opt, new_rf):
+            cql.execute(f"ALTER KEYSPACE {keyspace} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{rf_opt}' : {new_rf} }}")
+        def change_dc_rf(new_rf):
+            change_opt_rf(this_dc, new_rf)
+        def change_default_rf(new_rf):
+            change_opt_rf("replication_factor", new_rf)
+
+        change_dc_rf(2)
+        change_dc_rf(3)
+
+        with pytest.raises(InvalidRequest):
+            change_dc_rf(5)
+        with pytest.raises(InvalidRequest):
+            change_dc_rf(1)
+        with pytest.raises(InvalidRequest):
+            change_dc_rf(10)

@@ -12,8 +12,6 @@
 #include <seastar/core/thread.hh>
 #include <seastar/util/defer.hh>
 #include "replica/database_fwd.hh"
-#include "sstables/sstables.hh"
-#include <seastar/core/do_with.hh>
 #include "test/lib/cql_test_env.hh"
 #include "cdc/generation_service.hh"
 #include "cql3/functions/functions.hh"
@@ -29,7 +27,6 @@
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/coroutine.hh>
-#include "utils/UUID_gen.hh"
 #include "service/migration_manager.hh"
 #include "service/tablet_allocator.hh"
 #include "compaction/compaction_manager.hh"
@@ -46,7 +43,6 @@
 #include "db/batchlog_manager.hh"
 #include "schema/schema_builder.hh"
 #include "test/lib/tmpdir.hh"
-#include "test/lib/test_services.hh"
 #include "test/lib/log.hh"
 #include "unit_test_service_levels_accessor.hh"
 #include "db/view/view_builder.hh"
@@ -71,6 +67,7 @@
 #include "service/raft/raft_group0.hh"
 #include "sstables/sstables_manager.hh"
 #include "init.hh"
+#include "lang/manager.hh"
 
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -140,6 +137,7 @@ private:
     sharded<db::view::view_update_generator> _view_update_generator;
     sharded<service::migration_notifier> _mnotifier;
     sharded<qos::service_level_controller> _sl_controller;
+    sharded<service::topology_state_machine> _topology_state_machine;
     sharded<service::migration_manager> _mm;
     sharded<db::batchlog_manager> _batchlog_manager;
     sharded<gms::gossiper> _gossiper;
@@ -155,7 +153,7 @@ private:
     sharded<locator::shared_token_metadata> _token_metadata;
     sharded<locator::effective_replication_map_factory> _erm_factory;
     sharded<sstables::directory_semaphore> _sst_dir_semaphore;
-    sharded<wasm::manager> _wasm;
+    sharded<lang::manager> _lang_manager;
     sharded<cql3::cql_config> _cql_config;
     sharded<service::endpoint_lifecycle_notifier> _elc_notif;
     sharded<cdc::generation_service> _cdc_generation_service;
@@ -313,6 +311,10 @@ public:
 
     virtual replica::database& local_db() override {
         return _db.local();
+    }
+
+    virtual sharded<locator::shared_token_metadata>& shared_token_metadata() override {
+        return _token_metadata;
     }
 
     cql3::query_processor& local_qp() override {
@@ -567,16 +569,27 @@ private:
             _sstm.start(std::ref(*cfg), sstables::storage_manager::config{}).get();
             auto stop_sstm = deferred_stop(_sstm);
 
-            std::optional<wasm::startup_context> wasm_ctx;
+            lang::manager::config lang_config;
+            lang_config.lua.max_bytes = cfg->user_defined_function_allocation_limit_bytes();
+            lang_config.lua.max_contiguous = cfg->user_defined_function_contiguous_allocation_limit_bytes();
+            lang_config.lua.timeout = std::chrono::milliseconds(cfg->user_defined_function_time_limit_ms());
             if (cfg->enable_user_defined_functions() && cfg->check_experimental(db::experimental_features_t::feature::UDF)) {
-                wasm_ctx.emplace(*cfg, dbcfg);
+                lang_config.wasm = lang::manager::wasm_config {
+                    .udf_memory_limit = cfg->wasm_udf_memory_limit(),
+                    .cache_size = dbcfg.available_memory * cfg->wasm_cache_memory_fraction(),
+                    .cache_instance_size = cfg->wasm_cache_instance_size_limit(),
+                    .cache_timer_period = std::chrono::milliseconds(cfg->wasm_cache_timeout_in_ms()),
+                    .yield_fuel = cfg->wasm_udf_yield_fuel(),
+                    .total_fuel = cfg->wasm_udf_total_fuel(),
+                };
             }
 
-            _wasm.start(std::ref(wasm_ctx)).get();
-            auto stop_wasm = defer([this] { _wasm.stop().get(); });
+            _lang_manager.start(lang_config).get();
+            auto stop_lang_manager = defer([this] { _lang_manager.stop().get(); });
+            _lang_manager.invoke_on_all(&lang::manager::start).get();
 
 
-            _db.start(std::ref(*cfg), dbcfg, std::ref(_mnotifier), std::ref(_feature_service), std::ref(_token_metadata), std::ref(_cm), std::ref(_sstm), std::ref(_wasm), std::ref(_sst_dir_semaphore), utils::cross_shard_barrier()).get();
+            _db.start(std::ref(*cfg), dbcfg, std::ref(_mnotifier), std::ref(_feature_service), std::ref(_token_metadata), std::ref(_cm), std::ref(_sstm), std::ref(_lang_manager), std::ref(_sst_dir_semaphore), utils::cross_shard_barrier()).get();
             auto stop_db = defer([this] {
                 _db.stop().get();
             });
@@ -614,7 +627,7 @@ private:
                                                      std::chrono::duration_cast<std::chrono::milliseconds>(cql3::prepared_statements_cache::entry_expiry));
             auth_prep_cache_config.refresh = std::chrono::milliseconds(cfg->permissions_update_interval_in_ms());
 
-            _qp.start(std::ref(_proxy), std::move(local_data_dict), std::ref(_mnotifier), qp_mcfg, std::ref(_cql_config), auth_prep_cache_config, std::ref(_wasm)).get();
+            _qp.start(std::ref(_proxy), std::move(local_data_dict), std::ref(_mnotifier), qp_mcfg, std::ref(_cql_config), auth_prep_cache_config, std::ref(_lang_manager)).get();
             auto stop_qp = defer([this] { _qp.stop().get(); });
 
             _elc_notif.start().get();
@@ -622,7 +635,7 @@ private:
 
             set_abort_on_internal_error(true);
             const gms::inet_address listen("127.0.0.1");
-            _sl_controller.start(std::ref(_auth_service), qos::service_level_options{}).get();
+            _sl_controller.start(std::ref(_auth_service), std::ref(_token_metadata), std::ref(abort_sources), qos::service_level_options{}).get();
             auto stop_sl_controller = defer([this] { _sl_controller.stop().get(); });
             _sl_controller.invoke_on_all(&qos::service_level_controller::start).get();
 
@@ -700,7 +713,7 @@ private:
             gcfg.seeds = std::move(seeds);
             gcfg.skip_wait_for_gossip_to_settle = 0;
             gcfg.shutdown_announce_ms = 0;
-            _gossiper.start(std::ref(abort_sources), std::ref(_token_metadata), std::ref(_ms), std::ref(*cfg), std::move(gcfg)).get();
+            _gossiper.start(std::ref(abort_sources), std::ref(_token_metadata), std::ref(_ms), std::move(gcfg)).get();
             auto stop_ms_fd_gossiper = defer([this] {
                 _gossiper.stop().get();
             });
@@ -717,7 +730,8 @@ private:
             service::direct_fd_clock fd_clock;
             _fd.start(
                 std::ref(_fd_pinger), std::ref(fd_clock),
-                service::direct_fd_clock::base::duration{std::chrono::milliseconds{100}}.count()).get();
+                service::direct_fd_clock::base::duration{std::chrono::milliseconds{100}}.count(),
+                service::direct_fd_clock::base::duration{std::chrono::milliseconds{600}}.count()).get();
 
             auto stop_fd = defer([this] {
                 _fd.stop().get();
@@ -729,7 +743,7 @@ private:
                 std::ref(_ms), std::ref(_fd)).get();
             auto stop_raft_gr = deferred_stop(_group0_registry);
 
-            _stream_manager.start(std::ref(*cfg), std::ref(_db), std::ref(_sys_dist_ks), std::ref(_view_update_generator), std::ref(_ms), std::ref(_mm), std::ref(_gossiper), scheduling_groups.streaming_scheduling_group).get();
+            _stream_manager.start(std::ref(*cfg), std::ref(_db), std::ref(_view_builder), std::ref(_ms), std::ref(_mm), std::ref(_gossiper), scheduling_groups.streaming_scheduling_group).get();
             auto stop_streaming = defer([this] { _stream_manager.stop().get(); });
 
             _feature_service.invoke_on_all([] (auto& fs) {
@@ -750,16 +764,14 @@ private:
                 _tablet_allocator.stop().get();
             });
 
-            _qp.invoke_on_all([this, &group0_client] (cql3::query_processor& qp) {
-                qp.start_remote(_mm.local(), _forward_service.local(), group0_client);
-            }).get();
-            auto stop_qp_remote = defer([this] {
-                _qp.invoke_on_all(&cql3::query_processor::stop_remote).get();
+            _topology_state_machine.start().get();
+            auto stop_topology_state_machine = defer([this] {
+                _topology_state_machine.stop().get();
             });
 
             service::raft_group0 group0_service{
                     abort_sources.local(), _group0_registry.local(), _ms,
-                    _gossiper.local(), _feature_service.local(), _sys_ks.local(), group0_client};
+                    _gossiper.local(), _feature_service.local(), _sys_ks.local(), group0_client, scheduling_groups.gossip_scheduling_group};
 
             _ss.start(std::ref(abort_sources), std::ref(_db),
                 std::ref(_gossiper),
@@ -774,8 +786,10 @@ private:
                 std::ref(_snitch),
                 std::ref(_tablet_allocator),
                 std::ref(_cdc_generation_service),
+                std::ref(_view_builder),
                 std::ref(_qp),
-                std::ref(_sl_controller)).get();
+                std::ref(_sl_controller),
+                std::ref(_topology_state_machine)).get();
             auto stop_storage_service = defer([this] { _ss.stop().get(); });
 
             _mnotifier.local().register_listener(&_ss.local());
@@ -786,6 +800,13 @@ private:
             smp::invoke_on_all([&] {
                 return db::initialize_virtual_tables(_db, _ss, _gossiper, _group0_registry, _sys_ks, *cfg);
             }).get();
+
+            _qp.invoke_on_all([this, &group0_client] (cql3::query_processor& qp) {
+                qp.start_remote(_mm.local(), _forward_service.local(), _ss.local(), group0_client);
+            }).get();
+            auto stop_qp_remote = defer([this] {
+                _qp.invoke_on_all(&cql3::query_processor::stop_remote).get();
+            });
 
             _cm.invoke_on_all([&](compaction_manager& cm) {
                 auto cl = _db.local().commitlog();
@@ -845,6 +866,11 @@ private:
             });
 
             _sys_dist_ks.start(std::ref(_qp), std::ref(_mm), std::ref(_proxy)).get();
+
+            _view_builder.start(std::ref(_db), std::ref(_sys_ks), std::ref(_sys_dist_ks), std::ref(_mnotifier), std::ref(_view_update_generator)).get();
+            auto stop_view_builder = defer([this] {
+                _view_builder.stop().get();
+            });
 
             if (cfg_in.need_remote_proxy) {
                 _proxy.invoke_on_all(&service::storage_proxy::start_remote, std::ref(_ms), std::ref(_gossiper), std::ref(_mm), std::ref(_sys_ks)).get();
@@ -939,18 +965,15 @@ private:
             db::batchlog_manager_config bmcfg;
             bmcfg.replay_rate = 100000000;
             bmcfg.write_request_timeout = 2s;
+            bmcfg.delay = 0ms;
             _batchlog_manager.start(std::ref(_qp), std::ref(_sys_ks), bmcfg).get();
             auto stop_bm = defer([this] {
                 _batchlog_manager.stop().get();
             });
 
-            _view_builder.start(std::ref(_db), std::ref(_sys_ks), std::ref(_sys_dist_ks), std::ref(_mnotifier), std::ref(_view_update_generator)).get();
             _view_builder.invoke_on_all([this] (db::view::view_builder& vb) {
                 return vb.start(_mm.local());
             }).get();
-            auto stop_view_builder = defer([this] {
-                _view_builder.stop().get();
-            });
 
             // Create the testing user.
             try {
@@ -958,11 +981,16 @@ private:
                 config.is_superuser = true;
                 config.can_login = true;
 
+                auto as = &abort_sources.local();
+                auto guard = group0_client.start_operation(as).get();
+                service::group0_batch mc{std::move(guard)};
                 auth::create_role(
                         _auth_service.local(),
                         testing_superuser,
                         config,
-                        auth::authentication_options()).get();
+                        auth::authentication_options(),
+                        mc).get();
+                std::move(mc).commit(group0_client, *as, ::service::raft_timeout{}).get();
             } catch (const auth::role_already_exists&) {
                 // The default user may already exist if this `cql_test_env` is starting with previously populated data.
             }
@@ -1022,6 +1050,16 @@ future<> do_with_cql_env_thread(std::function<void(cql_test_env&)> func, cql_tes
             return func(e);
         });
     }, std::move(cfg_in), std::move(init_configurables));
+}
+
+// this function should be called in seastar thread
+void do_with_mc(cql_test_env& env, std::function<void(service::group0_batch&)> func) {
+    seastar::abort_source as;
+    auto& g0 = env.get_raft_group0_client();
+    auto guard = g0.start_operation(&as).get();
+    auto mc = service::group0_batch(std::move(guard));
+    func(mc);
+    std::move(mc).commit(g0, as, std::nullopt).get();
 }
 
 reader_permit make_reader_permit(cql_test_env& env) {

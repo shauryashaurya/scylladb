@@ -10,8 +10,8 @@
 import pytest
 import random
 from pytest import fixture
-from contextlib import contextmanager
-from util import new_type, unique_name, new_test_table, new_test_keyspace, new_function, new_aggregate, new_cql, keyspace_has_tablets
+from contextlib import contextmanager, ExitStack
+from util import new_type, unique_name, new_test_table, new_test_keyspace, new_function, new_aggregate, new_cql, keyspace_has_tablets, unique_name_prefix
 from cassandra.protocol import InvalidRequest
 import re
 
@@ -552,6 +552,57 @@ def test_whitespaces_in_table_options(cql, test_keyspace, scylla_only):
         desc = "\n".join([d.create_statement for d in cql.execute(f"DESC TABLE {tbl}")])
         assert re.search(regex, desc) == None
 
+# Randomly create many UDTs, with dependencies between them 
+# and validate if describe displays them in correct order.
+# UDTs should be sorted topologically, meaning if UDT `a`
+# is used to create UDT `b`, then `a` should be before `b`.
+def test_udt_sorting(scylla_only, cql, test_keyspace, random_seed):
+    repeat = 10 # test it randomized, so repeat it inside the test to increase coverage
+    max_selected_udts = 5 # max number of UDTs that can be used to create a new UDT
+
+    # Keyspace for recreating UDTs
+    with new_test_keyspace(cql, "WITH REPLICATION = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}") as keyspace:
+        for _ in range(repeat):
+            created_udts = []
+            udts_cnt = 10
+            udt_backup = []
+
+            with ExitStack() as stack:
+                # Create `udts_cnt` many UDTs
+                while len(created_udts) < udts_cnt:
+                    select_cnt = random.randint(0, min(max_selected_udts, len(created_udts))) # how many UDTs we want to use to create a new one
+                    udt_body = "(a int)"
+                    if select_cnt != 0:
+                        selected_udts = random.sample(created_udts, select_cnt) # randomly select `select_cnt` already created UDTs
+                        udt_body = create_udt_body(selected_udts)
+                    
+                    udt = stack.enter_context(new_type(cql, test_keyspace, udt_body))
+                    created_udts.append(udt)
+                
+                # Describe all UDTs, iterate over all of them and verify the order is correct.
+                # (If UDT `u` is used create UDT `w`, `u` has to be described before `w`)
+                desc = cql.execute(f"DESC KEYSPACE {test_keyspace}").all()
+                visited_udts = set()
+                for row in desc:
+                    if row.type == "type":
+                        # Extract UDTs used in current UDT
+                        # Names of all UDTs begin with `unique_name_prefix`
+                        for it in re.finditer(f"<({unique_name_prefix}[^\s\>]+)>", row.create_statement):
+                            assert f"{test_keyspace}.{it.group(1)}" in visited_udts
+                        visited_udts.add(f"{row.keyspace_name}.{row.name}")
+                
+                assert visited_udts == set(created_udts)
+                udt_backup = desc
+
+            with ExitStack() as stack:
+                drop_type = lambda cql, keyspace_name, type_name: cql.execute(f"DROP TYPE {keyspace_name}.{type_name}")
+
+                # Recreate all UDTs from the description in a designated keyspace.
+                for row in desc:
+                    if row.type == "type":
+                        cql.execute(row.create_statement.replace(test_keyspace, keyspace))
+                        stack.callback(drop_type, cql=cql, keyspace_name=keyspace, type_name=row.name)
+
 # -----------------------------------------------------------------------------
 # Following tests `test_*_quoting` check if names inside elements' descriptions are quoted if needed.
 # The tests don't check if create statements are correct, but only assert if the name inside is quoted.
@@ -733,8 +784,112 @@ def test_table_options_quoting(cql, test_keyspace):
     finally:
         cql.execute(f"DROP TYPE {test_keyspace}.\"{type_name}\"")
 
+# We need to hide cdc log tables (more precisely, their CREATE statemtns and/or names)
+# but we are attaching `ALTER TABLE <cdc log table name> WITH <all table's properties>` to description of base table
+@pytest.mark.parametrize("test_keyspace",
+                         [pytest.param("tablets", marks=[pytest.mark.xfail(reason="issue #16317")]), "vnodes"],
+                         indirect=True)
+def test_hide_cdc_table(scylla_only, cql, test_keyspace):
+    cdc_table_suffix = "_scylla_cdc_log"
+    
+    with new_test_table(cql, test_keyspace, "a int primary key, b int", "WITH cdc = {'enabled': true}") as t:
+        t_name = t.split('.')[1]
+        cdc_log_name = t_name + cdc_table_suffix
+
+        # Check if the log table exists
+        cdc_log_table_entry = cql.execute(f"SELECT * FROM system_schema.tables WHERE keyspace_name='{test_keyspace}' AND table_name='{cdc_log_name}'").all()
+        assert len(cdc_log_table_entry) == 1
+
+        # DESC TABLES
+        desc_tables = cql.execute("DESC TABLES")
+        assert cdc_log_name not in [r.name for r in desc_tables]
+
+        # DESC KEYSPACE ks
+        desc_keyspace = cql.execute(f"DESC KEYSPACE {test_keyspace}").all()
+        for row in desc_keyspace:
+            if row.name == cdc_log_name:
+                assert f"ALTER TABLE {test_keyspace}.{cdc_log_name} WITH" in row.create_statement
+
+        #  DESC SCHEMA
+        desc_schema = cql.execute("DESC SCHEMA")
+        for row in desc_schema:
+            if row.name == cdc_log_name:
+                assert f"ALTER TABLE {test_keyspace}.{cdc_log_name} WITH" in row.create_statement
+
+        # Check 't_scylla_cdc_log' cannot be described directly
+        with pytest.raises(InvalidRequest, match=f"{test_keyspace}.{cdc_log_name} is a cdc log table and it cannot be described directly. Try `DESC TABLE {test_keyspace}.{t_name}` to describe cdc base table and it's log table."):
+            desc_cdc_table = cql.execute(f"DESC TABLE {test_keyspace}.{cdc_log_name}")
+        
+        # Check base table description contains ALTER TABLE statement for cdc log table
+        desc_base_table = cql.execute(f"DESC TABLE {t}").all()
+        assert f"ALTER TABLE {test_keyspace}.{cdc_log_name} WITH" in desc_base_table[1].create_statement
+        
+        # Drop current cdc base table and try to recreate it with describe output
+        cql.execute(f"DROP TABLE {t}")
+        for row in desc_keyspace[1:]: # [1:] because we want to skip first row (keyspace's CREATE STATEMENT)
+            cql.execute(row.create_statement)
+        
+        # Check if base and log tables were recreated
+        ks_tables = cql.execute(f"SELECT * FROM system_schema.tables WHERE keyspace_name='{test_keyspace}'").all()
+        assert len(ks_tables) == 2
+        for row in ks_tables:
+            assert row.table_name == t_name or row.table_name == cdc_log_name
+
 
 ### =========================== UTILITY FUNCTIONS =============================
+
+# Create random body of UDT using all UDTs from `udts`.
+# The functions tries to create complex field types,
+# by mixing lists, tuples, sets, etc...
+def create_udt_body(udts):
+    two_udts_type_probability = 0.3
+    nest_probability = 0.1
+
+    one_udt_type = lambda u: random.choice([
+        f"frozen<{u}>",
+        f"frozen<list<{u}>>",
+        f"list<frozen<{u}>>",
+        f"frozen<set<{u}>>",
+        f"set<frozen<{u}>>",
+        f"tuple<frozen<{u}>, int>",
+        f"frozen<tuple<{u}, int>>",
+        f"map<frozen<{u}>, int>",
+        f"map<int, frozen<{u}>>",
+        f"frozen<map<{u}, int>>",
+        f"frozen<map<int, {u}>>",
+    ])
+    two_udts_type = lambda u, w: random.choice([
+        f"frozen<tuple<{u}, {w}>>",
+        f"tuple<frozen<{u}>, frozen<{w}>>",
+        f"frozen<map<{u}, {w}>>",
+        f"map<frozen<{u}>, frozen<{w}>>"
+    ])
+    
+    fields = []
+    field_idx = 1
+    while udts:
+        # Select to create one_udt_type or two_udts_type
+        two_udts = False
+        if len(udts) > 1 and random.random() < two_udts_type_probability:
+            two_udts = True
+        
+        field_type = None
+        if two_udts: # Create a type based on two UDTs (two_udts_type)
+            u1 = udts.pop()
+            u2 = udts.pop()
+            field_type = two_udts_type(u1, u2)
+        else:        # Create a type based on one UDT (one_udt_type)
+            field_type = one_udt_type(udts.pop())
+        
+        # Maybe create nested type
+        if random.random() < nest_probability:
+            field_type = one_udt_type(field_type)
+
+        fields.append(f"f_{field_idx} {field_type}")
+        field_idx = field_idx + 1
+    
+    fields_joined = ", ".join(fields)
+    return f"({fields_joined})"
 
 def get_name(name_with_ks):
     return name_with_ks.split(".")[1]

@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <filesystem>
 
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
@@ -58,7 +59,7 @@ public:
     using sync_dir = bool_class<struct sync_dir_tag>; // meaningful only to filesystem storage
 
     virtual future<> seal(const sstable& sst) = 0;
-    virtual future<> snapshot(const sstable& sst, sstring dir, absolute_path abs) const = 0;
+    virtual future<> snapshot(const sstable& sst, sstring dir, absolute_path abs, std::optional<generation_type> gen = {}) const = 0;
     virtual future<> change_state(const sstable& sst, sstable_state to, generation_type generation, delayed_commit_changes* delay) = 0;
     // runs in async context
     virtual void open(sstable& sst) = 0;

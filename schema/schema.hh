@@ -37,6 +37,7 @@ namespace dht {
 
 class i_partitioner;
 class sharder;
+class static_sharder;
 
 }
 
@@ -304,7 +305,6 @@ public:
             , _is_counter(other._is_counter)
             , _is_view_virtual(other._is_view_virtual)
             , _computation(other.get_computation_ptr())
-            , _thrift_bits(other._thrift_bits)
             , type(other.type)
             , id(other.id)
             , ordinal_id(other.ordinal_id)
@@ -374,18 +374,6 @@ public:
 };
 
 class schema_builder;
-
-/*
- * Sub-schema for thrift aspects. Should be kept isolated (and starved)
- */
-class thrift_schema {
-    bool _compound = true;
-    bool _is_dynamic = false;
-public:
-    bool has_compound_comparator() const;
-    bool is_dynamic() const;
-    friend class schema;
-};
 
 bool operator==(const column_definition&, const column_definition&);
 
@@ -533,6 +521,10 @@ public:
     virtual bool is_placeholder() const {
         return false;
     }
+    using default_map_type = std::map<sstring, sstring>;
+    // default impl assumes options are in a map.
+    // implementations should override if not
+    virtual std::string options_to_string() const;
 };
 
 struct schema_static_props {
@@ -605,11 +597,10 @@ private:
         std::reference_wrapper<const dht::i_partitioner> _partitioner;
         // Sharding info is not stored in the schema mutation and does not affect
         // schema digest. It is also not set locally on a schema tables.
-        std::reference_wrapper<const dht::sharder> _sharder;
+        std::reference_wrapper<const dht::static_sharder> _sharder;
     };
     raw_schema _raw;
     schema_static_props _static_props;
-    thrift_schema _thrift;
     v3_columns _v3_columns;
     mutable schema_registry_entry* _registry_entry = nullptr;
     std::unique_ptr<::view_info> _view_info;
@@ -673,7 +664,6 @@ public:
     double bloom_filter_fp_chance() const {
         return _raw._bloom_filter_fp_chance;
     }
-    sstring thrift_key_validator() const;
     const compression_parameters& get_compressor_params() const {
         return _raw._compressor_params;
     }
@@ -698,12 +688,6 @@ public:
         return !is_super() && !is_dense() && !is_compound();
     }
 
-    thrift_schema& thrift() {
-        return _thrift;
-    }
-    const thrift_schema& thrift() const {
-        return _thrift;
-    }
     const table_id& id() const {
         return _raw._id;
     }
@@ -792,11 +776,11 @@ public:
     // Use only for tables which use vnode-based replication strategy, that is for which
     // table::uses_static_sharding() is true.
     // To obtain a sharder which is valid for all kinds of tables, use table::get_effective_replication_map()->get_sharder()
-    const dht::sharder& get_sharder() const;
+    const dht::static_sharder& get_sharder() const;
 
     // Returns a sharder for this table, but only if it is a static sharder (token->shard mappings
     // don't change while the node is up)
-    const dht::sharder* try_get_static_sharder() const;
+    const dht::static_sharder* try_get_static_sharder() const;
 
     // Returns a pointer to the table if the local database has a table which this object references by id().
     // The table pointer is not guaranteed to be stable, schema_ptr doesn't keep the table alive.
@@ -934,6 +918,9 @@ public:
      * (and `ALTER ADD` if the column has been re-added) to the description.
      */
     virtual std::ostream& describe(replica::database& db, std::ostream& os, bool with_internals) const override;
+    // Generate ALTER TABLE/MATERIALIZED VIEW statement containing all properties with current values.
+    // The method cannot be used on index, as indexes don't support alter statement.
+    std::ostream& describe_alter_with_properties(replica::database& db, std::ostream& os) const;
     friend bool operator==(const schema&, const schema&);
     const column_mapping& get_column_mapping() const;
     friend class schema_registry_entry;
@@ -948,6 +935,9 @@ public:
     bool wait_for_sync_to_commitlog() const {
         return _static_props.wait_for_sync_to_commitlog;
     }
+private:
+    // Print all schema properties in CQL syntax
+    std::ostream& schema_properties(replica::database& db, std::ostream& os) const;
 public:
     const v3_columns& v3() const {
         return _v3_columns;

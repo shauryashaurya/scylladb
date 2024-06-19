@@ -15,14 +15,13 @@
 #include "cql3/untyped_result_set.hh"
 #include "db/consistency_level_type.hh"
 #include "db/system_keyspace.hh"
-#include "seastar/core/on_internal_error.hh"
-#include "seastar/core/timer.hh"
+#include <seastar/core/on_internal_error.hh>
+#include <seastar/core/timer.hh>
 #include "service/qos/raft_service_level_distributed_data_accessor.hh"
 #include "service/qos/standard_service_level_distributed_data_accessor.hh"
 #include "service_level_controller.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "cql3/query_processor.hh"
-#include "service/storage_proxy.hh"
 
 namespace qos {
 static logging::logger sl_logger("service_level_controller");
@@ -31,11 +30,13 @@ sstring service_level_controller::default_service_level_name = "default";
 
 
 
-service_level_controller::service_level_controller(sharded<auth::service>& auth_service, service_level_options default_service_level_config):
+service_level_controller::service_level_controller(sharded<auth::service>& auth_service, locator::shared_token_metadata& tm, abort_source& as, service_level_options default_service_level_config):
         _sl_data_accessor(nullptr),
         _auth_service(auth_service),
+        _token_metadata(tm),
         _last_successful_config_update(seastar::lowres_clock::now()),
-        _logged_intervals(0)
+        _logged_intervals(0),
+        _early_abort_subscription(as.subscribe([this] () noexcept { do_abort(); }))
 
 {
     if (this_shard_id() == global_controller) {
@@ -97,9 +98,9 @@ future<> service_level_controller::reload_distributed_data_accessor(cql3::query_
     set_distributed_data_accessor(std::move(accessor));
 }
 
-future<> service_level_controller::drain() {
+void service_level_controller::do_abort() noexcept {
     if (this_shard_id() != global_controller) {
-        co_return;
+        return;
     }
 
     // abort the loop of the distributed data checking if it is running
@@ -110,6 +111,18 @@ future<> service_level_controller::drain() {
     abort_group0_operations();
     
     _global_controller_db->notifications_serializer.broken();
+}
+
+future<> service_level_controller::stop() {
+    if (this_shard_id() != global_controller) {
+        co_return;
+    }
+
+    if (*_early_abort_subscription) {
+        // Abort source didn't fire, so do it now
+        do_abort();
+    }
+
     try {
         co_await std::exchange(_global_controller_db->distributed_data_update, make_ready_future<>());
     } catch (const broken_semaphore& ignored) {
@@ -117,10 +130,6 @@ future<> service_level_controller::drain() {
     } catch (const exceptions::unavailable_exception& ignored) {
     } catch (const exceptions::read_timeout_exception& ignored) {
     }
-}
-
-future<> service_level_controller::stop() {
-    return drain();
 }
 
 void service_level_controller::abort_group0_operations() {
@@ -285,7 +294,7 @@ future<> service_level_controller::notify_service_level_removed(sstring name) {
     auto sl_it = _service_levels_db.find(name);
     if (sl_it != _service_levels_db.end()) {
         _service_levels_db.erase(sl_it);
-        return seastar::async( [this, name] {
+        co_return co_await seastar::async( [this, name] {
             _subscribers.thread_for_each([name] (qos_configuration_change_subscriber* subscriber) {
                 try {
                     subscriber->on_after_service_level_remove({name}).get();
@@ -295,7 +304,7 @@ future<> service_level_controller::notify_service_level_removed(sstring name) {
             });
         });
     }
-    return make_ready_future<>();
+    co_return;
 }
 
 void service_level_controller::update_from_distributed_data(std::function<steady_clock_type::duration()> interval_f) {
@@ -345,16 +354,16 @@ void service_level_controller::update_from_distributed_data(std::function<steady
     }
 }
 
-future<> service_level_controller::add_distributed_service_level(sstring name, service_level_options slo, bool if_not_exists, std::optional<service::group0_guard> guard) {
+future<> service_level_controller::add_distributed_service_level(sstring name, service_level_options slo, bool if_not_exists, service::group0_batch& mc) {
     set_service_level_op_type add_type = if_not_exists ? set_service_level_op_type::add_if_not_exists : set_service_level_op_type::add;
-    return set_distributed_service_level(name, slo, add_type, std::move(guard));
+    return set_distributed_service_level(name, slo, add_type, mc);
 }
 
-future<> service_level_controller::alter_distributed_service_level(sstring name, service_level_options slo, std::optional<service::group0_guard> guard) {
-    return set_distributed_service_level(name, slo, set_service_level_op_type::alter, std::move(guard));
+future<> service_level_controller::alter_distributed_service_level(sstring name, service_level_options slo, service::group0_batch& mc) {
+    return set_distributed_service_level(name, slo, set_service_level_op_type::alter, mc);
 }
 
-future<> service_level_controller::drop_distributed_service_level(sstring name, bool if_exists, std::optional<service::group0_guard> guard) {
+future<> service_level_controller::drop_distributed_service_level(sstring name, bool if_exists, service::group0_batch& mc) {
     auto sl_info = co_await _sl_data_accessor->get_service_levels();
     auto it = sl_info.find(name);
     if (it == sl_info.end()) {
@@ -367,23 +376,18 @@ future<> service_level_controller::drop_distributed_service_level(sstring name, 
     
     auto& role_manager = _auth_service.local().underlying_role_manager();
     auto attributes = co_await role_manager.query_attribute_for_all("service_level");
-    //FIXME: use the same group0 operation to remove attribute
-    if (guard) {
-        service::release_guard(std::move(*guard));
-        guard = std::nullopt;
-    }
-        
-    co_await coroutine::parallel_for_each(attributes.begin(), attributes.end(), [&role_manager, name] (auto&& attr) {
+
+    co_await coroutine::parallel_for_each(attributes.begin(), attributes.end(), [&role_manager, name, &mc] (auto&& attr) {
         if (attr.second == name) {
-            return do_with(attr.first, [&role_manager] (const sstring& role_name) {
-                return role_manager.remove_attribute(role_name, "service_level");
+            return do_with(attr.first, [&role_manager, &mc] (const sstring& role_name) {
+                return role_manager.remove_attribute(role_name, "service_level", mc);
             });
         } else {
             return make_ready_future();
         }
     });
 
-    co_return co_await _sl_data_accessor->drop_service_level(name, std::move(guard), _global_controller_db->group0_aborter);
+    co_return co_await _sl_data_accessor->drop_service_level(name, mc);
 }
 
 future<service_levels_info> service_level_controller::get_distributed_service_levels() {
@@ -394,7 +398,7 @@ future<service_levels_info> service_level_controller::get_distributed_service_le
     return _sl_data_accessor ? _sl_data_accessor->get_service_level(service_level_name) : make_ready_future<service_levels_info>();
 }
 
-future<> service_level_controller::set_distributed_service_level(sstring name, service_level_options slo, set_service_level_op_type op_type, std::optional<service::group0_guard> guard) {
+future<> service_level_controller::set_distributed_service_level(sstring name, service_level_options slo, set_service_level_op_type op_type, service::group0_batch& mc) {
     auto sl_info = co_await _sl_data_accessor->get_service_levels();
     auto it = sl_info.find(name);
     // test for illegal requests or requests that should terminate without any action
@@ -409,7 +413,7 @@ future<> service_level_controller::set_distributed_service_level(sstring name, s
             co_return;
         }
     }
-    co_return co_await _sl_data_accessor->set_service_level(name, slo, std::move(guard), _global_controller_db->group0_aborter);
+    co_return co_await _sl_data_accessor->set_service_level(name, slo, mc);
 }
 
 future<> service_level_controller::do_add_service_level(sstring name, service_level_options slo, bool is_static) {
@@ -557,9 +561,8 @@ future<> service_level_controller::do_remove_service_level(sstring name, bool re
 
 void service_level_controller::on_join_cluster(const gms::inet_address& endpoint) { }
 
-void service_level_controller::on_leave_cluster(const gms::inet_address& endpoint) {
-    auto my_address = _auth_service.local().query_processor().proxy().local_db().get_token_metadata().get_topology().my_address();
-    if (this_shard_id() == global_controller && endpoint == my_address) {
+void service_level_controller::on_leave_cluster(const gms::inet_address& endpoint, const locator::host_id& hid) {
+    if (this_shard_id() == global_controller && _token_metadata.get()->get_topology().is_me(endpoint)) {
         _global_controller_db->dist_data_update_aborter.request_abort();
         _global_controller_db->group0_aborter.request_abort();
     }

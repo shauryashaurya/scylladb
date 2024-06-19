@@ -23,6 +23,7 @@
 
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
+#include "test/lib/eventually.hh"
 #include "test/lib/sstable_utils.hh"
 #include "schema/schema_builder.hh"
 #include "test/lib/data_model.hh"
@@ -31,6 +32,7 @@
 #include "test/lib/key_utils.hh"
 #include "test/lib/mutation_source_test.hh"
 #include "test/lib/mutation_assertions.hh"
+#include "test/lib/test_utils.hh"
 #include "utils/ranges.hh"
 
 #include "readers/from_mutations_v2.hh"

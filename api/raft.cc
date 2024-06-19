@@ -8,10 +8,10 @@
 
 #include <seastar/core/coroutine.hh>
 
-#include "api/api.hh"
 #include "api/api-doc/raft.json.hh"
 
 #include "service/raft/raft_group_registry.hh"
+#include "log.hh"
 
 using namespace seastar::httpd;
 
@@ -19,12 +19,13 @@ extern logging::logger apilog;
 
 namespace api {
 
+struct http_context;
 namespace r = httpd::raft_json;
 using namespace json;
 
 void set_raft(http_context&, httpd::routes& r, sharded<service::raft_group_registry>& raft_gr) {
     r::trigger_snapshot.set(r, [&raft_gr] (std::unique_ptr<http::request> req) -> future<json_return_type> {
-        raft::group_id gid{utils::UUID{req->param["group_id"]}};
+        raft::group_id gid{utils::UUID{req->get_path_param("group_id")}};
         auto timeout_dur = std::invoke([timeout_str = req->get_query_param("timeout")] {
             if (timeout_str.empty()) {
                 return std::chrono::seconds{60};

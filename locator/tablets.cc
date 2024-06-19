@@ -100,6 +100,8 @@ tablet_migration_streaming_info get_migration_streaming_info(const locator::topo
 tablet_migration_streaming_info get_migration_streaming_info(const locator::topology& topo, const tablet_info& tinfo, const tablet_transition_info& trinfo) {
     tablet_migration_streaming_info result;
     switch (trinfo.transition) {
+        case tablet_transition_kind::intranode_migration:
+            [[fallthrough]];
         case tablet_transition_kind::migration:
             result.read_from = substract_sets(tinfo.replicas, trinfo.next);
             result.written_to = substract_sets(trinfo.next, tinfo.replicas);
@@ -243,6 +245,19 @@ dht::token_range tablet_map::get_token_range(tablet_id id) const {
     }
 }
 
+tablet_replica tablet_map::get_primary_replica(tablet_id id) const {
+    const auto& replicas = get_tablet_info(id).replicas;
+    return replicas.at(size_t(id) % replicas.size());
+}
+
+tablet_replica tablet_map::get_primary_replica_within_dc(tablet_id id, const topology& topo, sstring dc) const {
+    const auto replicas = boost::copy_range<tablet_replica_set>(get_tablet_info(id).replicas | boost::adaptors::filtered([&] (const auto& tr) {
+        const auto& node = topo.get_node(tr.host);
+        return node.dc_rack().dc == dc;
+    }));
+    return replicas.at(size_t(id) % replicas.size());
+}
+
 future<std::vector<token>> tablet_map::get_sorted_tokens() const {
     std::vector<token> tokens;
     tokens.reserve(tablet_count());
@@ -281,21 +296,16 @@ void tablet_map::clear_transitions() {
     _transitions.clear();
 }
 
-std::optional<shard_id> tablet_map::get_shard(tablet_id tid, host_id host) const {
-    auto&& info = get_tablet_info(tid);
-
-    for (auto&& r : info.replicas) {
-        if (r.host == host) {
-            return r.shard;
-        }
+bool tablet_map::has_replica(tablet_id tid, tablet_replica r) const {
+    auto& tinfo = get_tablet_info(tid);
+    if (contains(tinfo.replicas, r)) {
+        return true;
     }
-
-    auto tinfo = get_tablet_transition_info(tid);
-    if (tinfo && tinfo->pending_replica && tinfo->pending_replica->host == host) {
-        return tinfo->pending_replica->shard;
+    auto* trinfo = get_tablet_transition_info(tid);
+    if (trinfo && contains(trinfo->next, r)) {
+        return true;
     }
-
-    return std::nullopt;
+    return false;
 }
 
 future<> tablet_map::clear_gently() {
@@ -346,6 +356,7 @@ tablet_transition_stage tablet_transition_stage_from_string(const sstring& name)
 // The names are persisted in system tables so should not be changed.
 static const std::unordered_map<tablet_transition_kind, sstring> tablet_transition_kind_to_name = {
         {tablet_transition_kind::migration, "migration"},
+        {tablet_transition_kind::intranode_migration, "intranode_migration"},
         {tablet_transition_kind::rebuild, "rebuild"},
 };
 
@@ -504,7 +515,14 @@ size_t tablet_metadata::external_memory_usage() const {
 bool tablet_metadata::has_replica_on(host_id host) const {
     for (auto&& [id, map] : _tablets) {
         for (auto&& tablet : map.tablet_ids()) {
-            if (map.get_shard(tablet, host)) {
+            auto& tinfo = map.get_tablet_info(tablet);
+            for (auto&& r : tinfo.replicas) {
+                if (r.host == host) {
+                    return true;
+                }
+            }
+            auto* trinfo = map.get_tablet_transition_info(tablet);
+            if (trinfo && trinfo->pending_replica && trinfo->pending_replica->host == host) {
                 return true;
             }
         }
@@ -541,7 +559,7 @@ private:
         auto& topo = _tmptr->get_topology();
         for (auto&& replica : replicas) {
             auto* node = topo.find_node(replica.host);
-            if (node) {
+            if (node && !node->left()) {
                 result.emplace_back(node->endpoint());
             }
         }
@@ -633,7 +651,7 @@ public:
         auto&& tablets = get_tablet_map();
         auto tablet = tablets.get_tablet_id(search_token);
         auto&& info = tablets.get_tablet_transition_info(tablet);
-        if (!info) {
+        if (!info || info->transition == tablet_transition_kind::intranode_migration) {
             return {};
         }
         switch (info->writes) {

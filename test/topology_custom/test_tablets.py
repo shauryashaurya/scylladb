@@ -7,18 +7,24 @@ from cassandra.protocol import ConfigurationException
 from cassandra.query import SimpleStatement, ConsistencyLevel
 from test.pylib.manager_client import ManagerClient
 from test.pylib.rest_client import HTTPError
-from test.pylib.tablets import get_all_tablet_replicas
+from test.pylib.tablets import get_tablet_replica, get_all_tablet_replicas
+from test.pylib.util import read_barrier
+from test.topology.conftest import skip_mode
+from test.topology.util import wait_for_cql_and_get_hosts
+import time
 import pytest
 import logging
 import asyncio
+import re
+import requests
+import random
 
 logger = logging.getLogger(__name__)
 
 
 @pytest.mark.asyncio
 async def test_tablet_replication_factor_enough_nodes(manager: ManagerClient):
-    cfg = {'enable_user_defined_functions': False,
-           'experimental_features': ['tablets']}
+    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
     servers = await manager.servers_add(2, config=cfg)
 
     cql = manager.get_cql()
@@ -36,7 +42,7 @@ async def test_tablet_replication_factor_enough_nodes(manager: ManagerClient):
 @pytest.mark.asyncio
 async def test_tablet_cannot_decommision_below_replication_factor(manager: ManagerClient):
     logger.info("Bootstrapping cluster")
-    cfg = {'enable_user_defined_functions': False, 'experimental_features': ['tablets']}
+    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
     servers = await manager.servers_add(4, config=cfg)
 
     logger.info("Creating table")
@@ -65,7 +71,7 @@ async def test_tablet_cannot_decommision_below_replication_factor(manager: Manag
 
 async def test_reshape_with_tablets(manager: ManagerClient):
     logger.info("Bootstrapping cluster")
-    cfg = {'enable_user_defined_functions': False, 'experimental_features': ['tablets']}
+    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
     server = (await manager.servers_add(1, config=cfg, cmdline=['--smp', '1']))[0]
 
     logger.info("Creating table")
@@ -99,12 +105,12 @@ async def test_reshape_with_tablets(manager: ManagerClient):
 
 
 @pytest.mark.parametrize("direction", ["up", "down", "none"])
-@pytest.mark.xfail(reason="Scaling not implemented yet")
 @pytest.mark.asyncio
 async def test_tablet_rf_change(manager: ManagerClient, direction):
-    cfg = {'enable_user_defined_functions': False,
-           'experimental_features': ['tablets']}
+    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
     servers = await manager.servers_add(3, config=cfg)
+    for s in servers:
+        await manager.api.disable_tablet_balancing(s.ip_addr)
 
     cql = manager.get_cql()
     res = await cql.run_async("SELECT data_center FROM system.local")
@@ -140,3 +146,159 @@ async def test_tablet_rf_change(manager: ManagerClient, direction):
 
     logger.info(f"Checking {rf_to} re-allocated replicas")
     await check_allocated_replica(rf_to)
+
+    if direction != 'up':
+        # Don't check fragments for up/none changes, scylla crashes when checking nodes
+        # that (validly) miss the replica, see scylladb/scylladb#18786
+        return
+
+    fragments = { pk: set() for pk in random.sample(range(128), 17) }
+    for s in servers:
+        host_id = await manager.get_host_id(s.server_id)
+        host = await wait_for_cql_and_get_hosts(cql, [s], time.time() + 30)
+        await read_barrier(manager.get_cql(), host[0]) # scylladb/scylladb#18199
+        for k in fragments:
+            res = await cql.run_async(f"SELECT partition_region FROM MUTATION_FRAGMENTS(test.test) WHERE pk={k}", host=host[0])
+            for fragment in res:
+                if fragment.partition_region == 0: # partition start
+                    fragments[k].add(host_id)
+    logger.info("Checking fragments")
+    for k in fragments:
+        assert len(fragments[k]) == rf_to, f"Found mutations for {k} key on {fragments[k]} hosts, but expected only {rf_to} of them"
+
+
+# Reproducer for https://github.com/scylladb/scylladb/issues/18110
+# Check that an existing cached read, will be cleaned up when the tablet it reads
+# from is migrated away.
+@pytest.mark.asyncio
+async def test_saved_readers_tablet_migration(manager: ManagerClient, mode):
+    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+
+    if mode != "release":
+        cfg['error_injections_at_startup'] = [{'name': 'querier-cache-ttl-seconds', 'value': 999999999}]
+
+    servers = await manager.servers_add(2, config=cfg)
+
+    cql = manager.get_cql()
+
+    await cql.run_async("CREATE KEYSPACE test WITH"
+                        " replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}"
+                        " and tablets = {'initial': 1}")
+    await cql.run_async("CREATE TABLE test.test (pk int, ck int, c int, PRIMARY KEY (pk, ck));")
+
+    logger.info("Populating table")
+    await asyncio.gather(*[cql.run_async(f"INSERT INTO test.test (pk, ck, c) VALUES (0, {k}, 0);") for k in range(128)])
+
+    statement = SimpleStatement("SELECT * FROM test.test WHERE pk = 0", fetch_size=10)
+    cql.execute(statement)
+
+    def get_querier_cache_population(server):
+        metrics = requests.get(f"http://{server.ip_addr}:9180/metrics").text
+        pattern = re.compile("^scylla_database_querier_cache_population")
+        for metric in metrics.split('\n'):
+            if pattern.match(metric) is not None:
+                return int(float(metric.split()[1]))
+
+    assert any(map(lambda x: x > 0, [get_querier_cache_population(server) for server in servers]))
+
+    table_id = await cql.run_async("SELECT id FROM system_schema.tables WHERE keyspace_name = 'test' AND table_name = 'test'")
+    table_id = table_id[0].id
+
+    tablet_infos = await cql.run_async(f"SELECT last_token, replicas FROM system.tablets WHERE table_id = {table_id}")
+    tablet_infos = list(tablet_infos)
+
+    assert len(tablet_infos) == 1
+    tablet_info = tablet_infos[0]
+    assert len(tablet_info.replicas) == 1
+
+    hosts = {await manager.get_host_id(server.server_id) for server in servers}
+    print(f"HOSTS: {hosts}")
+    source_host, source_shard = tablet_info.replicas[0]
+
+    hosts.remove(str(source_host))
+    target_host, target_shard = list(hosts)[0], source_shard
+
+    await manager.api.move_tablet(
+           node_ip=servers[0].ip_addr,
+           ks="test",
+           table="test",
+           src_host=source_host,
+           src_shard=source_shard,
+           dst_host=target_host,
+           dst_shard=target_shard,
+           token=tablet_info.last_token)
+
+    # The tablet move should have evicted the cached reader.
+    assert all(map(lambda x: x == 0, [get_querier_cache_population(server) for server in servers]))
+
+# Reproducer for https://github.com/scylladb/scylladb/issues/19052
+#   1) table A has N tablets and views
+#   2) migration starts for a tablet of A from node 1 to 2.
+#   3) migration is at write_both_read_old stage
+#   4) coordinator will push writes to both nodes
+#   5) A has view, so writes to it will also result in reads (table::push_view_replica_updates())
+#   6) tablet's update_effective_replication_map() is not refreshing tablet sstable set (for new tablet migrating in)
+#   7) so read on step 5 is not being able to find sstable set for tablet migrating in
+@pytest.mark.parametrize("with_cache", ['false', 'true'])
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_read_of_pending_replica_during_migration(manager: ManagerClient, with_cache):
+    logger.info("Bootstrapping cluster")
+    cfg = {'enable_user_defined_functions': False, 'enable_tablets': True}
+    cmdline = [
+        '--logger-log-level', 'storage_service=debug',
+        '--logger-log-level', 'raft_topology=debug',
+        '--enable-cache', with_cache,
+    ]
+    servers = [await manager.server_add(cmdline=cmdline, config=cfg)]
+
+    await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+
+    cql = manager.get_cql()
+    await cql.run_async("CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1};")
+    await cql.run_async("CREATE TABLE test.test (pk int PRIMARY KEY, c int);")
+    await cql.run_async("CREATE MATERIALIZED VIEW test.mv1 AS \
+        SELECT * FROM test.test WHERE pk IS NOT NULL AND c IS NOT NULL \
+        PRIMARY KEY (c, pk);")
+
+    servers.append(await manager.server_add(cmdline=cmdline, config=cfg))
+
+    key = 7 # Whatever
+    tablet_token = 0 # Doesn't matter since there is one tablet
+    await cql.run_async(f"INSERT INTO test.test (pk, c) VALUES ({key}, 0)")
+    rows = await cql.run_async("SELECT pk from test.test")
+    assert len(list(rows)) == 1
+
+    replica = await get_tablet_replica(manager, servers[0], 'test', 'test', tablet_token)
+
+    s0_host_id = await manager.get_host_id(servers[0].server_id)
+    s1_host_id = await manager.get_host_id(servers[1].server_id)
+    dst_shard = 0
+
+    await manager.api.enable_injection(servers[1].ip_addr, "stream_mutation_fragments", one_shot=True)
+    s1_log = await manager.server_open_log(servers[1].server_id)
+    s1_mark = await s1_log.mark()
+
+    # Drop cache to remove dummy entry indicating that underlying mutation source is empty
+    await manager.api.drop_sstable_caches(servers[1].ip_addr)
+
+    migration_task = asyncio.create_task(
+        manager.api.move_tablet(servers[0].ip_addr, "test", "test", replica[0], replica[1], s1_host_id, dst_shard, tablet_token))
+
+    await s1_log.wait_for('stream_mutation_fragments: waiting', from_mark=s1_mark)
+    s1_mark = await s1_log.mark()
+
+    await cql.run_async(f"INSERT INTO test.test (pk, c) VALUES ({key}, 1)")
+    rows = await cql.run_async("SELECT pk from test.test")
+    assert len(list(rows)) == 1
+
+    # Release abandoned streaming
+    await manager.api.message_injection(servers[1].ip_addr, "stream_mutation_fragments")
+    await s1_log.wait_for('stream_mutation_fragments: done', from_mark=s1_mark)
+
+    logger.info("Waiting for migration to finish")
+    await migration_task
+    logger.info("Migration done")
+
+    rows = await cql.run_async("SELECT pk from test.test")
+    assert len(list(rows)) == 1

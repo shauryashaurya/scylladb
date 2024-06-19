@@ -1,13 +1,7 @@
 #!/usr/bin/python3
-
 import os
-import sys
-import logging
-import pytest
-import pathlib
 
 # use minio_server
-sys.path.insert(1, sys.path[0] + '/../..')
 from test.pylib.minio_server import MinioServer
 from test.pylib.cql_repl import conftest
 from test.topology.conftest import *
@@ -28,8 +22,11 @@ def pytest_addoption(parser):
 
     parser.addoption('--manager-api', action='store', required=True,
                      help='Manager unix socket path')
-    parser.addoption('--mode', action='store', required=True,
-                     help='Scylla build mode. Tests can use it to adjust their behavior.')
+    parser.addoption('--tmpdir', action='store', type=str, dest='tmpdir',
+                     help='Temporary directory where logs are stored')
+    parser.addoption("--artifacts_dir_url", action='store', type=str, default=None, dest="artifacts_dir_url",
+                     help="Provide the URL to artifacts directory to generate the link to failed tests directory "
+                          "with logs")
     parser.addoption('--auth_username', action='store', default=None,
                         help='username for authentication')
     parser.addoption('--auth_password', action='store', default=None,
@@ -66,17 +63,6 @@ class S3_Server:
 
     async def stop(self):
         pass
-
-
-@pytest.fixture(scope="function")
-def test_tempdir(tmpdir, request):
-    tempdir = tmpdir.strpath
-    try:
-        yield tempdir
-    finally:
-        if request.config.getoption('--keep-tmp'):
-            return
-        _remove_all_but(tempdir, 'log')
 
 
 @pytest.fixture(scope="function")

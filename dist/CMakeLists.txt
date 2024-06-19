@@ -1,14 +1,15 @@
 set(unstripped_dist_pkg
-  ${CMAKE_CURRENT_BINARY_DIR}/${Scylla_PRODUCT}-unstripped-${Scylla_VERSION}-${Scylla_RELEASE}.${CMAKE_SYSTEM_PROCESSOR}.tar.gz)
+  ${CMAKE_BINARY_DIR}/$<CONFIG>/dist/tar/${Scylla_PRODUCT}-unstripped-${Scylla_VERSION}-${Scylla_RELEASE}.${CMAKE_SYSTEM_PROCESSOR}.tar.gz)
 add_custom_command(
   OUTPUT ${unstripped_dist_pkg}
-  COMMAND scripts/create-relocatable-package.py
-    --build-dir ${CMAKE_BINARY_DIR}/$<CONFIG>
-    --node-exporter-dir ${CMAKE_BINARY_DIR}/node_exporter
-    --debian-dir ${CMAKE_BINARY_DIR}/debian
-    ${unstripped_dist_pkg}
+  COMMAND
+    scripts/create-relocatable-package.py
+      --build-dir ${CMAKE_BINARY_DIR}/$<CONFIG>
+      --node-exporter-dir ${CMAKE_BINARY_DIR}/node_exporter
+      --debian-dir ${CMAKE_BINARY_DIR}/debian
+      ${unstripped_dist_pkg}
   DEPENDS
-    scylla
+    ${CMAKE_BINARY_DIR}/$<CONFIG>/scylla
     ${CMAKE_BINARY_DIR}/$<CONFIG>/iotune
     ${CMAKE_BINARY_DIR}/node_exporter/node_exporter
     ${CMAKE_BINARY_DIR}/debian
@@ -80,7 +81,7 @@ add_custom_command(
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 set(stripped_dist_pkg
-  "${CMAKE_CURRENT_BINARY_DIR}/${Scylla_PRODUCT}-${Scylla_VERSION}-${Scylla_RELEASE}.${CMAKE_SYSTEM_PROCESSOR}.tar.gz")
+  "${CMAKE_BINARY_DIR}/$<CONFIG>/dist/tar/${Scylla_PRODUCT}-${Scylla_VERSION}-${Scylla_RELEASE}.${CMAKE_SYSTEM_PROCESSOR}.tar.gz")
 add_custom_command(
   OUTPUT
     ${stripped_dist_pkg}
@@ -100,7 +101,7 @@ add_custom_command(
 add_custom_target(dist-server-tar
   DEPENDS ${stripped_dist_pkg})
 add_custom_target(package
-  ${CMAKE_COMMAND} -E copy ${stripped_dist_pkg} ${Scylla_PRODUCT}-package.tar.gz
+  ${CMAKE_COMMAND} -E copy ${stripped_dist_pkg} ${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/${Scylla_PRODUCT}-package.tar.gz
   DEPENDS ${stripped_dist_pkg})
 
 
@@ -114,7 +115,7 @@ dist_submodule(jmx jmx dist_pkgs
   NOARCH)
 dist_submodule(python3 python3 dist_pkgs)
 set(unified_dist_pkg
-  "${CMAKE_CURRENT_BINARY_DIR}/${Scylla_PRODUCT}-unified-${Scylla_VERSION}-${Scylla_RELEASE}.${CMAKE_SYSTEM_PROCESSOR}.tar.gz")
+  "${CMAKE_BINARY_DIR}/$<CONFIG>/dist/tar/${Scylla_PRODUCT}-unified-${Scylla_VERSION}-${Scylla_RELEASE}.${CMAKE_SYSTEM_PROCESSOR}.tar.gz")
 add_custom_command(
   OUTPUT
     "${unified_dist_pkg}"
@@ -127,7 +128,7 @@ add_custom_command(
     ${dist_pkgs}
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   VERBATIM)
-add_custom_target(dist-unified
+add_custom_target(dist-unified ALL
   DEPENDS ${unified_dist_pkg})
 
 add_subdirectory(debuginfo)

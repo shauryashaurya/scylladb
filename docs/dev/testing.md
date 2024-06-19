@@ -38,9 +38,16 @@ If you want to run only a specific test:
 
     $ ./test.py suitename/testname
 
-If you want to run only a specific test-case from a test:
+This will select and run all tests having suitename/testname as substring,
+e.g. suitename/testname_ext and others.
+
+If you want to run only a specific test-case from a specific test:
 
     $ ./test.py suitename/testname::casename
+
+This will select only the test with the suitename/testname name, no
+substring search is performed in this case. If the casename is `*`, then
+all test-cases will be selected.
 
 Note that not all tests are divided into cases. Below sections will
 shed more light on this.
@@ -291,7 +298,7 @@ Jenkins in event of test failure.
 ## Stability
 
 Testing is hard. Testing ScyllaDB is even harder, but we strive to ensure our testing
-suite is as solid as possible. The first step is contribuing a stable (read: non-flaky) test.
+suite is as solid as possible. The first step is contributing a stable (read: non-flaky) test.
 To do so, when developing tests, please run them (1) in debug mode and (2) 100 times in a row (using `--repeat 100`),
 and see that they pass successfully.
 

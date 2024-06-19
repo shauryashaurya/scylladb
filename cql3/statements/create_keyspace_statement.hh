@@ -11,6 +11,7 @@
 #pragma once
 
 #include "cql3/statements/schema_altering_statement.hh"
+#include "service/raft/raft_group0_client.hh"
 #include "transport/event.hh"
 
 #include <seastar/core/shared_ptr.hh>
@@ -68,16 +69,19 @@ public:
     virtual void validate(query_processor&, const service::client_state& state) const override;
 
 
-    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, api::timestamp_type) const override;
+    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const override;
 
     virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
 
-    virtual future<> grant_permissions_to_creator(const service::client_state&) const override;
+    virtual future<> grant_permissions_to_creator(const service::client_state&, service::group0_batch&) const override;
 
     virtual future<::shared_ptr<messages::result_message>>
     execute(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const override;
 
     lw_shared_ptr<data_dictionary::keyspace_metadata> get_keyspace_metadata(const locator::token_metadata& tm, const gms::feature_service& feat);
+
+private:
+    ::shared_ptr<event_t> created_event() const;
 };
 
 std::vector<sstring> check_against_restricted_replication_strategies(

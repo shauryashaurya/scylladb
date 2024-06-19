@@ -136,6 +136,7 @@ public:
 
     // Apply a group 0 change.
     // The future resolves after the change is applied locally.
+    template<typename mutation_type = schema_change>
     future<> announce(std::vector<mutation> schema, group0_guard, std::string_view description);
 
     void passive_announce(table_schema_version version);
@@ -164,6 +165,7 @@ private:
 
     future<> maybe_schedule_schema_pull(const table_schema_version& their_version, const gms::inet_address& endpoint);
 
+    template<typename mutation_type = schema_change>
     future<> announce_with_raft(std::vector<mutation> schema, group0_guard, std::string_view description);
     future<> announce_without_raft(std::vector<mutation> schema, group0_guard);
 
@@ -193,6 +195,17 @@ public:
     void set_concurrent_ddl_retries(size_t);
 };
 
+extern template
+future<> migration_manager::announce_with_raft<schema_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+extern template
+future<> migration_manager::announce_with_raft<topology_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+
+extern template
+future<> migration_manager::announce<schema_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+extern template
+future<> migration_manager::announce<topology_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+
+
 future<column_mapping> get_column_mapping(db::system_keyspace& sys_ks, table_id, table_schema_version v);
 
 std::vector<mutation> prepare_keyspace_update_announcement(replica::database& db, lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type ts);
@@ -202,7 +215,7 @@ std::vector<mutation> prepare_new_keyspace_announcement(replica::database& db, l
 // The timestamp parameter can be used to ensure that all nodes update their internal tables' schemas
 // with identical timestamps, which can prevent an undeeded schema exchange
 future<std::vector<mutation>> prepare_column_family_update_announcement(storage_proxy& sp,
-        schema_ptr cfm, bool from_thrift, std::vector<view_ptr> view_updates, api::timestamp_type ts);
+        schema_ptr cfm, std::vector<view_ptr> view_updates, api::timestamp_type ts);
 
 future<std::vector<mutation>> prepare_new_column_family_announcement(storage_proxy& sp, schema_ptr cfm, api::timestamp_type timestamp);
 // The ksm parameter can describe a keyspace that hasn't been created yet.

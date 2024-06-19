@@ -60,6 +60,8 @@ add_scylla_test(column_mapping_test
   KIND SEASTAR)
 add_scylla_test(commitlog_test
   KIND SEASTAR)
+add_scylla_test(commitlog_cleanup_test
+  KIND SEASTAR)
 add_scylla_test(compaction_group_test
   KIND SEASTAR)
 add_scylla_test(compound_test
@@ -360,6 +362,8 @@ add_scylla_test(wasm_test
   KIND SEASTAR)
 add_scylla_test(pretty_printers_test
   KIND BOOST)
+add_scylla_test(sorting_test
+  KIND SEASTAR)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/suite.yaml")
   set(scylla_tests "${scylla_tests}" PARENT_SCOPE)

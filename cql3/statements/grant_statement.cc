@@ -12,6 +12,7 @@
 #include "auth/authorizer.hh"
 #include "cql3/statements/prepared_statement.hh"
 #include "service/query_state.hh"
+#include "service/raft/raft_group0_client.hh"
 
 std::unique_ptr<cql3::statements::prepared_statement> cql3::statements::grant_statement::prepare(
                 data_dictionary::database db, cql_stats& stats) {
@@ -21,14 +22,15 @@ std::unique_ptr<cql3::statements::prepared_statement> cql3::statements::grant_st
 future<::shared_ptr<cql_transport::messages::result_message>>
 cql3::statements::grant_statement::execute(query_processor&, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const {
     auto& auth_service = *state.get_client_state().get_auth_service();
+    try {
+        service::group0_batch mc{std::move(guard)};
+        co_await auth::grant_permissions(auth_service, _role_name, _permissions, _resource, mc);
+        co_await auth::commit_mutations(auth_service, std::move(mc));
+    } catch (const auth::nonexistant_role& e) {
+        throw exceptions::invalid_request_exception(e.what());
+    } catch (const auth::unsupported_authorization_operation& e) {
+        throw exceptions::invalid_request_exception(e.what());
+    }
 
-    return auth::grant_permissions(auth_service, _role_name, _permissions, _resource).then([] {
-        return make_ready_future<::shared_ptr<cql_transport::messages::result_message>>();
-    }).handle_exception_type([](const auth::nonexistant_role& e) {
-        return make_exception_future<::shared_ptr<cql_transport::messages::result_message>>(
-                exceptions::invalid_request_exception(e.what()));
-    }).handle_exception_type([](const auth::unsupported_authorization_operation& e) {
-        return make_exception_future<::shared_ptr<cql_transport::messages::result_message>>(
-                exceptions::invalid_request_exception(e.what()));
-    });
+    co_return ::shared_ptr<cql_transport::messages::result_message>();
 }

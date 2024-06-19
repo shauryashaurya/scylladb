@@ -14,12 +14,14 @@
 # through out-of-band HTTP requests.
 ##############################################################################
 
+import json
+import time
+
 import pytest
 import requests
-import time
-import json
-from botocore.exceptions import ClientError
-from util import random_string, full_scan, full_query, create_test_table
+
+from test.alternator.util import random_string, full_scan, full_query, create_test_table
+
 
 # The "with_tracing" fixture ensures that tracing is enabled throughout
 # the run of a test function, and disabled when it ends. If tracing cannot be
@@ -240,9 +242,9 @@ def test_slow_query_log(with_slow_query_logging, test_table_s, dynamodb):
     while time.time() < start_time + 60:
         results = full_scan(slow_query_table, ConsistentRead=False)
         put_item_found = any("PutItem" in result['parameters'] and p in result['parameters']
-                and result['username'] == "alternator" for result in results)
+                and result['username'] == "cassandra" for result in results)
         delete_item_found = any("DeleteItem" in result['parameters'] and p in result['parameters']
-                and result['username'] == "alternator" for result in results)
+                and result['username'] == "cassandra" for result in results)
         if put_item_found and delete_item_found:
             return
         else:

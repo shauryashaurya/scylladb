@@ -38,10 +38,6 @@
 #include "locator/token_metadata.hh"
 #include "locator/types.hh"
 
-namespace db {
-class config;
-}
-
 namespace gms {
 
 class gossip_digest_syn;
@@ -75,6 +71,8 @@ struct gossip_config {
     uint32_t shadow_round_ms = 300 * 1000;
     uint32_t shutdown_announce_ms = 2 * 1000;
     uint32_t skip_wait_for_gossip_to_settle = -1;
+    utils::updateable_value<uint32_t> failure_detector_timeout_ms;
+    utils::updateable_value<int32_t> force_gossip_generation;
 };
 
 struct loaded_endpoint_state {
@@ -259,7 +257,7 @@ private:
 
     bool _in_shadow_round = false;
 
-    service::topology_state_machine* topo_sm = nullptr;
+    service::topology_state_machine* _topo_sm = nullptr;
 
     // Must be called on shard 0.
     future<semaphore_units<>> lock_endpoint_update_semaphore();
@@ -291,7 +289,7 @@ private:
     // Must be called under lock_endpoint.
     future<> replicate(inet_address, endpoint_state, permit_id);
 public:
-    explicit gossiper(abort_source& as, const locator::shared_token_metadata& stm, netw::messaging_service& ms, const db::config& cfg, gossip_config gcfg);
+    explicit gossiper(abort_source& as, const locator::shared_token_metadata& stm, netw::messaging_service& ms, gossip_config gcfg);
 
     /**
      * Register for interesting state changes.
@@ -332,7 +330,7 @@ public:
     version_type get_max_endpoint_state_version(const endpoint_state& state) const noexcept;
 
     void set_topology_state_machine(service::topology_state_machine* m) {
-        topo_sm = m;
+        _topo_sm = m;
         // In raft topology mode the coodinator maintains banned nodes list
         _just_removed_endpoints.clear();
     }
@@ -690,8 +688,6 @@ private:
     abort_source& _abort_source;
     const locator::shared_token_metadata& _shared_token_metadata;
     netw::messaging_service& _messaging;
-    utils::updateable_value<uint32_t> _failure_detector_timeout_ms;
-    utils::updateable_value<int32_t> _force_gossip_generation;
     gossip_config _gcfg;
     // Get features supported by a particular node
     std::set<sstring> get_supported_features(inet_address endpoint) const;

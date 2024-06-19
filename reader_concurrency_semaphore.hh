@@ -15,6 +15,7 @@
 #include <seastar/core/metrics_registration.hh>
 #include "reader_permit.hh"
 #include "utils/updateable_value.hh"
+#include "dht/i_partitioner_fwd.hh"
 
 namespace bi = boost::intrusive;
 
@@ -160,6 +161,7 @@ public:
 private:
     resources _initial_resources;
     resources _resources;
+    utils::observer<int> _count_observer;
 
     struct wait_queue {
         // Stores entries for permits waiting to be admitted.
@@ -272,13 +274,26 @@ public:
     /// Create a semaphore with the specified limits
     ///
     /// The semaphore's name has to be unique!
-    reader_concurrency_semaphore(int count,
+    reader_concurrency_semaphore(
+            utils::updateable_value<int> count,
             ssize_t memory,
             sstring name,
             size_t max_queue_length,
             utils::updateable_value<uint32_t> serialize_limit_multiplier,
             utils::updateable_value<uint32_t> kill_limit_multiplier,
             register_metrics metrics);
+
+    reader_concurrency_semaphore(
+            int count,
+            ssize_t memory,
+            sstring name,
+            size_t max_queue_length,
+            utils::updateable_value<uint32_t> serialize_limit_multiplier,
+            utils::updateable_value<uint32_t> kill_limit_multiplier,
+            register_metrics metrics)
+        : reader_concurrency_semaphore(utils::updateable_value(count), memory, std::move(name), max_queue_length,
+                std::move(serialize_limit_multiplier), std::move(kill_limit_multiplier), metrics)
+    { }
 
     /// Create a semaphore with practically unlimited count and memory.
     ///
@@ -297,7 +312,7 @@ public:
             utils::updateable_value<uint32_t> serialize_limit_multipler = utils::updateable_value(std::numeric_limits<uint32_t>::max()),
             utils::updateable_value<uint32_t> kill_limit_multipler = utils::updateable_value(std::numeric_limits<uint32_t>::max()),
             register_metrics metrics = register_metrics::no)
-        : reader_concurrency_semaphore(count, memory, std::move(name), max_queue_length, std::move(serialize_limit_multipler),
+        : reader_concurrency_semaphore(utils::updateable_value<uint32_t>(count), memory, std::move(name), max_queue_length, std::move(serialize_limit_multipler),
                 std::move(kill_limit_multipler), register_metrics::no)
     {}
 
@@ -326,7 +341,7 @@ public:
     ///
     /// The semaphore takes ownership of the passed in reader for the duration
     /// of its inactivity and it may evict it to free up resources if necessary.
-    inactive_read_handle register_inactive_read(flat_mutation_reader_v2 ir) noexcept;
+    inactive_read_handle register_inactive_read(flat_mutation_reader_v2 ir, const dht::partition_range* range = nullptr) noexcept;
 
     /// Set the inactive read eviction notification handler and optionally eviction ttl.
     ///
@@ -358,7 +373,12 @@ public:
     void clear_inactive_reads();
 
     /// Evict all inactive reads the belong to the table designated by the id.
-    future<> evict_inactive_reads_for_table(table_id id) noexcept;
+    /// If a range is provided, only inactive reads whose range overlaps with the
+    /// range are evicted.
+    /// The range of the inactive read is provided in register_inactive_read().
+    /// If the range for an inactive read was not provided, all reads for the
+    /// table are evicted.
+    future<> evict_inactive_reads_for_table(table_id id, const dht::partition_range* range = nullptr) noexcept;
 private:
     // The following two functions are extension points for
     // future inheriting classes that needs to run some stop

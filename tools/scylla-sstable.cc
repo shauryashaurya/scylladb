@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <set>
 #include <fmt/chrono.h>
+#include <fmt/ostream.h>
 #include <fmt/ranges.h>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/queue.hh>
@@ -48,6 +49,14 @@ namespace bpo = boost::program_options;
 using namespace tools::utils;
 
 using operation_func = void(*)(schema_ptr, reader_permit, const std::vector<sstables::shared_sstable>&, sstables::sstables_manager&, const bpo::variables_map&);
+
+namespace std {
+// required by boost::lexical_cast<std::string>(vector<string>), which is in turn used
+// by boost::program_option for printing out the default value of an option
+std::ostream& operator<<(std::ostream& os, const std::vector<sstring>& v) {
+    return os << fmt::format("{}", v);
+}
+}
 
 namespace {
 
@@ -271,6 +280,26 @@ std::optional<schema_with_source> try_load_schema_autodetect(const bpo::variable
             .obtained_from = "data dir"};
     } catch (...) {
         sst_log.debug("Trying to locate data dir failed: {}", std::current_exception());
+    }
+
+    try {
+        sstring keyspace_name, table_name;
+        try {
+            std::tie(keyspace_name, table_name) = get_keyspace_and_table_options(app_config);
+        } catch (std::invalid_argument&) {
+            keyspace_name = "my_keyspace";
+            table_name = "my_table";
+        }
+        if (!app_config.count("sstables")) {
+            throw std::runtime_error("no sstables provided on the command-line");
+        }
+        const auto sst_path = app_config["sstables"].as<std::vector<sstring>>().front();
+        return schema_with_source{.schema = tools::load_schema_from_sstable(cfg, fs::path(sst_path),
+                keyspace_name, table_name).get(),
+            .source = "sstable's serialization header",
+            .obtained_from = sst_path};
+    } catch (...) {
+        sst_log.debug("Trying to load schema from the sstable itself failed: {}", std::current_exception());
     }
 
     fmt::print(std::cerr, "Failed to autodetect and load schema, try again with --logger-log-level scylla-sstable=debug to learn more or provide the schema source manually\n");
@@ -1746,12 +1775,9 @@ class json_mutation_stream_parser {
             return boost::algorithm::join(_state_stack | boost::adaptors::transformed([] (state s) { return std::string(to_string(s)); }), "|");
         }
 
-        bool error(const char* msg, auto&&... args) {
-#if FMT_VERSION >= 80000
-            auto parse_error = fmt::format(fmt::runtime(msg), std::forward<decltype(args)>(args)...);
-#else
-            auto parse_error = fmt::format(msg, std::forward<decltype(args)>(args)...);
-#endif
+        template<typename... Args>
+        bool error(fmt::format_string<Args...> fmt, Args&&... args) {
+            auto parse_error = fmt::format(fmt, std::forward<Args>(args)...);
             sst_log.trace("{}", parse_error);
             _queue.abort(std::make_exception_ptr(std::runtime_error(parse_error)));
             return false;
@@ -1768,7 +1794,7 @@ class json_mutation_stream_parser {
                 auto raw = from_hex(*_string);
                 _pkey.emplace(partition_key::from_bytes(raw));
             } catch (...) {
-                return error("failed to parse partition key from raw string: {}", std::current_exception());
+                return error("failed to parse partition key from raw string: {}", fmt::streamed(std::current_exception()));
             }
             return true;
         }
@@ -1778,7 +1804,7 @@ class json_mutation_stream_parser {
                 auto raw = from_hex(*_string);
                 _ckey.emplace(clustering_key::from_bytes(raw));
             } catch (...) {
-                return error("failed to parse clustering key from raw string: {}", std::current_exception());
+                return error("failed to parse clustering key from raw string: {}", fmt::streamed(std::current_exception()));
             }
             return true;
         }
@@ -2578,7 +2604,7 @@ void shard_of_operation(schema_ptr, reader_permit,
             sst->generation(),
             sstable_state::normal,
             sst->get_version());
-        new_sst->load(schema->get_sharder(), sstables::sstable_open_config{}).get();
+        new_sst->load_owner_shards(schema->get_sharder()).get();
 
         writer.Key(sst->get_filename());
         writer.StartArray();
@@ -3030,6 +3056,7 @@ $ scylla sstable validate /path/to/md-123456-big-Data.db /path/to/md-123457-big-
                     schema_with_source->source,
                     schema_with_source->path ? format(" ({})", schema_with_source->path->native()) : "",
                     schema_with_source->obtained_from);
+            sst_log.trace("Loaded schema: {}", schema);
         } else {
             return 1;
         }

@@ -23,8 +23,6 @@
 #include "service/migration_manager.hh"
 #include "service/raft/group0_state_machine.hh"
 #include "timeout_config.hh"
-#include "db/config.hh"
-#include "db/system_auth_keyspace.hh"
 #include "utils/error_injection.hh"
 
 namespace auth {
@@ -41,14 +39,14 @@ constinit const std::string_view AUTH_PACKAGE_NAME("org.apache.cassandra.auth.")
 static logging::logger auth_log("auth");
 
 bool legacy_mode(cql3::query_processor& qp) {
-    return qp.auth_version < db::system_auth_keyspace::version_t::v2;
+    return qp.auth_version < db::system_keyspace::auth_version_t::v2;
 }
 
 std::string_view get_auth_ks_name(cql3::query_processor& qp) {
     if (legacy_mode(qp)) {
         return meta::legacy::AUTH_KS;
     }
-    return db::system_auth_keyspace::NAME;
+    return db::system_keyspace::NAME;
 }
 
 // Func must support being invoked more than once.
@@ -65,7 +63,7 @@ future<> do_after_system_ready(seastar::abort_source& as, seastar::noncopyable_f
     }).discard_result();
 }
 
-static future<> create_metadata_table_if_missing_impl(
+static future<> create_legacy_metadata_table_if_missing_impl(
         std::string_view table_name,
         cql3::query_processor& qp,
         std::string_view cql,
@@ -98,12 +96,12 @@ static future<> create_metadata_table_if_missing_impl(
     }
 }
 
-future<> create_metadata_table_if_missing(
+future<> create_legacy_metadata_table_if_missing(
         std::string_view table_name,
         cql3::query_processor& qp,
         std::string_view cql,
         ::service::migration_manager& mm) noexcept {
-    return futurize_invoke(create_metadata_table_if_missing_impl, table_name, qp, cql, mm);
+    return futurize_invoke(create_legacy_metadata_table_if_missing_impl, table_name, qp, cql, mm);
 }
 
 ::service::query_state& internal_distributed_query_state() noexcept {
@@ -138,7 +136,7 @@ static future<> announce_mutations_with_guard(
 future<> announce_mutations_with_batching(
         ::service::raft_group0_client& group0_client,
         start_operation_func_t start_operation_func,
-        std::function<mutations_generator(api::timestamp_type& t)> gen,
+        std::function<::service::mutations_generator(api::timestamp_type t)> gen,
         seastar::abort_source* as,
         std::optional<::service::raft_timeout> timeout) {
     // account for command's overhead, it's better to use smaller threshold than constantly bounce off the limit
@@ -201,6 +199,19 @@ future<> announce_mutations(
             std::move(values));
     std::vector<canonical_mutation> cmuts = {muts.begin(), muts.end()};
     co_await announce_mutations_with_guard(group0_client, std::move(cmuts), std::move(group0_guard), as, timeout);
+}
+
+future<> collect_mutations(
+        cql3::query_processor& qp,
+        ::service::group0_batch& collector,
+        const sstring query_string,
+        std::vector<data_value_or_unset> values) {
+    auto muts = co_await qp.get_mutations_internal(
+            query_string,
+            internal_distributed_query_state(),
+            collector.write_timestamp(),
+            std::move(values));
+    collector.add_mutations(std::move(muts), format("auth internal statement: {}", query_string));
 }
 
 }

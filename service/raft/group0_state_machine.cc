@@ -6,15 +6,16 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 #include "service/raft/group0_state_machine.hh"
-#include "db/system_auth_keyspace.hh"
 #include "mutation/atomic_cell.hh"
 #include "cql3/selection/selection.hh"
 #include "dht/i_partitioner.hh"
 #include "dht/token.hh"
 #include "message/messaging_service.hh"
 #include "mutation/canonical_mutation.hh"
-#include "seastar/core/abort_source.hh"
-#include "seastar/core/on_internal_error.hh"
+#include "mutation/async_utils.hh"
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/on_internal_error.hh>
+#include <seastar/coroutine/parallel_for_each.hh>
 #include "service/broadcast_tables/experimental/query_result.hh"
 #include "schema_mutations.hh"
 #include "frozen_schema.hh"
@@ -115,22 +116,24 @@ static bool should_flush_system_topology_after_applying(const mutation& mut, con
 }
 
 static future<> write_mutations_to_database(storage_proxy& proxy, gms::inet_address from, std::vector<canonical_mutation> cms) {
-    std::vector<mutation> mutations;
+    std::vector<frozen_mutation_and_schema> mutations;
     mutations.reserve(cms.size());
     bool need_system_topology_flush = false;
     try {
-        for (const auto& cm : cms) {
+        for (auto& cm : cms) {
             auto& tbl = proxy.local_db().find_column_family(cm.column_family_id());
-            auto mut = cm.to_mutation(tbl.schema());
+            auto& s = tbl.schema();
+            auto mut = co_await to_mutation_gently(cm, s);
             need_system_topology_flush = need_system_topology_flush || should_flush_system_topology_after_applying(mut, proxy.data_dictionary());
-            mutations.emplace_back(std::move(mut));
+            mutations.emplace_back(co_await freeze_gently(mut), s);
         }
     } catch (replica::no_such_column_family& e) {
         slogger.error("Error while applying mutations from {}: {}", from, e);
         throw std::runtime_error(::format("Error while applying mutations: {}", e));
     }
 
-    co_await proxy.mutate_locally(std::move(mutations), tracing::trace_state_ptr());
+    co_await proxy.mutate_locally(std::move(mutations), tracing::trace_state_ptr(), db::commitlog::force_sync::no);
+
     if (need_system_topology_flush) {
         slogger.trace("write_mutations_to_database: flushing {}.{}", db::system_keyspace::NAME, db::system_keyspace::TOPOLOGY);
         co_await proxy.get_db().local().flush(db::system_keyspace::NAME, db::system_keyspace::TOPOLOGY);
@@ -164,6 +167,11 @@ future<> group0_state_machine::merge_and_apply(group0_state_machine_merger& merg
     [&] (topology_change& chng) -> future<> {
         co_await write_mutations_to_database(_sp, cmd.creator_addr, std::move(chng.mutations));
         co_await _ss.topology_transition();
+    },
+    [&] (mixed_change& chng) -> future<> {
+        co_await _mm.merge_schema_from(netw::messaging_service::msg_addr(std::move(cmd.creator_addr)), std::move(chng.mutations));
+        co_await _ss.topology_transition();
+        co_return;
     },
     [&] (write_mutations& muts) -> future<> {
         return write_mutations_to_database(_sp, cmd.creator_addr, std::move(muts.mutations));
@@ -270,7 +278,7 @@ future<> group0_state_machine::transfer_snapshot(raft::server_id from_id, raft::
     std::optional<service::raft_snapshot> raft_snp;
 
     if (_topology_change_enabled) {
-        auto auth_tables = db::system_auth_keyspace::all_tables();
+        auto auth_tables = db::system_keyspace::auth_tables();
         std::vector<table_id> tables;
         tables.reserve(3);
         tables.push_back(db::system_keyspace::topology()->id());

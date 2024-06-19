@@ -100,12 +100,12 @@ future<> unset_transport_controller(http_context& ctx) {
     return ctx.http_server.set_routes([&ctx] (routes& r) { unset_transport_controller(ctx, r); });
 }
 
-future<> set_rpc_controller(http_context& ctx, thrift_controller& ctl) {
-    return ctx.http_server.set_routes([&ctx, &ctl] (routes& r) { set_rpc_controller(ctx, r, ctl); });
+future<> set_thrift_controller(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { set_thrift_controller(ctx, r); });
 }
 
-future<> unset_rpc_controller(http_context& ctx) {
-    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_rpc_controller(ctx, r); });
+future<> unset_thrift_controller(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_thrift_controller(ctx, r); });
 }
 
 future<> set_server_storage_service(http_context& ctx, sharded<service::storage_service>& ss, service::raft_group0_client& group0_client) {
@@ -346,7 +346,7 @@ void req_params::process(const request& req) {
             continue;
         }
         try {
-            ent.value = req.param[name];
+            ent.value = req.get_path_param(name);
         } catch (std::out_of_range&) {
             throw httpd::bad_param_exception(fmt::format("Mandatory parameter '{}' was not provided", name));
         }

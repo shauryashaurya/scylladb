@@ -13,7 +13,7 @@
 #include <chrono>
 #include <fmt/ranges.h>
 #include <seastar/core/shared_ptr.hh>
-#include "seastar/core/on_internal_error.hh"
+#include <seastar/core/on_internal_error.hh>
 #include "sstables/shared_sstable.hh"
 #include "sstables/sstables.hh"
 #include "compaction_strategy.hh"
@@ -150,7 +150,7 @@ static bool validate_unchecked_tombstone_compaction(const std::map<sstring, sstr
     auto tmp_value = compaction_strategy_impl::get_value(options, compaction_strategy_impl::UNCHECKED_TOMBSTONE_COMPACTION_OPTION);
     if (tmp_value.has_value()) {
         if (tmp_value != "true" && tmp_value != "false") {
-            throw exceptions::configuration_exception(fmt::format("{} value ({}) must be \"true\" or \"false\"", compaction_strategy_impl::UNCHECKED_TOMBSTONE_COMPACTION_OPTION, tmp_value));
+            throw exceptions::configuration_exception(fmt::format("{} value ({}) must be \"true\" or \"false\"", compaction_strategy_impl::UNCHECKED_TOMBSTONE_COMPACTION_OPTION, *tmp_value));
         }
         unchecked_tombstone_compaction = tmp_value == "true";
     }
@@ -628,7 +628,7 @@ leveled_compaction_strategy::calculate_max_sstable_size_in_mb(std::optional<sstr
             max_size);
     } else if (max_size < 50) {
         leveled_manifest::logger.warn("Max sstable size of {}MB is configured. Testing done for CASSANDRA-5727 indicates that performance" \
-            "improves up to 160MB", max_size);
+            " improves up to 160MB", max_size);
     }
     return max_size;
 }

@@ -135,7 +135,7 @@ auto fmt::formatter<column_mapping>::format(const column_mapping& cm, fmt::forma
 }
 
 thread_local std::map<sstring, std::unique_ptr<dht::i_partitioner>> partitioners;
-thread_local std::map<std::pair<unsigned, unsigned>, std::unique_ptr<dht::sharder>> sharders;
+thread_local std::map<std::pair<unsigned, unsigned>, std::unique_ptr<dht::static_sharder>> sharders;
 sstring default_partitioner_name = "org.apache.cassandra.dht.Murmur3Partitioner";
 unsigned default_partitioner_ignore_msb = 12;
 
@@ -153,10 +153,10 @@ void schema::set_default_partitioner(const sstring& class_name, unsigned ignore_
     default_partitioner_ignore_msb = ignore_msb;
 }
 
-static const dht::sharder& get_sharder(unsigned shard_count, unsigned ignore_msb) {
+static const dht::static_sharder& get_sharder(unsigned shard_count, unsigned ignore_msb) {
     auto it = sharders.find({shard_count, ignore_msb});
     if (it == sharders.end()) {
-        auto sharder = std::make_unique<dht::sharder>(shard_count, ignore_msb);
+        auto sharder = std::make_unique<dht::static_sharder>(shard_count, ignore_msb);
         it = sharders.emplace(std::make_pair(shard_count, ignore_msb), std::move(sharder)).first;
     }
     return *it->second;
@@ -166,7 +166,7 @@ const dht::i_partitioner& schema::get_partitioner() const {
     return _raw._partitioner.get();
 }
 
-const dht::sharder* schema::try_get_static_sharder() const {
+const dht::static_sharder* schema::try_get_static_sharder() const {
     auto t = maybe_table();
     if (t && !t->uses_static_sharding()) {
         // Use table()->get_effective_replication_map()->get_sharder() instead.
@@ -175,7 +175,7 @@ const dht::sharder* schema::try_get_static_sharder() const {
     return &_raw._sharder.get();
 }
 
-const dht::sharder& schema::get_sharder() const {
+const dht::static_sharder& schema::get_sharder() const {
     auto* s = try_get_static_sharder();
     if (!s) {
         // Use table()->get_effective_replication_map()->get_sharder() instead.
@@ -328,9 +328,6 @@ void schema::rebuild() {
         _column_mapping = column_mapping(std::move(cm_columns), static_columns_count());
     }
 
-    thrift()._compound = is_compound();
-    thrift()._is_dynamic = clustering_key_size() > 0;
-
     if (is_counter()) {
         for (auto&& cdef : boost::range::join(static_columns(), regular_columns())) {
             if (!cdef.type->is_counter()) {
@@ -415,8 +412,6 @@ schema::schema(private_tag, const raw_schema& raw, std::optional<raw_view_info> 
             def._dropped_at = std::max(def._dropped_at, dropped_at_it->second.timestamp);
         }
 
-        def._thrift_bits = column_definition::thrift_bits();
-
         {
             // is_on_all_components
             // TODO : In origin, this predicate is "componentIndex == null", which is true in
@@ -436,7 +431,6 @@ schema::schema(private_tag, const raw_schema& raw, std::optional<raw_view_info> 
                 [[fallthrough]];
             default:
                 // Or any other column where "comparator" is not compound
-                def._thrift_bits.is_on_all_components = !thrift().has_compound_comparator();
                 break;
             }
         }
@@ -517,18 +511,6 @@ schema::~schema() {
 schema_registry_entry*
 schema::registry_entry() const noexcept {
     return _registry_entry;
-}
-
-sstring schema::thrift_key_validator() const {
-    if (partition_key_size() == 1) {
-        return partition_key_columns().begin()->type->name();
-    } else {
-        auto type_params = fmt::join(partition_key_columns()
-                            | boost::adaptors::transformed(std::mem_fn(&column_definition::type))
-                            | boost::adaptors::transformed(std::mem_fn(&abstract_type::name)),
-                                        ", ");
-        return format("org.apache.cassandra.db.marshal.CompositeType({})", type_params);
-    }
 }
 
 bool
@@ -699,7 +681,6 @@ auto fmt::formatter<schema>::format(const schema& s, fmt::format_context& ctx) c
     out = fmt::format_to(out, ",comment={}", s._raw._comment);
     out = fmt::format_to(out, ",tombstoneGcOptions={}", s.tombstone_gc_options().to_sstring());
     out = fmt::format_to(out, ",gcGraceSeconds={}", s._raw._gc_grace_seconds);
-    out = fmt::format_to(out, ",keyValidator={}", s.thrift_key_validator());
     out = fmt::format_to(out, ",minCompactionThreshold={}", s._raw._min_compaction_threshold);
     out = fmt::format_to(out, ",maxCompactionThreshold={}", s._raw._max_compaction_threshold);
     out = fmt::format_to(out, ",columnMetadata=[");
@@ -799,6 +780,16 @@ static std::ostream& map_as_cql_param(std::ostream& os, const std::map<sstring, 
 std::ostream& operator<<(std::ostream& os, const schema& s) {
     fmt::print(os, "{}", s);
     return os;
+}
+
+// default impl assumes options are in a map.
+// implementations should override if not
+std::string schema_extension::options_to_string() const {
+    std::ostringstream ss;
+    ss << '{';
+    map_as_cql_param(ss, ser::deserialize_from_buffer(serialize(), boost::type<default_map_type>(), 0));
+    ss << '}';
+    return ss.str();
 }
 
 static std::ostream& column_definition_as_cql_key(std::ostream& os, const column_definition & cd) {
@@ -943,6 +934,28 @@ std::ostream& schema::describe(replica::database& db, std::ostream& os, bool wit
     if (is_compact_table()) {
         os << "COMPACT STORAGE\n    AND ";
     }
+    schema_properties(db, os);
+    os << ";\n";
+
+    if (with_internals) {
+        for (auto& cdef : dropped_columns()) {
+            os << "\nALTER TABLE " << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(cf_name())
+               << " DROP " << cql3::util::maybe_quote(cdef.first) << " USING TIMESTAMP " << cdef.second.timestamp << ";";
+
+            auto column = get_column_definition(to_bytes(cdef.first));
+            if (column) {
+                os << "\nALTER TABLE " << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(cf_name())
+                   << " ADD ";
+                column_definition_as_cql_key(os, *column);
+                os << ";";
+            }
+        }
+    }
+
+    return os;
+}
+
+std::ostream& schema::schema_properties(replica::database& db, std::ostream& os) const {
     os << "bloom_filter_fp_chance = " << bloom_filter_fp_chance();
     os << "\n    AND caching = {";
     map_as_cql_param(os, caching_options().to_map());
@@ -961,15 +974,9 @@ std::ostream& schema::describe(replica::database& db, std::ostream& os, bool wit
     os << "\n    AND memtable_flush_period_in_ms = " << memtable_flush_period();
     os << "\n    AND min_index_interval = " << min_index_interval();
     os << "\n    AND speculative_retry = '" << speculative_retry().to_sstring() << "'";
-    os << "\n    AND paxos_grace_seconds = " << paxos_grace_seconds().count();
-    os << "\n    AND tombstone_gc = {";
-    map_as_cql_param(os, tombstone_gc_options().to_map());
-    os << "}";
     
-    if (cdc_options().enabled()) {
-        os << "\n    AND cdc = {";
-        map_as_cql_param(os, cdc_options().to_map());
-        os << "}";
+    for (auto& [type, ext] : extensions()) {
+        os << "\n    AND " << type << " = " << ext->options_to_string();
     }
     if (is_view() && !is_index(db, view_info()->base_id(), *this)) {
         auto is_sync_update = db::find_tag(*this, db::SYNCHRONOUS_VIEW_UPDATES_TAG_KEY);
@@ -977,22 +984,23 @@ std::ostream& schema::describe(replica::database& db, std::ostream& os, bool wit
             os << "\n    AND synchronous_updates = " << *is_sync_update;
         }
     }
-    os << ";\n";
+    return os;
+}
 
-    if (with_internals) {
-        for (auto& cdef : dropped_columns()) {
-            os << "\nALTER TABLE " << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(cf_name())
-               << " DROP " << cql3::util::maybe_quote(cdef.first) << " USING TIMESTAMP " << cdef.second.timestamp << ";";
-
-            auto column = get_column_definition(to_bytes(cdef.first));
-            if (column) {
-                os << "\nALTER TABLE " << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(cf_name())
-                   << " ADD ";
-                column_definition_as_cql_key(os, *column);
-                os << ";";
-            }
+std::ostream& schema::describe_alter_with_properties(replica::database& db, std::ostream& os) const {
+    os << "ALTER "; 
+    if (is_view()) {
+        if (is_index(db, view_info()->base_id(), *this)) {
+            on_internal_error(dblog, "ALTER statement is not supported for index");
         }
+        
+        os << "MATERIALIZED VIEW ";
+    } else {
+        os << "TABLE ";
     }
+    os << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(cf_name()) << " WITH ";
+    schema_properties(db, os);
+    os << ";\n";
 
     return os;
 }
@@ -1028,14 +1036,6 @@ bool operator==(const column_definition& x, const column_definition& y)
 table_id
 generate_legacy_id(const sstring& ks_name, const sstring& cf_name) {
     return table_id(utils::UUID_gen::get_name_UUID(ks_name + cf_name));
-}
-
-bool thrift_schema::has_compound_comparator() const {
-    return _compound;
-}
-
-bool thrift_schema::is_dynamic() const {
-    return _is_dynamic;
 }
 
 schema_builder& schema_builder::set_compaction_strategy_options(std::map<sstring, sstring>&& options) {
@@ -1165,7 +1165,7 @@ schema_builder& schema_builder::with_computed_column(bytes name, data_type type,
     return with_column(name, type, kind, 0, column_view_virtual::no, std::move(computation));
 }
 
-schema_builder& schema_builder::remove_column(bytes name)
+schema_builder& schema_builder::remove_column(bytes name, std::optional<api::timestamp_type> timestamp)
 {
     auto it = boost::range::find_if(_raw._columns, [&] (auto& column) {
         return column.name() == name;
@@ -1174,7 +1174,7 @@ schema_builder& schema_builder::remove_column(bytes name)
         throw std::out_of_range(format("Cannot remove: column {} not found.", name));
     }
     auto name_as_text = it->column_specification ? it->name_as_text() : schema::column_name_type(*it, _raw._regular_column_name_type)->get_string(it->name());
-    without_column(name_as_text, it->type, api::new_timestamp());
+    without_column(name_as_text, it->type, timestamp ? *timestamp : api::new_timestamp());
     _raw._columns.erase(it);
     return *this;
 }

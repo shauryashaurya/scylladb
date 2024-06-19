@@ -88,7 +88,7 @@ future<std::vector<mutation>> alter_type_statement::prepare_announcement_mutatio
                 auto res = co_await service::prepare_view_update_announcement(sp, view_ptr(cfm.build()), ts);
                 std::move(res.begin(), res.end(), std::back_inserter(m));
             } else {
-                auto res = co_await service::prepare_column_family_update_announcement(sp, cfm.build(), false, {}, ts);
+                auto res = co_await service::prepare_column_family_update_announcement(sp, cfm.build(), {}, ts);
                 std::move(res.begin(), res.end(), std::back_inserter(m));
             }
         }
@@ -98,7 +98,7 @@ future<std::vector<mutation>> alter_type_statement::prepare_announcement_mutatio
 }
 
 future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
-alter_type_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
+alter_type_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     try {
         auto m = co_await prepare_announcement_mutations(qp.proxy(), ts);
 

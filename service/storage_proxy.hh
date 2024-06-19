@@ -58,7 +58,7 @@ class one_or_two_partition_ranges;
 }
 
 namespace cdc {
-    class cdc_service;    
+    class cdc_service;
 }
 
 namespace gms {
@@ -83,7 +83,6 @@ class abstract_write_response_handler;
 class paxos_response_handler;
 class abstract_read_executor;
 class mutation_holder;
-class view_update_write_response_handler;
 class client_state;
 class migration_manager;
 struct hint_wrapper;
@@ -231,6 +230,18 @@ public:
     query::tombstone_limit get_tombstone_limit() const;
     inet_address_vector_replica_set get_live_endpoints(const locator::effective_replication_map& erm, const dht::token& token) const;
 
+    void update_view_update_backlog();
+
+    // Get information about this node's view update backlog. It combines information from all local shards.
+    db::view::update_backlog get_view_update_backlog();
+
+    // Used for gossiping view update backlog information. Must be called on shard 0.
+    future<std::optional<db::view::update_backlog>> get_view_update_backlog_if_changed();
+
+    // Get information about a remote node's view update backlog. Information about remote backlogs is constantly updated
+    // using gossip and by passing the information in each MUTATION_DONE rpc call response.
+    db::view::update_backlog get_backlog_of(gms::inet_address) const;
+
     future<std::vector<dht::token_range_endpoints>> describe_ring(const sstring& keyspace, bool include_only_local_dc = false) const;
 
 private:
@@ -333,7 +344,8 @@ private:
     void register_cdc_operation_result_tracker(const storage_proxy::unique_response_handler_vector& ids, lw_shared_ptr<cdc::operation_result_tracker> tracker);
     void send_to_live_endpoints(response_id_type response_id, clock_type::time_point timeout);
     template<typename Range>
-    size_t hint_to_dead_endpoints(std::unique_ptr<mutation_holder>& mh, const Range& targets, db::write_type type, tracing::trace_state_ptr tr_state) noexcept;
+    size_t hint_to_dead_endpoints(std::unique_ptr<mutation_holder>& mh, const Range& targets,
+            locator::effective_replication_map_ptr ermptr, db::write_type type, tracing::trace_state_ptr tr_state) noexcept;
     void hint_to_dead_endpoints(response_id_type, db::consistency_level);
     template<typename Range>
     bool cannot_hint(const Range& targets, db::write_type type) const;
@@ -438,11 +450,7 @@ private:
             allow_hints,
             is_cancellable);
 
-    db::view::update_backlog get_view_update_backlog() const;
-
     void maybe_update_view_backlog_of(gms::inet_address, std::optional<db::view::update_backlog>);
-
-    db::view::update_backlog get_backlog_of(gms::inet_address) const;
 
     template<typename Range>
     future<> mutate_counters(Range&& mutations, db::consistency_level cl, tracing::trace_state_ptr tr_state, service_permit permit, clock_type::time_point timeout);
@@ -557,6 +565,9 @@ public:
     // Applies mutations on this node.
     // Resolves with timed_out_error when timeout is reached.
     future<> mutate_locally(std::vector<mutation> mutation, tracing::trace_state_ptr tr_state, clock_type::time_point timeout = clock_type::time_point::max(), db::per_partition_rate_limit::info rate_limit_info = std::monostate());
+    // Applies a vector of frozen_mutation:s and their schemas on this node, in parallel.
+    // Resolves with timed_out_error when timeout is reached.
+    future<> mutate_locally(std::vector<frozen_mutation_and_schema> mutations, tracing::trace_state_ptr tr_state, db::commitlog::force_sync sync, clock_type::time_point timeout = clock_type::time_point::max(), db::per_partition_rate_limit::info rate_limit_info = std::monostate());
 
     future<> mutate_hint(const schema_ptr&, const frozen_mutation& m, tracing::trace_state_ptr tr_state, clock_type::time_point timeout = clock_type::time_point::max());
 
@@ -685,6 +696,7 @@ public:
     future<> start_hints_manager(shared_ptr<gms::gossiper>);
     void allow_replaying_hints() noexcept;
     future<> drain_on_shutdown();
+    future<> abort_view_writes();
 
     future<> change_hints_host_filter(db::hints::host_filter new_filter);
     const db::hints::host_filter& get_hints_host_filter() const;
@@ -722,7 +734,7 @@ public:
     }
 
     virtual void on_join_cluster(const gms::inet_address& endpoint) override;
-    virtual void on_leave_cluster(const gms::inet_address& endpoint) override;
+    virtual void on_leave_cluster(const gms::inet_address& endpoint, const locator::host_id& hid) override;
     virtual void on_up(const gms::inet_address& endpoint) override;
     virtual void on_down(const gms::inet_address& endpoint) override;
 
@@ -730,7 +742,6 @@ public:
     friend class abstract_write_response_handler;
     friend class speculating_read_executor;
     friend class view_update_backlog_broker;
-    friend class view_update_write_response_handler;
     friend class paxos_response_handler;
     friend class mutation_holder;
     friend class per_destination_mutation;

@@ -17,7 +17,6 @@
 #include "replica/global_table_ptr.hh"
 #include "db/config.hh"
 #include "db/extensions.hh"
-#include "db/system_auth_keyspace.hh"
 #include "db/system_keyspace.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "db/schema_tables.hh"
@@ -31,12 +30,12 @@
 #include "db/view/view_update_checks.hh"
 #include <unordered_map>
 #include <boost/range/adaptor/map.hpp>
-#include "db/view/view_update_generator.hh"
+#include "db/view/view_builder.hh"
 
 extern logging::logger dblog;
 
 static const std::unordered_set<std::string_view> system_keyspaces = {
-                db::system_keyspace::NAME, db::system_auth_keyspace::NAME, db::schema_tables::NAME,
+                db::system_keyspace::NAME, db::schema_tables::NAME,
 };
 
 // Not super nice. Adding statefulness to the file. 
@@ -60,7 +59,6 @@ static const std::unordered_set<std::string_view> internal_keyspaces = {
         db::system_distributed_keyspace::NAME,
         db::system_distributed_keyspace::NAME_EVERYWHERE,
         db::system_keyspace::NAME,
-        db::system_auth_keyspace::NAME,
         db::schema_tables::NAME,
         auth::meta::legacy::AUTH_KS,
         tracing::trace_keyspace_helper::KEYSPACE_NAME
@@ -139,7 +137,7 @@ distributed_loader::reshape(sharded<sstables::sstable_directory>& dir, sharded<r
 // Loads SSTables into the main directory (or staging) and returns how many were loaded
 future<size_t>
 distributed_loader::make_sstables_available(sstables::sstable_directory& dir, sharded<replica::database>& db,
-        sharded<db::view::view_update_generator>& view_update_generator, bool needs_view_update, sstring ks, sstring cf) {
+        sharded<db::view::view_builder>& vb, bool needs_view_update, sstring ks, sstring cf) {
 
     auto& table = db.local().find_column_family(ks, cf);
     auto new_sstables = std::vector<sstables::shared_sstable>();
@@ -163,9 +161,9 @@ distributed_loader::make_sstables_available(sstables::sstable_directory& dir, sh
         abort();
     });
 
-    co_await coroutine::parallel_for_each(new_sstables, [&view_update_generator, &table] (sstables::shared_sstable sst) -> future<> {
+    co_await coroutine::parallel_for_each(new_sstables, [&vb, &table] (sstables::shared_sstable sst) -> future<> {
         if (sst->requires_view_building()) {
-            co_await view_update_generator.local().register_staging_sstable(sst, table.shared_from_this());
+            co_await vb.local().register_staging_sstable(sst, table.shared_from_this());
         }
     });
 
@@ -173,17 +171,13 @@ distributed_loader::make_sstables_available(sstables::sstable_directory& dir, sh
 }
 
 future<>
-distributed_loader::process_upload_dir(distributed<replica::database>& db, distributed<db::system_distributed_keyspace>& sys_dist_ks,
-        distributed<db::view::view_update_generator>& view_update_generator, sstring ks, sstring cf) {
-    seastar::thread_attributes attr;
-    attr.sched_group = db.local().get_streaming_scheduling_group();
-
+distributed_loader::process_upload_dir(distributed<replica::database>& db, sharded<db::view::view_builder>& vb, sstring ks, sstring cf) {
     const auto& rs = db.local().find_keyspace(ks).get_replication_strategy();
     if (rs.is_per_table()) {
         on_internal_error(dblog, "process_upload_dir is not supported with tablets");
     }
 
-    return seastar::async(std::move(attr), [&db, &view_update_generator, &sys_dist_ks, ks = std::move(ks), cf = std::move(cf)] {
+    return seastar::async([&db, &vb, ks = std::move(ks), cf = std::move(cf)] {
         auto global_table = get_table_on_all_shards(db, ks, cf).get();
 
         sharded<sstables::sstable_directory> directory;
@@ -232,10 +226,10 @@ distributed_loader::process_upload_dir(distributed<replica::database>& db, distr
                 [] (const sstables::shared_sstable&) { return true; }).get();
 
         // Move to staging directory to avoid clashes with future uploads. Unique generation number ensures no collisions.
-        const bool use_view_update_path = db::view::check_needs_view_update_path(sys_dist_ks.local(), db.local().get_token_metadata(), *global_table, streaming::stream_reason::repair).get();
+        const bool use_view_update_path = db::view::check_needs_view_update_path(vb.local(), db.local().get_token_metadata(), *global_table, streaming::stream_reason::repair).get();
 
-        size_t loaded = directory.map_reduce0([&db, ks, cf, use_view_update_path, &view_update_generator] (sstables::sstable_directory& dir) {
-            return make_sstables_available(dir, db, view_update_generator, use_view_update_path, ks, cf);
+        size_t loaded = directory.map_reduce0([&db, ks, cf, use_view_update_path, &vb] (sstables::sstable_directory& dir) {
+            return make_sstables_available(dir, db, vb, use_view_update_path, ks, cf);
         }, size_t(0), std::plus<size_t>()).get();
 
         dblog.info("Loaded {} SSTables", loaded);
@@ -278,20 +272,17 @@ class table_populator {
     sstring _ks;
     sstring _cf;
     global_table_ptr& _global_table;
-    std::filesystem::path _base_path;
     std::unordered_map<sstables::sstable_state, lw_shared_ptr<sharded<sstables::sstable_directory>>> _sstable_directories;
     sstables::sstable_version_types _highest_version = sstables::oldest_writable_sstable_format;
     sstables::generation_type _highest_generation;
 
 public:
-    table_populator(global_table_ptr& ptr, distributed<replica::database>& db, sstring ks, sstring cf, sstring datadir)
+    table_populator(global_table_ptr& ptr, distributed<replica::database>& db, sstring ks, sstring cf)
         : _db(db)
         , _ks(std::move(ks))
         , _cf(std::move(cf))
         , _global_table(ptr)
-        , _base_path(std::move(datadir))
     {
-        dblog.debug("table_populator: {}", _base_path);
     }
 
     ~table_populator() {
@@ -366,7 +357,7 @@ sstables::shared_sstable make_sstable(replica::table& table, sstables::sstable_s
 }
 
 future<> table_populator::populate_subdir(sstables::sstable_state state, allow_offstrategy_compaction do_allow_offstrategy_compaction) {
-    dblog.debug("Populating {}/{}/{} state={} allow_offstrategy_compaction={}", _ks, _cf, _base_path, state, do_allow_offstrategy_compaction);
+    dblog.debug("Populating {}/{}/{} state={} allow_offstrategy_compaction={}", _ks, _cf, _global_table->dir(), state, do_allow_offstrategy_compaction);
 
     if (!_sstable_directories.contains(state)) {
         co_return;
@@ -427,7 +418,7 @@ future<> distributed_loader::populate_keyspace(distributed<replica::database>& d
 
             dblog.info("Keyspace {}: Reading CF {} id={} version={} storage={} datadir={}", ks_name, cfname, uuid, s->version(), cf.get_storage_options().type_string(), datadir);
 
-            auto metadata = table_populator(gtable, db, ks_name, cfname, datadir);
+            auto metadata = table_populator(gtable, db, ks_name, cfname);
             std::exception_ptr ex;
 
             try {

@@ -14,7 +14,10 @@
 #include <boost/range/combine.hpp>
 #include "mutation_query.hh"
 #include "utils/hashers.hh"
+#include "utils/preempt.hh"
 #include "utils/xx_hasher.hh"
+
+#include <fmt/ranges.h>
 
 #include <seastar/core/sstring.hh>
 #include <seastar/core/do_with.hh>
@@ -45,6 +48,7 @@
 #include "test/lib/mutation_assertions.hh"
 #include "test/lib/random_utils.hh"
 #include "test/lib/simple_schema.hh"
+#include "test/lib/test_utils.hh"
 #include "test/lib/log.hh"
 #include "types/map.hh"
 #include "types/list.hh"
@@ -52,6 +56,7 @@
 #include "types/user.hh"
 #include "mutation/mutation_rebuilder.hh"
 #include "mutation/mutation_partition.hh"
+#include "mutation/async_utils.hh"
 #include "clustering_key_filter.hh"
 #include "readers/from_mutations_v2.hh"
 #include "readers/from_fragments_v2.hh"
@@ -1044,13 +1049,15 @@ SEASTAR_TEST_CASE(test_apply_monotonically_is_monotonic) {
                             expected_cont, target.partition().get_continuity(s), second.partition().get_continuity(s),
                             actual, c1, c2));
                     }
-                    m.partition().apply_monotonically(*m.schema(), std::move(m2), no_cache_tracker, app_stats);
+                    apply_resume res;
+                    m.partition().apply_monotonically(*m.schema(), std::move(m2), no_cache_tracker, app_stats, is_preemptible::no, res);
                     assert_that(m).is_equal_to(expected);
 
                     m = target;
                     m2 = mutation_partition(*m.schema(), second.partition());
                 });
-                m.partition().apply_monotonically(*m.schema(), std::move(m2), no_cache_tracker, app_stats);
+                apply_resume res;
+                m.partition().apply_monotonically(*m.schema(), std::move(m2), no_cache_tracker, app_stats, is_preemptible::no, res);
                 d.cancel();
             });
             assert_that(m).is_equal_to(expected).has_same_continuity(expected);
@@ -1060,6 +1067,32 @@ SEASTAR_TEST_CASE(test_apply_monotonically_is_monotonic) {
     do_test(random_mutation_generator(random_mutation_generator::generate_counters::no));
     do_test(random_mutation_generator(random_mutation_generator::generate_counters::yes));
     return make_ready_future<>();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_apply_monotonically_with_preemption) {
+    auto do_test = [](auto&& gen) {
+        auto&& alloc = standard_allocator();
+        with_allocator(alloc, [&] {
+            mutation_application_stats app_stats;
+            mutation target = gen();
+            mutation second = gen();
+
+            auto expected = target + second;
+
+            mutation m = target;
+            auto m2 = mutation_partition(*m.schema(), second.partition());
+            apply_resume res;
+            memory::with_allocation_failures([&] {
+                while (m.partition().apply_monotonically(*m.schema(), std::move(m2), no_cache_tracker, app_stats, is_preemptible::yes, res) == stop_iteration::no) {
+                    yield().get();
+                }
+            });
+            assert_that(m).is_equal_to_compacted(expected);
+        });
+    };
+
+    do_test(random_mutation_generator(random_mutation_generator::generate_counters::no));
+    do_test(random_mutation_generator(random_mutation_generator::generate_counters::yes));
 }
 
 SEASTAR_TEST_CASE(test_v2_apply_monotonically_is_monotonic_on_alloc_failures) {
@@ -1966,6 +1999,16 @@ SEASTAR_TEST_CASE(test_mutation_diff_with_random_generator) {
             m12.apply(m2);
             auto m12_with_diff = m1;
             m12_with_diff.partition().apply(*s, m2.partition().difference(*s, m1.partition()), app_stats);
+            check_partitions_match(m12.partition(), m12_with_diff.partition(), *s);
+            check_partitions_match(mutation_partition{*s}, m1.partition().difference(*s, m1.partition()), *s);
+            check_partitions_match(m1.partition(), m1.partition().difference(*s, mutation_partition{*s}), *s);
+            check_partitions_match(mutation_partition{*s}, mutation_partition{*s}.difference(*s, m1.partition()), *s);
+
+            // same as above, just using apply_gently
+            m12 = m1;
+            apply_gently(m12, m2).get();
+            m12_with_diff = m1;
+            apply_gently(m12_with_diff.partition(), *s, m2.partition().difference(*s, m1.partition()), app_stats).get();
             check_partitions_match(m12.partition(), m12_with_diff.partition(), *s);
             check_partitions_match(mutation_partition{*s}, m1.partition().difference(*s, m1.partition()), *s);
             check_partitions_match(m1.partition(), m1.partition().difference(*s, mutation_partition{*s}), *s);
@@ -2958,12 +3001,6 @@ SEASTAR_THREAD_TEST_CASE(test_appending_hash_row_4567) {
 
     BOOST_CHECK(!r1.equal(column_kind::regular_column, *s, r2, *s));
 
-    auto compute_legacy_hash = [&] (const row& r, const query::column_id_vector& columns) {
-        auto hasher = legacy_xx_hasher_without_null_digest{};
-        max_timestamp ts;
-        appending_hash<row>{}(hasher, r, *s, column_kind::regular_column, columns, ts);
-        return hasher.finalize_uint64();
-    };
     auto compute_hash = [&] (const row& r, const query::column_id_vector& columns) {
         auto hasher = xx_hasher{};
         max_timestamp ts;
@@ -2978,9 +3015,6 @@ SEASTAR_THREAD_TEST_CASE(test_appending_hash_row_4567) {
     // Additional test for making sure that {"", NULL, "bbb"} is not equal to {"", "bbb", NULL}
     // due to ignoring NULL in a hash
     BOOST_CHECK_NE(compute_hash(r2, { 0, 1, 2 }), compute_hash(r3, { 0, 1, 2 }));
-    // Legacy check which shows incorrect handling of NULL values.
-    // These checks are meaningful because legacy hashing is still used for old nodes.
-    BOOST_CHECK_EQUAL(compute_legacy_hash(r1, { 0, 1, 2 }), compute_legacy_hash(r2, { 0, 1, 2 }));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_mutation_consume) {

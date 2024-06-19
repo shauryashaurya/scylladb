@@ -55,13 +55,6 @@ def unique_key_int():
     return unique_key_int.i
 unique_key_int.i = 0
 
-def format_tuples(tuples=None, **kwargs):
-    '''format a dict to structured values (tuples) in CQL'''
-    if tuples is None:
-        tuples = {}
-    tuples.update(kwargs)
-    body = ', '.join(f"'{key}': '{value}'" for key, value in tuples.items())
-    return f'{{ {body} }}'
 
 def is_scylla(cql):
     """ Check whether we are running against Scylla or not """
@@ -87,9 +80,15 @@ def keyspace_has_tablets(cql, keyspace):
     if not is_scylla(cql):
         return False
 
-    # Need to use network strategy, otherwise tablets will not be enabled.
-    res = list(cql.execute(f"SELECT * FROM system_schema.scylla_keyspaces WHERE keyspace_name='{keyspace}'"))
-    # The row migh exist due to storage related options, but the tablets related fields are null.
+    try:
+        res = list(cql.execute(f"SELECT * FROM system_schema.scylla_keyspaces WHERE keyspace_name='{keyspace}'"))
+    except:
+        # Antique versions of Scylla are is_scylla() but did not have
+        # the scylla_keyspaces table. They didn't have tablets either, so
+        # we should just return False.
+        return False
+    # The row might exist due to storage related options, but the tablets
+    # related fields are null.
     # So we check that:
     # * the row exists
     # * `initial_tablets` has a value

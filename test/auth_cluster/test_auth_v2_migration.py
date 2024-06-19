@@ -12,7 +12,7 @@ import time
 from test.pylib.manager_client import ManagerClient
 from test.pylib.util import read_barrier, wait_for_cql_and_get_hosts, unique_name
 from cassandra.cluster import ConsistencyLevel
-from test.topology.util import wait_until_topology_upgrade_finishes, restart, enter_recovery_state, reconnect_driver, \
+from test.topology.util import wait_until_topology_upgrade_finishes, enter_recovery_state, reconnect_driver, \
         delete_raft_topology_state, delete_raft_data_and_upgrade_state, wait_until_upgrade_finishes
 
 def auth_data():
@@ -90,18 +90,18 @@ async def check_auth_v2_data_migration(manager: ManagerClient, hosts):
     data = auth_data()
 
     roles = set()
-    for row in await cql.run_async("SELECT * FROM system_auth_v2.roles"):
+    for row in await cql.run_async("SELECT * FROM system.roles"):
         member_of = frozenset(row.member_of) if row.member_of else None
         roles.add((row.role, row.can_login, row.is_superuser, member_of, row.salted_hash))
     assert roles == set(data[0]["rows"])
 
     role_members = set()
-    for row in await cql.run_async("SELECT * FROM system_auth_v2.role_members"):
+    for row in await cql.run_async("SELECT * FROM system.role_members"):
         role_members.add((row.role, row.member))
     assert role_members == set(data[1]["rows"])
 
     role_attributes = set()
-    for row in await cql.run_async("SELECT * FROM system_auth_v2.role_attributes"):
+    for row in await cql.run_async("SELECT * FROM system.role_attributes"):
         role_attributes.add((row.role, row.name, row.value))
     assert role_attributes == set(data[2]["rows"])
 
@@ -121,7 +121,7 @@ async def check_auth_v2_works(manager: ManagerClient, hosts):
     await asyncio.gather(*(read_barrier(cql, host) for host in hosts))
     # see warmup_v1_static_values for background about checks below
     # check if it was added to a new table
-    assert len(await cql.run_async("SELECT role FROM system_auth_v2.roles WHERE role = 'user_after_migration'")) == 1
+    assert len(await cql.run_async("SELECT role FROM system.roles WHERE role = 'user_after_migration'")) == 1
     # check whether list roles statement sees it also via new table (on all nodes)
     await asyncio.gather(*(cql.run_async("LIST ROLES OF user_after_migration", host=host) for host in hosts))
     await cql.run_async("DROP ROLE user_after_migration")
@@ -158,7 +158,7 @@ async def test_auth_v2_migration(request, manager: ManagerClient):
     logging.info("Waiting until upgrade finishes")
     await asyncio.gather(*(wait_until_topology_upgrade_finishes(manager, h.address, time.time() + 60) for h in hosts))
 
-    logging.info("Checking migrated data in system_auth_v2")
+    logging.info("Checking migrated data in system")
     await check_auth_v2_data_migration(manager, hosts)
 
     logging.info("Checking auth statements after migration")
@@ -187,13 +187,13 @@ async def test_auth_v2_during_recovery(manager: ManagerClient):
     logging.info("Poison with auth_v1 look a like data")
     # this will verify that old roles are not brought back during recovery
     # as it runs very similar code path as during v1->v2 migration
+    await cql.run_async(f"CREATE TABLE system_auth.roles (role text PRIMARY KEY, can_login boolean, is_superuser boolean, member_of set<text>, salted_hash text)")
     v1_ro_name = "v1_ro" + unique_name()
     await cql.run_async(f"INSERT INTO system_auth.roles (role) VALUES ('{v1_ro_name}')")
 
     logging.info(f"Restarting hosts {hosts} in recovery mode")
     await asyncio.gather(*(enter_recovery_state(cql, h) for h in hosts))
-    for srv in servers:
-        await restart(manager, srv)
+    await manager.rolling_restart(servers)
 
     logging.info("Cluster restarted, waiting until driver reconnects to every server")
     await reconnect_driver(manager)
@@ -210,8 +210,7 @@ async def test_auth_v2_during_recovery(manager: ManagerClient):
     logging.info("Restoring cluster to normal status")
     await asyncio.gather(*(delete_raft_topology_state(cql, h) for h in hosts))
     await asyncio.gather(*(delete_raft_data_and_upgrade_state(cql, h) for h in hosts))
-    for srv in servers:
-        await restart(manager, srv)
+    await manager.rolling_restart(servers)
 
     await reconnect_driver(manager)
     cql, hosts = await manager.get_ready_cql(servers)

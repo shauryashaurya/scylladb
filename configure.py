@@ -203,18 +203,6 @@ class Source(object):
     def endswith(self, end):
         return self.source.endswith(end)
 
-class Thrift(Source):
-    def __init__(self, source, service):
-        Source.__init__(self, source, '.h', '.cpp')
-        self.service = service
-
-    def generated(self, gen_dir):
-        basename = os.path.splitext(os.path.basename(self.source))[0]
-        files = [basename + '_' + ext
-                 for ext in ['types.cpp', 'types.h', 'constants.cpp', 'constants.h']]
-        files += [self.service + ext
-                  for ext in ['.cpp', '.h']]
-        return [os.path.join(gen_dir, file) for file in files]
 
 def default_target_arch():
     if platform.machine() in ['i386', 'i686', 'x86_64']:
@@ -282,7 +270,7 @@ def generate_compdb(compdb, ninja, buildfile, modes):
         # build mode-specific compdbs
         for mode in modes:
             mode_out = outdir + '/' + mode
-            submodule_compdbs = [mode_out + '/' + submodule + '/' + compdb for submodule in ['seastar']]
+            submodule_compdbs = [mode_out + '/' + submodule + '/' + compdb for submodule in ['seastar', 'abseil']]
             with open(mode_out + '/' + compdb, 'w+b') as combined_mode_specific_compdb:
                 subprocess.run(['./scripts/merge-compdb.py', outdir + '/' + mode,
                                 ninja_compdb.name] + submodule_compdbs, stdout=combined_mode_specific_compdb)
@@ -368,18 +356,6 @@ def check_for_lz4(cxx, cflags):
         '''), flags=cflags.split()):
         print('Installed lz4-devel is too old. Please upgrade it to r129 / v1.73 and up')
         sys.exit(1)
-
-
-def thrift_uses_boost_share_ptr():
-    # thrift version detection, see #4538
-    proc_res = subprocess.run(["thrift", "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    proc_res_output = proc_res.stdout.decode("utf-8")
-    if proc_res.returncode != 0 and not re.search(r'^Thrift version', proc_res_output):
-        raise Exception("Thrift compiler must be missing: {}".format(proc_res_output))
-
-    thrift_version = proc_res_output.split(" ")[-1]
-    thrift_boost_versions = ["0.{}.".format(n) for n in range(1, 11)]
-    return any(filter(thrift_version.startswith, thrift_boost_versions))
 
 
 def find_ninja():
@@ -627,6 +603,7 @@ scylla_tests = set([
     'test/boost/string_format_test',
     'test/boost/tagged_integer_test',
     'test/boost/group0_cmd_merge_test',
+    'test/boost/sorting_test',
     'test/manual/ec2_snitch_test',
     'test/manual/enormous_table_scan_test',
     'test/manual/gce_snitch_test',
@@ -741,8 +718,6 @@ arg_parser.add_argument('--optimization-level', action='append', dest='mode_o_le
                         help=f'Override default compiler optimization level for mode (defaults: {" ".join([x+"="+modes[x]["optimization-level"] for x in modes])})')
 arg_parser.add_argument('--static-stdc++', dest='staticcxx', action='store_true',
                         help='Link libgcc and libstdc++ statically')
-arg_parser.add_argument('--static-thrift', dest='staticthrift', action='store_true',
-                        help='Link libthrift statically')
 arg_parser.add_argument('--static-boost', dest='staticboost', action='store_true',
                         help='Link boost statically')
 arg_parser.add_argument('--static-yaml-cpp', dest='staticyamlcpp', action='store_true',
@@ -826,6 +801,7 @@ scylla_core = (['message/messaging_service.cc',
                 'mutation/partition_version.cc',
                 'mutation/range_tombstone.cc',
                 'mutation/range_tombstone_list.cc',
+                'mutation/async_utils.cc',
                 'absl-flat_hash_map.cc',
                 'collection_mutation.cc',
                 'client_data.cc',
@@ -980,10 +956,6 @@ scylla_core = (['message/messaging_service.cc',
                 'cql3/ut_name.cc',
                 'cql3/role_name.cc',
                 'data_dictionary/data_dictionary.cc',
-                'thrift/handler.cc',
-                'thrift/server.cc',
-                'thrift/controller.cc',
-                'thrift/thrift_validation.cc',
                 'utils/runtime.cc',
                 'utils/murmur_hash.cc',
                 'utils/uuid.cc',
@@ -1013,7 +985,6 @@ scylla_core = (['message/messaging_service.cc',
                 'cql3/result_set.cc',
                 'cql3/prepare_context.cc',
                 'db/consistency_level.cc',
-                'db/system_auth_keyspace.cc',
                 'db/system_keyspace.cc',
                 'db/virtual_table.cc',
                 'db/virtual_tables.cc',
@@ -1179,6 +1150,7 @@ scylla_core = (['message/messaging_service.cc',
                 'mutation_writer/partition_based_splitting_writer.cc',
                 'mutation_writer/token_group_based_splitting_writer.cc',
                 'mutation_writer/feed_writers.cc',
+                'lang/manager.cc',
                 'lang/lua.cc',
                 'lang/wasm.cc',
                 'lang/wasm_alien_thread_runner.cc',
@@ -1202,7 +1174,7 @@ scylla_core = (['message/messaging_service.cc',
                 'service/topology_mutation.cc',
                 'service/topology_coordinator.cc',
                 'node_ops/node_ops_ctl.cc'
-                ] + [Antlr3Grammar('cql3/Cql.g')] + [Thrift('interface/cassandra.thrift', 'Cassandra')] \
+                ] + [Antlr3Grammar('cql3/Cql.g')] \
                   + scylla_raft_core
                )
 
@@ -1350,11 +1322,13 @@ scylla_tests_dependencies = scylla_core + alternator + idls + scylla_tests_gener
 scylla_raft_dependencies = scylla_raft_core + ['utils/uuid.cc', 'utils/error_injection.cc', 'utils/exceptions.cc']
 
 scylla_tools = ['tools/scylla-types.cc', 'tools/scylla-sstable.cc', 'tools/scylla-nodetool.cc', 'tools/schema_loader.cc', 'tools/utils.cc', 'tools/lua_sstable_consumer.cc']
-scylla_perfs = ['test/perf/perf_fast_forward.cc',
+scylla_perfs = ['test/perf/perf_alternator.cc',
+                'test/perf/perf_fast_forward.cc',
                 'test/perf/perf_row_cache_update.cc',
                 'test/perf/perf_simple_query.cc',
                 'test/perf/perf_sstable.cc',
                 'test/perf/perf_tablets.cc',
+                'test/perf/tablet_load_balancing.cc',
                 'test/perf/perf.cc',
                 'test/lib/alternator_test_env.cc',
                 'test/lib/cql_test_env.cc',
@@ -1711,6 +1685,7 @@ def configure_seastar(build_dir, mode, mode_config):
         '-DSeastar_LD_FLAGS={}'.format(semicolon_separated(mode_config['lib_ldflags'], seastar_cxx_ld_flags)),
         '-DSeastar_CXX_DIALECT=gnu++20',
         '-DSeastar_API_LEVEL=7',
+        '-DSeastar_DEPRECATED_OSTREAM_FORMATTERS=OFF',
         '-DSeastar_UNUSED_RESULT_ERROR=ON',
         '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
         '-DSeastar_SCHEDULING_GROUPS_COUNT=16',
@@ -1749,6 +1724,63 @@ def configure_seastar(build_dir, mode, mode_config):
     subprocess.check_call(seastar_cmd, shell=False, cwd=cmake_dir)
 
 
+def configure_abseil(build_dir, mode, mode_config):
+    abseil_cflags = mode_config['lib_cflags']
+    cxx_flags = mode_config['cxxflags']
+    if '-DSANITIZE' in cxx_flags:
+        abseil_cflags += ' -fsanitize=address -fsanitize=undefined -fno-sanitize=vptr'
+
+    # We want to "undo" coverage for abseil if we have it enabled, as we are not
+    # interested in the coverage of the abseil library. these flags were previously
+    # added to cxx_ld_flags
+    if args.coverage:
+        for flag in COVERAGE_INST_FLAGS:
+            cxx_flags = cxx_flags.replace(f' {flag}', '')
+
+    cxx_flags += ' ' + abseil_cflags.strip()
+    cmake_mode = mode_config['cmake_build_type']
+    abseil_cmake_args = [
+        '-DCMAKE_BUILD_TYPE={}'.format(cmake_mode),
+        '-DCMAKE_INSTALL_PREFIX={}'.format(build_dir + '/inst'), # just to avoid a warning from absl
+        '-DCMAKE_C_COMPILER={}'.format(args.cc),
+        '-DCMAKE_CXX_COMPILER={}'.format(args.cxx),
+        '-DCMAKE_CXX_FLAGS_{}={}'.format(cmake_mode.upper(), cxx_flags),
+        '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+        '-DCMAKE_CXX_STANDARD=20',
+        '-DABSL_PROPAGATE_CXX_STD=ON',
+    ]
+
+    abseil_build_dir = os.path.join(build_dir, mode, 'abseil')
+    abseil_cmd = ['cmake', '-G', 'Ninja', real_relpath('abseil', abseil_build_dir)] + abseil_cmake_args
+
+    os.makedirs(abseil_build_dir, exist_ok=True)
+    subprocess.check_call(abseil_cmd, shell=False, cwd=abseil_build_dir)
+
+abseil_libs = ['absl/' + lib for lib in [
+    'container/libabsl_hashtablez_sampler.a',
+    'container/libabsl_raw_hash_set.a',
+    'synchronization/libabsl_synchronization.a',
+    'synchronization/libabsl_graphcycles_internal.a',
+    'debugging/libabsl_stacktrace.a',
+    'debugging/libabsl_symbolize.a',
+    'debugging/libabsl_debugging_internal.a',
+    'debugging/libabsl_demangle_internal.a',
+    'time/libabsl_time.a',
+    'time/libabsl_time_zone.a',
+    'numeric/libabsl_int128.a',
+    'hash/libabsl_hash.a',
+    'hash/libabsl_city.a',
+    'hash/libabsl_low_level_hash.a',
+    'base/libabsl_malloc_internal.a',
+    'base/libabsl_spinlock_wait.a',
+    'base/libabsl_base.a',
+    'base/libabsl_raw_logging_internal.a',
+    'profiling/libabsl_exponential_biased.a',
+    'strings/libabsl_strings.a',
+    'strings/libabsl_strings_internal.a',
+    'base/libabsl_throw_delegate.a']]
+
+
 def query_seastar_flags(pc_file, use_shared_libs, link_static_cxx=False):
     if use_shared_libs:
         opt = '--shared'
@@ -1768,9 +1800,7 @@ def query_seastar_flags(pc_file, use_shared_libs, link_static_cxx=False):
             'seastar_testing_libs': testing_libs}
 
 pkgs = ['libsystemd',
-        'jsoncpp',
-        'absl_raw_hash_set',
-        'absl_hash']
+        'jsoncpp']
 # Lua can be provided by lua53 package on Debian-like
 # systems and by Lua on others.
 pkgs.append('lua53' if have_pkg('lua53') else 'lua')
@@ -1788,9 +1818,6 @@ libs = ' '.join([maybe_static(args.staticyamlcpp, '-lyaml-cpp'), '-latomic', '-l
 
 if not args.staticboost:
     user_cflags += ' -DBOOST_ALL_DYN_LINK'
-
-if thrift_uses_boost_share_ptr():
-    user_cflags += ' -DTHRIFT_USES_BOOST'
 
 for pkg in pkgs:
     user_cflags += ' ' + pkg_config(pkg, '--cflags')
@@ -1833,9 +1860,11 @@ def get_extra_cxxflags(mode, mode_config, cxx, debuginfo):
     return cxxflags
 
 
-def get_release_cxxflags(scylla_version,
+def get_release_cxxflags(scylla_product,
+                         scylla_version,
                          scylla_release):
-    definitions = {'SCYLLA_VERSION': scylla_version,
+    definitions = {'SCYLLA_PRODUCT': scylla_product,
+                   'SCYLLA_VERSION': scylla_version,
                    'SCYLLA_RELEASE': scylla_release}
     return [f'-D{name}="\\"{value}\\""' for name, value in definitions.items()]
 
@@ -1973,10 +2002,6 @@ def write_build_file(f,
             rule ar.{mode}
               command = rm -f $out; ar cr $out $in; ranlib $out
               description = AR $out
-            rule thrift.{mode}
-                command = thrift -gen cpp:cob_style -out $builddir/{mode}/gen $in
-                description = THRIFT $in
-                restat = 1
             rule antlr3.{mode}
                 # We replace many local `ExceptionBaseType* ex` variables with a single function-scope one.
                 # Because we add such a variable to every function, and because `ExceptionBaseType` is not a global
@@ -2020,13 +2045,13 @@ def write_build_file(f,
         compiles = {}
         swaggers = set()
         serializers = {}
-        thrifts = set()
         ragels = {}
         antlr3_grammars = set()
         rust_headers = {}
         seastar_lib_ext = 'so' if modeval['build_seastar_shared_libs'] else 'a'
         seastar_dep = f'$builddir/{mode}/seastar/libseastar.{seastar_lib_ext}'
         seastar_testing_dep = f'$builddir/{mode}/seastar/libseastar_testing.{seastar_lib_ext}'
+        abseil_dep = ' '.join(f'$builddir/{mode}/abseil/{lib}' for lib in abseil_libs)
         for binary in sorted(build_artifacts):
             if binary in other or binary in wasms:
                 continue
@@ -2035,32 +2060,26 @@ def write_build_file(f,
                     for src in srcs
                     if src.endswith('.cc')]
             objs.append('$builddir/../utils/arch/powerpc/crc32-vpmsum/crc32.S')
-            has_thrift = False
             has_rust = False
             for dep in deps[binary]:
-                if isinstance(dep, Thrift):
-                    has_thrift = True
-                    objs += dep.objects('$builddir/' + mode + '/gen')
                 if isinstance(dep, Antlr3Grammar):
-                    objs += dep.objects('$builddir/' + mode + '/gen')
+                    objs += dep.objects(f'$builddir/{mode}/gen')
                 if isinstance(dep, Json2Code):
-                    objs += dep.objects('$builddir/' + mode + '/gen')
+                    objs += dep.objects(f'$builddir/{mode}/gen')
                 if dep.endswith('.rs'):
                     has_rust = True
                     idx = dep.rindex('/src/')
                     obj = dep[:idx].replace('rust/','') + '.o'
-                    objs.append('$builddir/' + mode + '/gen/rust/' + obj)
+                    objs.append(f'$builddir/{mode}/gen/rust/{obj}')
             if has_rust:
-                objs.append('$builddir/' + mode +'/rust-' + mode + '/librust_combined.a')
-            local_libs = '$seastar_libs_{} $libs'.format(mode)
-            if has_thrift:
-                local_libs += ' ' + maybe_static(args.staticthrift, '-lthrift')
-                local_libs += ' ' + maybe_static(args.staticboost, '-lboost_system')
+                objs.append(f'$builddir/{mode}/rust-{mode}/librust_combined.a')
+            local_libs = f'$seastar_libs_{mode} $libs'
+            objs.extend([f'$builddir/{mode}/abseil/{lib}' for lib in abseil_libs])
             if binary in tests:
                 if binary in pure_boost_tests:
                     local_libs += ' ' + maybe_static(args.staticboost, '-lboost_unit_test_framework')
                 if binary not in tests_not_using_seastar_test_framework:
-                    local_libs += ' ' + "$seastar_testing_libs_{}".format(mode)
+                    local_libs += ' ' + f"$seastar_testing_libs_{mode}"
                 else:
                     local_libs += ' ' + '-lgnutls' + ' ' + '-lboost_unit_test_framework'
                 # Our code's debugging information is huge, and multiplied
@@ -2069,14 +2088,14 @@ def write_build_file(f,
                 # quickly re-link the test unstripped by adding a "_g"
                 # to the test name, e.g., "ninja build/release/testname_g"
                 link_rule = perf_tests_link_rule if binary.startswith('test/perf/') else tests_link_rule
-                f.write('build $builddir/{}/{}: {}.{} {} | {} {}\n'.format(mode, binary, link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep))
+                f.write('build $builddir/{}/{}: {}.{} {} | {} {} {}\n'.format(mode, binary, link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep, abseil_dep))
                 f.write('   libs = {}\n'.format(local_libs))
-                f.write('build $builddir/{}/{}_g: {}.{} {} | {} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep))
+                f.write('build $builddir/{}/{}_g: {}.{} {} | {} {} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep, abseil_dep))
                 f.write('   libs = {}\n'.format(local_libs))
             else:
                 if binary == 'scylla':
                     local_libs += ' ' + "$seastar_testing_libs_{}".format(mode)
-                f.write('build $builddir/{}/{}: {}.{} {} | {} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep))
+                f.write('build $builddir/{}/{}: {}.{} {} | {} {} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep, abseil_dep))
                 f.write('   libs = {}\n'.format(local_libs))
                 f.write(f'build $builddir/{mode}/{binary}.stripped: strip $builddir/{mode}/{binary}\n')
                 f.write(f'build $builddir/{mode}/{binary}.debug: phony $builddir/{mode}/{binary}.stripped\n')
@@ -2092,8 +2111,6 @@ def write_build_file(f,
                 elif src.endswith('.rl'):
                     hh = '$builddir/' + mode + '/gen/' + src.replace('.rl', '.hh')
                     ragels[hh] = src
-                elif src.endswith('.thrift'):
-                    thrifts.add(src)
                 elif src.endswith('.g'):
                     antlr3_grammars.add(src)
                 elif src.endswith('.rs'):
@@ -2143,8 +2160,6 @@ def write_build_file(f,
 
         gen_dir = '$builddir/{}/gen'.format(mode)
         gen_headers = []
-        for th in thrifts:
-            gen_headers += th.headers('$builddir/{}/gen'.format(mode))
         for g in antlr3_grammars:
             gen_headers += g.headers('$builddir/{}/gen'.format(mode))
         for g in swaggers:
@@ -2183,12 +2198,6 @@ def write_build_file(f,
         f.write('build {}: cxxbridge_header\n'.format('$builddir/{}/gen/rust/cxx.h'.format(mode)))
         librust = '$builddir/{}/rust-{}/librust_combined'.format(mode, mode)
         f.write('build {}.a: rust_lib.{} rust/Cargo.lock\n  depfile={}.d\n'.format(librust, mode, librust))
-        for thrift in thrifts:
-            outs = ' '.join(thrift.generated('$builddir/{}/gen'.format(mode)))
-            f.write('build {}: thrift.{} {}\n'.format(outs, mode, thrift.source))
-            for cc in thrift.sources('$builddir/{}/gen'.format(mode)):
-                obj = cc.replace('.cpp', '.o')
-                f.write('build {}: cxx.{} {}\n'.format(obj, mode, cc))
         for grammar in antlr3_grammars:
             outs = ' '.join(grammar.generated('$builddir/{}/gen'.format(mode)))
             f.write('build {}: antlr3.{} {}\n  stem = {}\n'.format(outs, mode, grammar.source,
@@ -2263,6 +2272,12 @@ def write_build_file(f,
         f.write(f'  mode = {mode}\n')
         f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-package-{scylla_version}-{scylla_release}.tar.gz: copy $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
         f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{arch}-package-{scylla_version}-{scylla_release}.tar.gz: copy $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
+
+        for lib in abseil_libs:
+            f.write('build $builddir/{mode}/abseil/{lib}: ninja $builddir/{mode}/abseil/build.ninja\n'.format(**locals()))
+            f.write('  pool = submodule_pool\n')
+            f.write('  subdir = $builddir/{mode}/abseil\n'.format(**locals()))
+            f.write('  target = {lib}\n'.format(**locals()))
 
     checkheaders_mode = 'dev' if 'dev' in modes else modes.keys()[0]
     f.write('build checkheaders: phony || {}\n'.format(' '.join(['$builddir/{}/{}.o'.format(checkheaders_mode, hh) for hh in headers])))
@@ -2393,7 +2408,7 @@ def write_build_file(f,
             description = List configured modes
         build mode_list: mode_list
         default {modes_list}
-        ''').format(modes_list=' '.join(default_modes), build_ninja_list=' '.join([f'{outdir}/{mode}/{dir}/build.ninja' for mode in build_modes for dir in ['seastar']]), **globals()))
+        ''').format(modes_list=' '.join(default_modes), build_ninja_list=' '.join([f'{outdir}/{mode}/{dir}/build.ninja' for mode in build_modes for dir in ['seastar', 'abseil']]), **globals()))
     unit_test_list = set(test for test in build_artifacts if test in set(tests))
     f.write(textwrap.dedent('''\
         rule unit_test_list
@@ -2434,14 +2449,17 @@ def create_build_system(args):
         extra_cxxflags = ' '.join(get_extra_cxxflags(mode, mode_config, args.cxx, args.debuginfo))
         mode_config['cxxflags'] += f' {extra_cxxflags}'
 
-        mode_config['per_src_extra_cxxflags']['release.cc'] = ' '.join(get_release_cxxflags(scylla_version, scylla_release))
+        mode_config['per_src_extra_cxxflags']['release.cc'] = ' '.join(get_release_cxxflags(scylla_product, scylla_version, scylla_release))
 
     if not args.dist_only:
+        global user_cflags, libs
         # args.buildfile builds seastar with the rules of
         # {outdir}/{mode}/seastar/build.ninja, and
         # {outdir}/{mode}/seastar/seastar.pc is queried for building flags
         for mode, mode_config in build_modes.items():
             configure_seastar(outdir, mode, mode_config)
+            configure_abseil(outdir, mode, mode_config)
+        user_cflags += ' -isystem abseil'
 
     for mode, mode_config in build_modes.items():
         mode_config.update(query_seastar_flags(f'{outdir}/{mode}/seastar/seastar.pc',
@@ -2473,16 +2491,15 @@ def configure_using_cmake(args):
                    'dev': BuildType(True, 'Dev'),
                    'sanitize': BuildType(False, 'Sanitize'),
                    'coverage': BuildType(False, 'Coverage')}
-    selected_modes = list(build_modes[mode] for mode in
-                          args.selected_modes or build_modes.keys())
-    selected_configs = ';'.join(mode.cmake_build_type for mode in selected_modes)
-    default_configs = ';'.join(mode.cmake_build_type for mode in selected_modes
-                               if mode.build_by_default)
-
+    default_modes = list(name for name, mode in build_modes.items()
+                         if mode.build_by_default)
+    selected_modes = args.selected_modes or default_modes
+    selected_configs = ';'.join(build_modes[mode].cmake_build_type for mode
+                                in selected_modes)
     settings = {
         'CMAKE_CONFIGURATION_TYPES': selected_configs,
-        'CMAKE_CROSS_CONFIGS': default_configs,
-        'CMAKE_DEFAULT_CONFIGS': default_configs,
+        'CMAKE_CROSS_CONFIGS': selected_configs,
+        'CMAKE_DEFAULT_CONFIGS': selected_configs,
         'CMAKE_C_COMPILER': args.cc,
         'CMAKE_CXX_COMPILER': args.cxx,
         'CMAKE_CXX_FLAGS': args.user_cflags,
@@ -2494,7 +2511,6 @@ def configure_using_cmake(args):
         settings['Scylla_DATE_STAMP'] = args.date_stamp
     if args.staticboost:
         settings['Boost_USE_STATIC_LIBS'] = 'ON'
-
 
     source_dir = os.path.realpath(os.path.dirname(__file__))
     build_dir = os.path.join(source_dir, 'build')

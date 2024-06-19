@@ -28,7 +28,7 @@ host_filter::host_filter(std::unordered_set<sstring> allowed_dcs)
         , _dcs(std::move(allowed_dcs)) {
 }
 
-bool host_filter::can_hint_for(const locator::topology& topo, gms::inet_address ep) const {
+bool host_filter::can_hint_for(const locator::topology& topo, endpoint_id ep) const {
     switch (_enabled_kind) {
     case enabled_kind::enabled_for_all:
         return true;
@@ -66,11 +66,6 @@ host_filter host_filter::parse_from_dc_list(sstring opt) {
     });
 
     return host_filter(std::unordered_set<sstring>(dcs.begin(), dcs.end()));
-}
-
-std::ostream& operator<<(std::ostream& os, const host_filter& f) {
-    fmt::print(os, "{}", f);
-    return os;
 }
 
 std::istream& operator>>(std::istream& is, host_filter& f) {

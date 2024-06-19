@@ -15,40 +15,27 @@
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/log.hh"
 #include "test/lib/simple_schema.hh"
+#include "test/lib/key_utils.hh"
 #include "test/lib/test_utils.hh"
 #include "db/config.hh"
+#include "db/schema_tables.hh"
 #include "schema/schema_builder.hh"
 
 #include "replica/tablets.hh"
 #include "replica/tablet_mutation_builder.hh"
 #include "locator/tablets.hh"
 #include "service/tablet_allocator.hh"
+#include "locator/tablet_replication_strategy.hh"
 #include "locator/tablet_sharder.hh"
 #include "locator/load_sketch.hh"
 #include "utils/UUID_gen.hh"
 #include "utils/error_injection.hh"
 #include "utils/to_string.hh"
+#include "service/topology_coordinator.hh"
 
 using namespace locator;
 using namespace replica;
 using namespace service;
-
-namespace locator {
-static std::ostream& boost_test_print_type(std::ostream& out, tablet_id id) {
-    fmt::print(out, "{}", id);
-    return out;
-}
-
-static std::ostream& boost_test_print_type(std::ostream& out, const tablet_map& r) {
-    fmt::print(out, "{}", r);
-    return out;
-}
-
-static std::ostream& boost_test_print_type(std::ostream& out, const tablet_metadata& tm) {
-    fmt::print(out, "{}", tm);
-    return out;
-}
-}
 
 static api::timestamp_type current_timestamp(cql_test_env& e) {
     // Mutations in system.tablets got there via group0, so in order for new
@@ -73,9 +60,7 @@ void verify_tablet_metadata_persistence(cql_test_env& env, const tablet_metadata
 static
 cql_test_config tablet_cql_test_config() {
     cql_test_config c;
-    c.db_config->experimental_features({
-            db::experimental_features_t::feature::TABLETS,
-        }, db::config::config_source::CommandLine);
+    c.db_config->enable_tablets(true);
     c.initial_tablets = 2;
     return c;
 }
@@ -341,13 +326,33 @@ SEASTAR_TEST_CASE(test_get_shard) {
         auto h2 = host_id(utils::UUID_gen::get_time_UUID());
         auto h3 = host_id(utils::UUID_gen::get_time_UUID());
 
-        auto table1 = table_id(utils::UUID_gen::get_time_UUID());
+        inet_address ip1("192.168.0.1");
+        inet_address ip2("192.168.0.2");
+        inet_address ip3("192.168.0.3");
 
-        tablet_metadata tm;
+        auto table1 = table_id(utils::UUID_gen::get_time_UUID());
+        const auto shard_count = 2;
+
+        semaphore sem(1);
+        shared_token_metadata stm([&sem] () noexcept { return get_units(sem, 1); }, locator::token_metadata::config{
+                locator::topology::config{
+                        .this_endpoint = ip1,
+                        .local_dc_rack = locator::endpoint_dc_rack::default_location
+                }
+        });
+
         tablet_id tid(0);
         tablet_id tid1(0);
 
-        {
+        stm.mutate_token_metadata([&] (token_metadata& tm) {
+            tm.update_host_id(h1, ip1);
+            tm.update_host_id(h2, ip2);
+            tm.update_host_id(h3, ip3);
+            tm.update_topology(h1, locator::endpoint_dc_rack::default_location, std::nullopt, shard_count);
+            tm.update_topology(h2, locator::endpoint_dc_rack::default_location, std::nullopt, shard_count);
+            tm.update_topology(h3, locator::endpoint_dc_rack::default_location, std::nullopt, shard_count);
+
+            tablet_metadata tmeta;
             tablet_map tmap(2);
             tid = tmap.first_tablet();
             tmap.set_tablet(tid, tablet_info {
@@ -372,19 +377,25 @@ SEASTAR_TEST_CASE(test_get_shard) {
                 },
                 tablet_replica {h2, 3}
             });
-            tm.set_tablet_map(table1, std::move(tmap));
-        }
+            tmeta.set_tablet_map(table1, std::move(tmap));
+            tm.set_tablets(std::move(tmeta));
+            return make_ready_future<>();
+        }).get();
 
-        auto&& tmap = tm.get_tablet_map(table1);
+        auto&& tmap = stm.get()->tablets().get_tablet_map(table1);
 
-        BOOST_REQUIRE_EQUAL(tmap.get_shard(tid1, h1), std::make_optional(shard_id(2)));
-        BOOST_REQUIRE(!tmap.get_shard(tid1, h2));
-        BOOST_REQUIRE_EQUAL(tmap.get_shard(tid1, h3), std::make_optional(shard_id(1)));
+        auto get_shard = [&] (tablet_id tid, host_id host) {
+            tablet_sharder sharder(*stm.get(), table1, host);
+            return sharder.shard_for_reads(tmap.get_last_token(tid));
+        };
 
-        BOOST_REQUIRE_EQUAL(tmap.get_shard(tid, h1), std::make_optional(shard_id(0)));
-        BOOST_REQUIRE_EQUAL(tmap.get_shard(tid, h2), std::make_optional(shard_id(3)));
-        BOOST_REQUIRE_EQUAL(tmap.get_shard(tid, h3), std::make_optional(shard_id(5)));
+        BOOST_REQUIRE_EQUAL(get_shard(tid1, h1), std::make_optional(shard_id(2)));
+        BOOST_REQUIRE(!get_shard(tid1, h2));
+        BOOST_REQUIRE_EQUAL(get_shard(tid1, h3), std::make_optional(shard_id(1)));
 
+        BOOST_REQUIRE_EQUAL(get_shard(tid, h1), std::make_optional(shard_id(0)));
+        BOOST_REQUIRE_EQUAL(get_shard(tid, h2), std::make_optional(shard_id(3)));
+        BOOST_REQUIRE_EQUAL(get_shard(tid, h3), std::make_optional(shard_id(5)));
     }, tablet_cql_test_config());
 }
 
@@ -585,7 +596,7 @@ SEASTAR_TEST_CASE(test_sharder) {
 
         std::vector<tablet_id> tablet_ids;
         {
-            tablet_map tmap(4);
+            tablet_map tmap(8);
             auto tid = tmap.first_tablet();
 
             tablet_ids.push_back(tid);
@@ -632,50 +643,233 @@ SEASTAR_TEST_CASE(test_sharder) {
                 }
             });
 
+            // tablet_ids[4]
+            // h1 is leaving, h3 is pending
+            tid = *tmap.next_tablet(tid);
+            tablet_ids.push_back(tid);
+            tmap.set_tablet(tid, tablet_info {
+                tablet_replica_set {
+                    tablet_replica {h1, 5},
+                    tablet_replica {h2, 1},
+                }
+            });
+            tmap.set_tablet_transition_info(tid, tablet_transition_info {
+                    tablet_transition_stage::allow_write_both_read_old,
+                    tablet_transition_kind::migration,
+                    tablet_replica_set {
+                            tablet_replica {h3, 7},
+                            tablet_replica {h2, 1},
+                    },
+                    tablet_replica {h3, 7}
+            });
+
+            // tablet_ids[5]
+            // h1 is leaving, h3 is pending
+            tid = *tmap.next_tablet(tid);
+            tablet_ids.push_back(tid);
+            tmap.set_tablet(tid, tablet_info {
+                tablet_replica_set {
+                    tablet_replica {h1, 5},
+                    tablet_replica {h2, 1},
+                }
+            });
+            tmap.set_tablet_transition_info(tid, tablet_transition_info {
+                    tablet_transition_stage::write_both_read_old,
+                    tablet_transition_kind::migration,
+                    tablet_replica_set {
+                            tablet_replica {h3, 7},
+                            tablet_replica {h2, 1},
+                    },
+                    tablet_replica {h3, 7}
+            });
+
+            // tablet_ids[6]
+            // h1 is leaving, h3 is pending
+            tid = *tmap.next_tablet(tid);
+            tablet_ids.push_back(tid);
+            tmap.set_tablet(tid, tablet_info {
+                tablet_replica_set {
+                    tablet_replica {h1, 5},
+                    tablet_replica {h2, 1},
+                }
+            });
+            tmap.set_tablet_transition_info(tid, tablet_transition_info {
+                    tablet_transition_stage::write_both_read_new,
+                    tablet_transition_kind::migration,
+                    tablet_replica_set {
+                            tablet_replica {h3, 7},
+                            tablet_replica {h2, 1},
+                    },
+                    tablet_replica {h3, 7}
+            });
+
+            // tablet_ids[7]
+            // h1 is leaving, h3 is pending
+            tid = *tmap.next_tablet(tid);
+            tablet_ids.push_back(tid);
+            tmap.set_tablet(tid, tablet_info {
+                tablet_replica_set {
+                    tablet_replica {h1, 5},
+                    tablet_replica {h2, 1},
+                }
+            });
+            tmap.set_tablet_transition_info(tid, tablet_transition_info {
+                    tablet_transition_stage::use_new,
+                    tablet_transition_kind::migration,
+                    tablet_replica_set {
+                            tablet_replica {h3, 7},
+                            tablet_replica {h2, 1},
+                    },
+                    tablet_replica {h3, 7}
+            });
+
             tablet_metadata tm;
             tm.set_tablet_map(table1, std::move(tmap));
             tokm.set_tablets(std::move(tm));
         }
 
         auto& tm = tokm.tablets().get_tablet_map(table1);
-        tablet_sharder sharder(tokm, table1);
-        BOOST_REQUIRE_EQUAL(sharder.shard_of(tm.get_last_token(tablet_ids[0])), 3);
-        BOOST_REQUIRE_EQUAL(sharder.shard_of(tm.get_last_token(tablet_ids[1])), 0); // missing
-        BOOST_REQUIRE_EQUAL(sharder.shard_of(tm.get_last_token(tablet_ids[2])), 1);
-        BOOST_REQUIRE_EQUAL(sharder.shard_of(tm.get_last_token(tablet_ids[3])), 0); // missing
+        tablet_sharder sharder(tokm, table1); // for h1
+        tablet_sharder sharder_h3(tokm, table1, h3);
 
-        BOOST_REQUIRE_EQUAL(sharder.token_for_next_shard(tm.get_last_token(tablet_ids[1]), 0), tm.get_first_token(tablet_ids[3]));
-        BOOST_REQUIRE_EQUAL(sharder.token_for_next_shard(tm.get_last_token(tablet_ids[1]), 1), tm.get_first_token(tablet_ids[2]));
-        BOOST_REQUIRE_EQUAL(sharder.token_for_next_shard(tm.get_last_token(tablet_ids[1]), 3), dht::maximum_token());
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(tm.get_last_token(tablet_ids[0])), 3);
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(tm.get_last_token(tablet_ids[1])), 0); // missing
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(tm.get_last_token(tablet_ids[2])), 1);
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(tm.get_last_token(tablet_ids[3])), 0); // missing
 
-        BOOST_REQUIRE_EQUAL(sharder.token_for_next_shard(tm.get_first_token(tablet_ids[1]), 0), tm.get_first_token(tablet_ids[3]));
-        BOOST_REQUIRE_EQUAL(sharder.token_for_next_shard(tm.get_first_token(tablet_ids[1]), 1), tm.get_first_token(tablet_ids[2]));
-        BOOST_REQUIRE_EQUAL(sharder.token_for_next_shard(tm.get_first_token(tablet_ids[1]), 3), dht::maximum_token());
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_writes(tm.get_last_token(tablet_ids[0])), dht::shard_replica_set{3});
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_writes(tm.get_last_token(tablet_ids[1])), dht::shard_replica_set{});
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_writes(tm.get_last_token(tablet_ids[2])), dht::shard_replica_set{1});
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_writes(tm.get_last_token(tablet_ids[3])), dht::shard_replica_set{});
+
+        // Shard for read should be stable across stages of migration. The coordinator may route
+        // requests to the leaving replica even if the stage on the replica side is use_new.
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(tm.get_last_token(tablet_ids[4])), 5);
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(tm.get_last_token(tablet_ids[5])), 5);
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(tm.get_last_token(tablet_ids[6])), 5);
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(tm.get_last_token(tablet_ids[7])), 5);
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_writes(tm.get_last_token(tablet_ids[4])), dht::shard_replica_set{5});
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_writes(tm.get_last_token(tablet_ids[5])), dht::shard_replica_set{5});
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_writes(tm.get_last_token(tablet_ids[6])), dht::shard_replica_set{5});
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_writes(tm.get_last_token(tablet_ids[7])), dht::shard_replica_set{5});
+
+        // On pending host
+        BOOST_REQUIRE_EQUAL(sharder_h3.shard_for_reads(tm.get_last_token(tablet_ids[4])), 7);
+        BOOST_REQUIRE_EQUAL(sharder_h3.shard_for_reads(tm.get_last_token(tablet_ids[5])), 7);
+        BOOST_REQUIRE_EQUAL(sharder_h3.shard_for_reads(tm.get_last_token(tablet_ids[6])), 7);
+        BOOST_REQUIRE_EQUAL(sharder_h3.shard_for_reads(tm.get_last_token(tablet_ids[7])), 7);
+        BOOST_REQUIRE_EQUAL(sharder_h3.shard_for_writes(tm.get_last_token(tablet_ids[4])), dht::shard_replica_set{7});
+        BOOST_REQUIRE_EQUAL(sharder_h3.shard_for_writes(tm.get_last_token(tablet_ids[5])), dht::shard_replica_set{7});
+        BOOST_REQUIRE_EQUAL(sharder_h3.shard_for_writes(tm.get_last_token(tablet_ids[6])), dht::shard_replica_set{7});
+        BOOST_REQUIRE_EQUAL(sharder_h3.shard_for_writes(tm.get_last_token(tablet_ids[7])), dht::shard_replica_set{7});
+
+        BOOST_REQUIRE_EQUAL(sharder.token_for_next_shard_for_reads(tm.get_last_token(tablet_ids[1]), 0), tm.get_first_token(tablet_ids[3]));
+        BOOST_REQUIRE_EQUAL(sharder.token_for_next_shard_for_reads(tm.get_last_token(tablet_ids[1]), 1), tm.get_first_token(tablet_ids[2]));
+        BOOST_REQUIRE_EQUAL(sharder.token_for_next_shard_for_reads(tm.get_last_token(tablet_ids[1]), 3), dht::maximum_token());
+
+        BOOST_REQUIRE_EQUAL(sharder.token_for_next_shard_for_reads(tm.get_first_token(tablet_ids[1]), 0), tm.get_first_token(tablet_ids[3]));
+        BOOST_REQUIRE_EQUAL(sharder.token_for_next_shard_for_reads(tm.get_first_token(tablet_ids[1]), 1), tm.get_first_token(tablet_ids[2]));
+        BOOST_REQUIRE_EQUAL(sharder.token_for_next_shard_for_reads(tm.get_first_token(tablet_ids[1]), 3), dht::maximum_token());
 
         {
-            auto shard_opt = sharder.next_shard(tm.get_last_token(tablet_ids[0]));
+            auto shard_opt = sharder.next_shard_for_reads(tm.get_last_token(tablet_ids[0]));
             BOOST_REQUIRE(shard_opt);
             BOOST_REQUIRE_EQUAL(shard_opt->shard, 0);
             BOOST_REQUIRE_EQUAL(shard_opt->token, tm.get_first_token(tablet_ids[1]));
         }
 
         {
-            auto shard_opt = sharder.next_shard(tm.get_last_token(tablet_ids[1]));
+            auto shard_opt = sharder.next_shard_for_reads(tm.get_last_token(tablet_ids[1]));
             BOOST_REQUIRE(shard_opt);
             BOOST_REQUIRE_EQUAL(shard_opt->shard, 1);
             BOOST_REQUIRE_EQUAL(shard_opt->token, tm.get_first_token(tablet_ids[2]));
         }
 
         {
-            auto shard_opt = sharder.next_shard(tm.get_last_token(tablet_ids[2]));
+            auto shard_opt = sharder.next_shard_for_reads(tm.get_last_token(tablet_ids[2]));
             BOOST_REQUIRE(shard_opt);
             BOOST_REQUIRE_EQUAL(shard_opt->shard, 0);
             BOOST_REQUIRE_EQUAL(shard_opt->token, tm.get_first_token(tablet_ids[3]));
         }
 
         {
-            auto shard_opt = sharder.next_shard(tm.get_last_token(tablet_ids[3]));
+            auto shard_opt = sharder.next_shard_for_reads(tm.get_last_token(tablet_ids[tablet_ids.size() - 1]));
             BOOST_REQUIRE(!shard_opt);
+        }
+    }, tablet_cql_test_config());
+}
+
+SEASTAR_TEST_CASE(test_intranode_sharding) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        auto h1 = host_id(utils::UUID_gen::get_time_UUID());
+        auto h2 = host_id(utils::UUID_gen::get_time_UUID());
+
+        auto table1 = table_id(utils::UUID_gen::get_time_UUID());
+
+        token_metadata tokm(token_metadata::config{ .topo_cfg{ .this_host_id = h1 } });
+        tokm.get_topology().add_or_update_endpoint(h1, tokm.get_topology().my_address());
+
+        auto leaving_replica = tablet_replica{h1, 5};
+        auto pending_replica = tablet_replica{h1, 7};
+        auto const_replica = tablet_replica{h2, 1};
+
+        // Prepare a tablet map with different tablets being in intra-node migration at different stages.
+        std::vector<tablet_id> tablet_ids;
+        {
+            tablet_map tmap(4);
+            auto tid = tmap.first_tablet();
+
+            auto set_tablet = [&] (tablet_id tid, tablet_transition_stage stage) {
+                tablet_ids.push_back(tid);
+                tmap.set_tablet(tid, tablet_info{
+                    tablet_replica_set{leaving_replica, const_replica}
+                });
+                tmap.set_tablet_transition_info(tid, tablet_transition_info {
+                    stage,
+                    tablet_transition_kind::intranode_migration,
+                    tablet_replica_set{pending_replica, const_replica},
+                    pending_replica
+                });
+            };
+
+            // tablet_ids[0]
+            set_tablet(tid, tablet_transition_stage::allow_write_both_read_old);
+
+            // tablet_ids[1]
+            tid = *tmap.next_tablet(tid);
+            set_tablet(tid, tablet_transition_stage::write_both_read_old);
+
+            // tablet_ids[2]
+            tid = *tmap.next_tablet(tid);
+            set_tablet(tid, tablet_transition_stage::write_both_read_new);
+
+            // tablet_ids[3]
+            tid = *tmap.next_tablet(tid);
+            set_tablet(tid, tablet_transition_stage::use_new);
+
+            tablet_metadata tm;
+            tm.set_tablet_map(table1, std::move(tmap));
+            tokm.set_tablets(std::move(tm));
+        }
+
+        auto& tm = tokm.tablets().get_tablet_map(table1);
+        tablet_sharder sharder(tokm, table1); // for h1
+
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(tm.get_last_token(tablet_ids[0])), 5);
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(tm.get_last_token(tablet_ids[1])), 5);
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(tm.get_last_token(tablet_ids[2])), 7);
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_reads(tm.get_last_token(tablet_ids[3])), 7);
+
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_writes(tm.get_last_token(tablet_ids[0])), dht::shard_replica_set{5});
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_writes(tm.get_last_token(tablet_ids[1])), dht::shard_replica_set({7, 5}));
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_writes(tm.get_last_token(tablet_ids[2])), dht::shard_replica_set({7, 5}));
+        BOOST_REQUIRE_EQUAL(sharder.shard_for_writes(tm.get_last_token(tablet_ids[3])), dht::shard_replica_set{7});
+
+        // On const replica
+        tablet_sharder sharder_h2(tokm, table1, const_replica.host);
+        for (auto id : tablet_ids) {
+            BOOST_REQUIRE_EQUAL(sharder_h2.shard_for_reads(tm.get_last_token(id)), const_replica.shard);
+            BOOST_REQUIRE_EQUAL(sharder_h2.shard_for_writes(tm.get_last_token(id)), dht::shard_replica_set{const_replica.shard});
         }
     }, tablet_cql_test_config());
 }
@@ -795,7 +989,7 @@ void rebalance_tablets(tablet_allocator& talloc, shared_token_metadata& stm, loc
     auto max_iterations = 1 + get_tablet_count(stm.get()->tablets()) * 10;
 
     for (size_t i = 0; i < max_iterations; ++i) {
-        auto plan = talloc.balance_tablets(stm.get(), load_stats, std::move(skiplist)).get();
+        auto plan = talloc.balance_tablets(stm.get(), load_stats, skiplist).get();
         if (plan.empty()) {
             return;
         }
@@ -1550,6 +1744,7 @@ SEASTAR_THREAD_TEST_CASE(test_load_balancing_with_two_empty_nodes) {
         for (auto h : {host1, host2, host3, host4}) {
             testlog.debug("Checking host {}", h);
             BOOST_REQUIRE_EQUAL(load.get_avg_shard_load(h), 4);
+            BOOST_REQUIRE_LE(load.get_shard_imbalance(h), 1);
         }
     }
   }).get();
@@ -1565,7 +1760,7 @@ SEASTAR_THREAD_TEST_CASE(test_load_balancer_disabling) {
 
         auto table1 = table_id(next_uuid());
 
-        unsigned shard_count = 1;
+        unsigned shard_count = 2;
 
         semaphore sem(1);
         shared_token_metadata stm([&sem] () noexcept { return get_units(sem, 1); }, locator::token_metadata::config{
@@ -1576,6 +1771,7 @@ SEASTAR_THREAD_TEST_CASE(test_load_balancer_disabling) {
         });
 
         // host1 is loaded and host2 is empty, resulting in an imbalance.
+        // host1's shard 0 is loaded and shard 1 is empty, resulting in intra-node imbalance.
         stm.mutate_token_metadata([&] (auto& tm) {
             tm.update_host_id(host1, ip1);
             tm.update_host_id(host2, ip2);
@@ -1643,6 +1839,68 @@ SEASTAR_THREAD_TEST_CASE(test_load_balancer_disabling) {
             BOOST_REQUIRE(!plan.empty());
         }
   }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_drained_node_is_not_balanced_internally) {
+    do_with_cql_env_thread([] (auto& e) {
+        inet_address ip1("192.168.0.1");
+        inet_address ip2("192.168.0.2");
+
+        auto host1 = host_id(next_uuid());
+        auto host2 = host_id(next_uuid());
+
+        auto table1 = table_id(next_uuid());
+
+        unsigned shard_count = 2;
+
+        semaphore sem(1);
+        shared_token_metadata stm([&sem] () noexcept { return get_units(sem, 1); }, locator::token_metadata::config{
+            locator::topology::config{
+                .this_endpoint = ip1,
+                .local_dc_rack = locator::endpoint_dc_rack::default_location
+            }
+        });
+
+        stm.mutate_token_metadata([&] (locator::token_metadata& tm) {
+            tm.update_host_id(host1, ip1);
+            tm.update_host_id(host2, ip2);
+            tm.update_topology(host1, locator::endpoint_dc_rack::default_location, locator::node::state::being_removed, shard_count);
+            tm.update_topology(host2, locator::endpoint_dc_rack::default_location, std::nullopt, shard_count);
+
+            tablet_map tmap(16);
+            for (auto tid : tmap.tablet_ids()) {
+                tmap.set_tablet(tid, tablet_info {
+                    tablet_replica_set {
+                        tablet_replica {host1, 0},
+                    }
+                });
+            }
+            tablet_metadata tmeta;
+            tmeta.set_tablet_map(table1, std::move(tmap));
+            tm.set_tablets(std::move(tmeta));
+            return make_ready_future<>();
+        }).get();
+
+        migration_plan plan = e.get_tablet_allocator().local().balance_tablets(stm.get()).get();
+        BOOST_REQUIRE(plan.has_nodes_to_drain());
+        for (auto&& mig : plan.migrations()) {
+            BOOST_REQUIRE(mig.kind != tablet_transition_kind::intranode_migration);
+        }
+  }).get();
+}
+
+static
+void check_tablet_invariants(const tablet_metadata& tmeta) {
+    for (auto&& [table, tmap] : tmeta.all_tables()) {
+        tmap.for_each_tablet([&](auto tid, const tablet_info& tinfo) -> future<> {
+            std::unordered_set<host_id> hosts;
+            // Uniqueness of hosts
+            for (const auto& replica: tinfo.replicas) {
+                BOOST_REQUIRE(hosts.insert(replica.host).second);
+            }
+            return make_ready_future<>();
+        }).get();
+    }
 }
 
 SEASTAR_THREAD_TEST_CASE(test_load_balancing_with_random_load) {
@@ -1728,7 +1986,11 @@ SEASTAR_THREAD_TEST_CASE(test_load_balancing_with_random_load) {
         testlog.debug("tablet metadata: {}", stm.get()->tablets());
         testlog.info("Total tablet count: {}, hosts: {}", total_tablet_count, hosts.size());
 
+        check_tablet_invariants(stm.get()->tablets());
+
         rebalance_tablets(e.get_tablet_allocator().local(), stm);
+
+        check_tablet_invariants(stm.get()->tablets());
 
         {
             load_sketch load(stm.get());
@@ -1739,6 +2001,7 @@ SEASTAR_THREAD_TEST_CASE(test_load_balancing_with_random_load) {
                 auto l = load.get_avg_shard_load(h);
                 testlog.info("Load on host {}: {}", h, l);
                 min_max_load.update(l);
+                BOOST_REQUIRE_LE(load.get_shard_imbalance(h), 1);
             }
 
             testlog.debug("tablet metadata: {}", stm.get()->tablets());
@@ -2070,4 +2333,359 @@ SEASTAR_THREAD_TEST_CASE(test_tablet_range_splitter) {
             {bound{dks[0], true}, bound{dks[1], false}},
             {bound{dks[1], true}, bound{dks[2], false}},
             {bound{dks[2], true}, bound{dks[3], false}}});
+
+}
+
+static locator::endpoint_dc_rack make_endpoint_dc_rack(gms::inet_address endpoint) {
+    // This resembles rack_inferring_snitch dc/rack generation which is
+    // still in use by this test via token_metadata internals
+    auto dc = std::to_string(uint8_t(endpoint.bytes()[1]));
+    auto rack = std::to_string(uint8_t(endpoint.bytes()[2]));
+    return locator::endpoint_dc_rack{dc, rack};
+}
+
+struct calculate_tablet_replicas_for_new_rf_config
+{
+    struct ring_point {
+        double point;
+        inet_address host;
+        host_id id = host_id::create_random_id();
+    };
+    std::vector<ring_point> ring_points;
+    std::map<sstring, sstring> options;
+    std::map<sstring, sstring> new_dc_rep_factor;
+    std::map<sstring, size_t> expected_rep_factor;
+};
+
+static void execute_tablet_for_new_rf_test(calculate_tablet_replicas_for_new_rf_config const& test_config)
+{
+    auto my_address = gms::inet_address("localhost");
+    // Create the RackInferringSnitch
+    snitch_config cfg;
+    cfg.listen_address = my_address;
+    cfg.broadcast_address = my_address;
+    cfg.name = "RackInferringSnitch";
+    sharded<snitch_ptr> snitch;
+    snitch.start(cfg).get();
+    auto stop_snitch = defer([&snitch] { snitch.stop().get(); });
+    snitch.invoke_on_all(&snitch_ptr::start).get();
+
+    static constexpr size_t tablet_count = 8;
+
+    std::vector<unsigned> nodes_shard_count(test_config.ring_points.size(), 3);
+
+    locator::token_metadata::config tm_cfg;
+    tm_cfg.topo_cfg.this_endpoint = test_config.ring_points[0].host;
+    tm_cfg.topo_cfg.local_dc_rack = { snitch.local()->get_datacenter(), snitch.local()->get_rack() };
+    tm_cfg.topo_cfg.this_host_id = test_config.ring_points[0].id;
+    locator::shared_token_metadata stm([] () noexcept { return db::schema_tables::hold_merge_lock(); }, tm_cfg);
+
+    // Initialize the token_metadata
+    stm.mutate_token_metadata([&] (token_metadata& tm) -> future<> {
+        auto& topo = tm.get_topology();
+        for (const auto& [ring_point, endpoint, id] : test_config.ring_points) {
+            std::unordered_set<token> tokens;
+            tokens.insert({dht::token::kind::key, tests::d2t(ring_point / test_config.ring_points.size())});
+            topo.add_node(id, endpoint, make_endpoint_dc_rack(endpoint), locator::node::state::normal, 1);
+            tm.update_host_id(id, endpoint);
+            co_await tm.update_normal_tokens(std::move(tokens), id);
+        }
+    }).get();
+
+    locator::replication_strategy_params params(test_config.options, tablet_count);
+
+    auto ars_ptr = abstract_replication_strategy::create_replication_strategy(
+        "NetworkTopologyStrategy", params);
+
+    auto tablet_aware_ptr = ars_ptr->maybe_as_tablet_aware();
+    BOOST_REQUIRE(tablet_aware_ptr);
+
+    auto s = schema_builder("ks", "tb")
+        .with_column("pk", utf8_type, column_kind::partition_key)
+        .with_column("v", utf8_type)
+        .build();
+
+    stm.mutate_token_metadata([&] (token_metadata& tm) {
+        for (size_t i = 0; i < test_config.ring_points.size(); ++i) {
+            auto& [ring_point, endpoint, id] = test_config.ring_points[i];
+            tm.update_host_id(id, endpoint);
+            tm.update_topology(id, make_endpoint_dc_rack(endpoint), std::nullopt, nodes_shard_count[i]);
+        }
+        return make_ready_future<>();
+    }).get();
+
+    auto allocated_map = tablet_aware_ptr->allocate_tablets_for_new_table(s, stm.get(), 0).get();
+
+    BOOST_REQUIRE_EQUAL(allocated_map.tablet_count(), tablet_count);
+
+    auto host_id_to_dc = [&stm](const locator::host_id& ep) -> std::optional<sstring> {
+        auto node = stm.get()->get_topology().find_node(ep);
+        if (node == nullptr) {
+            return std::nullopt;
+        }
+        return node->dc_rack().dc;
+    };
+
+    stm.mutate_token_metadata([&] (token_metadata& tm) {
+        tablet_metadata tab_meta;
+        auto table = s->id();
+        tab_meta.set_tablet_map(table, allocated_map);
+        tm.set_tablets(std::move(tab_meta));
+        return make_ready_future<>();
+    }).get();
+
+    std::map<sstring, size_t> initial_rep_factor;
+    for (auto const& [dc, shard_count] : test_config.options) {
+        initial_rep_factor[dc] = std::stoul(shard_count);
+    }
+
+    auto tablets = stm.get()->tablets().get_tablet_map(s->id());
+    BOOST_REQUIRE_EQUAL(tablets.tablet_count(), tablet_count);
+    for (auto tb : tablets.tablet_ids()) {
+        const locator::tablet_info& ti = tablets.get_tablet_info(tb);
+
+        std::map<sstring, size_t> dc_replicas_count;
+        for (const auto& r : ti.replicas) {
+            auto dc = host_id_to_dc(r.host);
+            if (dc) {
+                dc_replicas_count[*dc]++;
+            }
+        }
+
+        BOOST_REQUIRE_EQUAL(dc_replicas_count, initial_rep_factor);
+    }
+
+    try {
+        tablet_map old_tablets = stm.get()->tablets().get_tablet_map(s->id());
+        locator::replication_strategy_params params{test_config.new_dc_rep_factor, old_tablets.tablet_count()};
+        auto new_strategy = abstract_replication_strategy::create_replication_strategy("NetworkTopologyStrategy", params);
+        auto tmap = new_strategy->maybe_as_tablet_aware()->reallocate_tablets(s, stm.get(), old_tablets).get();
+
+        auto const& ts = tmap.tablets();
+        BOOST_REQUIRE_EQUAL(ts.size(), tablet_count);
+
+        for (auto tb : tmap.tablet_ids()) {
+            const locator::tablet_info& ti = tmap.get_tablet_info(tb);
+
+            std::map<sstring, size_t> dc_replicas_count;
+            for (const auto& r : ti.replicas) {
+                auto dc = host_id_to_dc(r.host);
+                if (dc) {
+                    dc_replicas_count[*dc]++;
+                }
+            }
+
+            BOOST_REQUIRE_EQUAL(dc_replicas_count, test_config.expected_rep_factor);
+        }
+
+    } catch (exceptions::configuration_exception const& e) {
+        thread_local boost::regex re("Datacenter [0-9]+ doesn't have enough nodes for replication_factor=[0-9]+");
+        boost::cmatch what;
+        if (!boost::regex_search(e.what(), what, re)) {
+            BOOST_FAIL("Unexpected exception: " + std::string(e.what()));
+        }
+    } catch (std::exception const& e) {
+        BOOST_FAIL("Unexpected exception: " + std::string(e.what()));
+    } catch (...) {
+        BOOST_FAIL("Unexpected exception");
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_calculate_tablet_replicas_for_new_rf_upsize_one_dc) {
+    calculate_tablet_replicas_for_new_rf_config config;
+    config.ring_points = {
+            { 1.0,  inet_address("192.100.10.1") },
+            { 4.0,  inet_address("192.100.20.1") },
+            { 7.0,  inet_address("192.100.30.1") },
+    };
+    config.options = {{"100", "2"}};
+    config.new_dc_rep_factor = {{"100", "3"}};
+    config.expected_rep_factor = {{"100", 3}};
+    execute_tablet_for_new_rf_test(config);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_calculate_tablet_replicas_for_new_rf_downsize_one_dc) {
+    calculate_tablet_replicas_for_new_rf_config config;
+    config.ring_points = {
+            { 1.0,  inet_address("192.100.10.1") },
+            { 4.0,  inet_address("192.100.20.1") },
+            { 7.0,  inet_address("192.100.30.1") },
+    };
+    config.options = {{"100", "3"}};
+    config.new_dc_rep_factor = {{"100", "2"}};
+    config.expected_rep_factor = {{"100", 2}};
+    execute_tablet_for_new_rf_test(config);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_calculate_tablet_replicas_for_new_rf_no_change_one_dc) {
+    calculate_tablet_replicas_for_new_rf_config config;
+    config.ring_points = {
+            { 1.0,  inet_address("192.100.10.1") },
+            { 4.0,  inet_address("192.100.20.1") },
+            { 7.0,  inet_address("192.100.30.1") },
+    };
+    config.options = {{"100", "3"}};
+    config.new_dc_rep_factor = {{"100", "3"}};
+    config.expected_rep_factor = {{"100", 3}};
+    execute_tablet_for_new_rf_test(config);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_calculate_tablet_replicas_for_new_rf) {
+    calculate_tablet_replicas_for_new_rf_config config;
+    config.ring_points = {
+            { 1.0,  inet_address("192.100.10.1") },
+            { 2.0,  inet_address("192.101.10.1") },
+            { 3.0,  inet_address("192.102.10.1") },
+            { 4.0,  inet_address("192.100.20.1") },
+            { 5.0,  inet_address("192.101.20.1") },
+            { 6.0,  inet_address("192.102.20.1") },
+            { 7.0,  inet_address("192.100.30.1") },
+            { 8.0,  inet_address("192.101.30.1") },
+            { 9.0,  inet_address("192.102.30.1") },
+            { 10.0, inet_address("192.101.40.1") },
+            { 11.0, inet_address("192.102.40.1") },
+            { 12.0, inet_address("192.102.40.2") }
+    };
+    config.options = {
+        {"100", "3"},
+        {"101", "2"},
+        {"102", "3"}
+    };
+    config.new_dc_rep_factor = {
+        {"100", "3"},
+        {"101", "4"},
+        {"102", "2"}
+    };
+    config.expected_rep_factor = {
+        {"100", 3},
+        {"101", 4},
+        {"102", 2}
+    };
+
+    execute_tablet_for_new_rf_test(config);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_calculate_tablet_replicas_for_new_rf_not_enough_nodes) {
+
+    calculate_tablet_replicas_for_new_rf_config config;
+    config.ring_points = {
+            { 1.0,  inet_address("192.100.10.1") },
+            { 4.0,  inet_address("192.100.20.1") },
+            { 7.0,  inet_address("192.100.30.1") },
+    };
+    config.options = {{"100", "3"}};
+    config.new_dc_rep_factor = {{"100", "5"}};
+    config.expected_rep_factor = {{"100", 3}};
+    execute_tablet_for_new_rf_test(config);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_calculate_tablet_replicas_for_new_rf_one_dc) {
+    calculate_tablet_replicas_for_new_rf_config config;
+    config.ring_points = {
+            { 1.0,  inet_address("192.100.10.1") },
+            { 4.0,  inet_address("192.100.20.1") },
+            { 7.0,  inet_address("192.100.30.1") },
+    };
+    config.options = {{"100", "2"}};
+    config.new_dc_rep_factor = {{"100", "3"}};
+    config.expected_rep_factor = {{"100", 3}};
+    execute_tablet_for_new_rf_test(config);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_calculate_tablet_replicas_for_new_rf_one_dc_1_to_2) {
+    calculate_tablet_replicas_for_new_rf_config config;
+    config.ring_points = {
+            { 1.0,  inet_address("192.100.10.1") },
+            { 4.0,  inet_address("192.100.20.1") },
+    };
+    config.options = {{"100", "1"}};
+    config.new_dc_rep_factor = {{"100", "2"}};
+    config.expected_rep_factor = {{"100", 2}};
+    execute_tablet_for_new_rf_test(config);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_calculate_tablet_replicas_for_new_rf_one_dc_not_enough_nodes) {
+
+    calculate_tablet_replicas_for_new_rf_config config;
+    config.ring_points = {
+            { 1.0,  inet_address("192.100.10.1") },
+            { 4.0,  inet_address("192.100.10.2") },
+            { 7.0,  inet_address("192.100.10.3") },
+    };
+    config.options = {{"100", "3"}};
+    config.new_dc_rep_factor = {{"100", "5"}};
+    config.expected_rep_factor = {{"100", 3}};
+    execute_tablet_for_new_rf_test(config);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_calculate_tablet_replicas_for_new_rf_default_rf) {
+    calculate_tablet_replicas_for_new_rf_config config;
+    config.ring_points = {
+            { 1.0,  inet_address("192.100.10.1") },
+            { 2.0,  inet_address("192.101.10.1") },
+            { 3.0,  inet_address("192.102.10.1") },
+            { 4.0,  inet_address("192.100.20.1") },
+            { 5.0,  inet_address("192.101.20.1") },
+            { 6.0,  inet_address("192.102.20.1") },
+            { 7.0,  inet_address("192.100.30.1") },
+            { 8.0,  inet_address("192.101.30.1") },
+            { 9.0,  inet_address("192.102.30.1") },
+            { 10.0, inet_address("192.100.40.1") },
+            { 11.0, inet_address("192.101.40.1") },
+            { 12.0, inet_address("192.102.40.1") },
+            { 13.0, inet_address("192.102.40.2") }
+    };
+    config.options = {
+        {"100", "3"},
+        {"101", "2"},
+        {"102", "2"}
+    };
+    config.new_dc_rep_factor = {
+        {"100", "4"},
+        {"101", "3"},
+        {"102", "3"},
+    };
+    config.expected_rep_factor = {
+        {"100", 4},
+        {"101", 3},
+        {"102", 3},
+    };
+
+    execute_tablet_for_new_rf_test(config);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_calculate_tablet_replicas_for_new_rf_default_rf_upsize_by_two) {
+    calculate_tablet_replicas_for_new_rf_config config;
+    config.ring_points = {
+            { 1.0,  inet_address("192.100.10.1") },
+            { 2.0,  inet_address("192.101.10.1") },
+            { 3.0,  inet_address("192.102.10.1") },
+            { 4.0,  inet_address("192.100.20.1") },
+            { 5.0,  inet_address("192.101.20.1") },
+            { 6.0,  inet_address("192.102.20.1") },
+            { 7.0,  inet_address("192.100.30.1") },
+            { 8.0,  inet_address("192.101.30.1") },
+            { 9.0,  inet_address("192.102.30.1") },
+            { 10.0, inet_address("192.100.40.1") },
+            { 11.0, inet_address("192.101.40.1") },
+            { 12.0, inet_address("192.102.40.1") },
+            { 13.0, inet_address("192.102.40.2") }
+    };
+    config.options = {
+        {"100", "3"},
+        {"101", "2"},
+        {"102", "1"}
+    };
+    config.new_dc_rep_factor = {
+        {"100", "4"},
+        {"101", "3"},
+        {"102", "3"},
+    };
+    config.expected_rep_factor = {
+        {"100", 4},
+        {"101", 3},
+        {"102", 3},
+    };
+
+    execute_tablet_for_new_rf_test(config);
 }

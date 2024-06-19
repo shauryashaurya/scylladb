@@ -56,7 +56,7 @@ class foreign_reader : public flat_mutation_reader_v2::impl {
     // and move it to the background (save it's future but don't wait on it
     // now). If all works well read-aheads complete by the next operation and
     // we don't have to wait on the remote reader filling its buffer.
-    template <typename Operation, typename Result = futurize_t<std::result_of_t<Operation()>>>
+    template <typename Operation, typename Result = futurize_t<std::invoke_result_t<Operation>>>
     Result forward_operation(Operation op) {
         reader_permit::awaits_guard awaits_guard{_permit};
         return smp::submit_to(_reader.get_owner_shard(), [reader = _reader.get(),
@@ -1010,7 +1010,7 @@ void multishard_combining_reader_v2::on_partition_range_change(const dht::partit
     _shard_selection_min_heap.reserve(_sharder.shard_count());
 
     auto token = pr.start() ? pr.start()->value().token() : dht::minimum_token();
-    _current_shard = _sharder.shard_of(token);
+    _current_shard = _sharder.shard_for_reads(token);
 
     auto sharder = dht::ring_position_range_sharder(_sharder, pr);
 

@@ -51,6 +51,7 @@
 #include "querier.hh"
 #include "cache_temperature.hh"
 #include <unordered_set>
+#include "utils/error_injection.hh"
 #include "utils/updateable_value.hh"
 #include "data_dictionary/user_types_metadata.hh"
 #include "data_dictionary/keyspace_metadata.hh"
@@ -77,7 +78,7 @@ class reconcilable_result;
 namespace tracing { class trace_state_ptr; }
 namespace s3 { struct endpoint_config; }
 
-namespace wasm { class manager; }
+namespace lang { class manager; }
 
 namespace service {
 class storage_proxy;
@@ -102,6 +103,7 @@ class compaction_data;
 class sstable_set;
 class directory_semaphore;
 struct sstable_files_snapshot;
+struct entry_descriptor;
 
 }
 
@@ -112,6 +114,14 @@ class serializer;
 
 namespace gms {
 class gossiper;
+}
+
+namespace compaction {
+class shard_reshaping_compaction_task_impl;
+}
+
+namespace api {
+class autocompaction_toggle_guard;
 }
 
 namespace db {
@@ -135,6 +145,7 @@ class mutation_reordered_with_truncate_exception : public std::exception {};
 class column_family_test;
 class table_for_tests;
 class database_test;
+using sstable_list = sstables::sstable_list;
 
 extern logging::logger dblog;
 
@@ -279,12 +290,6 @@ public:
 private:
     lw_shared_ptr<memtable> new_memtable();
 };
-
-}
-
-using sstable_list = sstables::sstable_list;
-
-namespace replica {
 
 class distributed_loader;
 class table_populator;
@@ -449,7 +454,7 @@ private:
     // It contains and manages both the compaction_groups list and the storage_groups vector.
     std::unique_ptr<storage_group_manager> _sg_manager;
     // Compound SSTable set for all the compaction groups, which is useful for operations spanning all of them.
-    lw_shared_ptr<sstables::sstable_set> _sstables;
+    lw_shared_ptr<const sstables::sstable_set> _sstables;
     // Control background fibers waiting for sstables to be deleted
     seastar::gate _sstable_deletion_gate;
     // This semaphore ensures that an operation like snapshot won't have its selected
@@ -584,15 +589,11 @@ private:
     // that were previously split.
     future<> handle_tablet_split_completion(size_t old_tablet_count, const locator::tablet_map& new_tmap);
 
-    // Select a compaction group from a given token.
-    std::pair<size_t, locator::tablet_range_side> storage_group_of(dht::token token) const noexcept;
-    storage_group* storage_group_for_token(dht::token token) const noexcept;
-    // FIXME: Cannot return nullptr, signature can be changed to return storage_group&.
-    storage_group* storage_group_for_id(size_t i) const;
+    // Select a storage group from a given token.
+    storage_group& storage_group_for_token(dht::token token) const noexcept;
+    storage_group& storage_group_for_id(size_t i) const;
 
     std::unique_ptr<storage_group_manager> make_storage_group_manager();
-    // Return compaction group if table owns a single one. Otherwise, null is returned.
-    compaction_group* single_compaction_group_if_available() const noexcept;
     compaction_group* get_compaction_group(size_t id) const noexcept;
     // Select a compaction group from a given token.
     compaction_group& compaction_group_for_token(dht::token token) const noexcept;
@@ -604,10 +605,15 @@ private:
     compaction_group& compaction_group_for_sstable(const sstables::shared_sstable& sst) const noexcept;
     // Returns a list of all compaction groups.
     compaction_group_list& compaction_groups() const noexcept;
-    // Returns a list of all storage groups.
-    const storage_group_map& storage_groups() const noexcept;
     // Safely iterate through compaction groups, while performing async operations on them.
     future<> parallel_foreach_compaction_group(std::function<future<>(compaction_group&)> action);
+
+    // Safely iterate through SSTables, with deletion guard taken to make sure they're not
+    // removed during iteration.
+    // WARNING: Be careful that the action doesn't perform an operation that will itself
+    // take the deletion guard, as that will cause a deadlock. For example, memtable flush
+    // can wait on compaction (backpressure) which in turn takes deletion guard on completion.
+    future<> safe_foreach_sstable(const sstables::sstable_set&, noncopyable_function<future<>(const sstables::shared_sstable&)> action);
 
     bool cache_enabled() const {
         return _config.enable_cache && _schema->caching_options().enabled();
@@ -643,7 +649,7 @@ private:
     // Mutations returned by the reader will all have given schema.
     flat_mutation_reader_v2 make_sstable_reader(schema_ptr schema,
                                         reader_permit permit,
-                                        lw_shared_ptr<sstables::sstable_set> sstables,
+                                        lw_shared_ptr<const sstables::sstable_set> sstables,
                                         const dht::partition_range& range,
                                         const query::partition_slice& slice,
                                         tracing::trace_state_ptr trace_state,
@@ -652,12 +658,12 @@ private:
                                         const sstables::sstable_predicate& = sstables::default_sstable_predicate()) const;
 
     lw_shared_ptr<sstables::sstable_set> make_maintenance_sstable_set() const;
-    lw_shared_ptr<sstables::sstable_set> make_compound_sstable_set() const;
+    lw_shared_ptr<const sstables::sstable_set> make_compound_sstable_set() const;
     // Compound sstable set must be refreshed whenever any of its managed sets are changed
     void refresh_compound_sstable_set();
 
     snapshot_source sstables_as_snapshot_source();
-    partition_presence_checker make_partition_presence_checker(lw_shared_ptr<sstables::sstable_set>);
+    partition_presence_checker make_partition_presence_checker(lw_shared_ptr<const sstables::sstable_set>);
     std::chrono::steady_clock::time_point _sstable_writes_disabled_at;
 
     dirty_memory_manager_logalloc::region_group& dirty_memory_region_group() const {
@@ -838,16 +844,19 @@ public:
     const locator::effective_replication_map_ptr& get_effective_replication_map() const { return _erm; }
     future<> update_effective_replication_map(locator::effective_replication_map_ptr);
     [[gnu::always_inline]] bool uses_tablets() const;
+private:
+    future<> clear_inactive_reads_for_tablet(database& db, storage_group& sg);
+    future<> stop_compaction_groups(storage_group& sg);
+    future<> flush_compaction_groups(storage_group& sg);
+    future<> cleanup_compaction_groups(database& db, db::system_keyspace& sys_ks, locator::tablet_id tid, storage_group& sg);
+public:
     future<> cleanup_tablet(database&, db::system_keyspace&, locator::tablet_id);
+    // For tests only.
+    future<> cleanup_tablet_without_deallocation(database& db, db::system_keyspace& sys_ks, locator::tablet_id tid);
     future<const_mutation_partition_ptr> find_partition(schema_ptr, reader_permit permit, const dht::decorated_key& key) const;
     future<const_row_ptr> find_row(schema_ptr, reader_permit permit, const dht::decorated_key& partition_key, clustering_key clustering_key) const;
-    shard_id shard_of(const mutation& m) const {
-        return shard_of(m.token());
-    }
-    shard_id shard_of(dht::token t) const {
-        return _erm ? _erm->shard_of(*_schema, t)
-                    : dht::static_shard_of(*_schema, t); // for tests.
-    }
+    shard_id shard_for_reads(dht::token t) const;
+    dht::shard_replica_set shard_for_writes(dht::token t) const;
     // Applies given mutation to this column family
     // The mutation is always upgraded to current schema.
     void apply(const frozen_mutation& m, const schema_ptr& m_schema, db::rp_handle&& h = {}) {
@@ -1019,7 +1028,7 @@ public:
 
     // The tablet filter is used to not double account migrating tablets, so it's important that
     // only one of pending or leaving replica is accounted based on current migration stage.
-    locator::table_load_stats table_load_stats(std::function<bool(locator::global_tablet_id)> tablet_filter) const noexcept;
+    locator::table_load_stats table_load_stats(std::function<bool(const locator::tablet_map&, locator::global_tablet_id)> tablet_filter) const noexcept;
 
     const db::view::stats& get_view_stats() const {
         return _view_stats;
@@ -1198,17 +1207,18 @@ public:
 
     friend class distributed_loader;
     friend class table_populator;
+    friend class compaction::shard_reshaping_compaction_task_impl;
 
 private:
     timer<> _off_strategy_trigger;
     void do_update_off_strategy_trigger();
 
+    compaction_group* try_get_compaction_group_with_static_sharding() const;
 public:
     void update_off_strategy_trigger();
     void enable_off_strategy_trigger();
 
-    // FIXME: get rid of it once no users.
-    compaction::table_state& as_table_state() const noexcept;
+    compaction::table_state& try_get_table_state_with_static_sharding() const;
     // Safely iterate through table states, while performing async operations on them.
     future<> parallel_foreach_table_state(std::function<future<>(compaction::table_state&)> action);
 
@@ -1227,6 +1237,10 @@ public:
     // a list of SSTables that represent the snapshot.
     future<utils::chunked_vector<sstables::sstable_files_snapshot>> take_storage_snapshot(dht::token_range tr);
 
+    // Clones storage of a given tablet. Memtable is flushed first to guarantee that the
+    // snapshot (list of sstables) will include all the data written up to the time it was taken.
+    future<utils::chunked_vector<sstables::entry_descriptor>> clone_tablet_storage(locator::tablet_id tid);
+
     friend class compaction_group;
 };
 
@@ -1239,7 +1253,6 @@ using keyspace_metadata = data_dictionary::keyspace_metadata;
 class keyspace {
 public:
     struct config {
-        std::vector<sstring> all_datadirs;
         sstring datadir;
         bool enable_commitlog = true;
         bool enable_disk_reads = true;
@@ -1336,6 +1349,7 @@ struct database_config {
     seastar::scheduling_group streaming_scheduling_group;
     seastar::scheduling_group gossip_scheduling_group;
     seastar::scheduling_group commitlog_scheduling_group;
+    seastar::scheduling_group schema_commitlog_scheduling_group;
     size_t available_memory;
     std::optional<sstables::sstable_version_types> sstables_format;
 };
@@ -1351,7 +1365,7 @@ class db_user_types_storage;
 // Policy for distributed<database>:
 //   broadcast metadata writes
 //   local metadata reads
-//   use shard_of() for data
+//   use table::shard_for_reads()/table::shard_for_writes() for data
 
 class database : public peering_sharded_service<database> {
     friend class ::database_test;
@@ -1411,7 +1425,13 @@ private:
     size_t max_memory_streaming_concurrent_reads() { return _dbcfg.available_memory * 0.02; }
     static constexpr size_t max_count_system_concurrent_reads{10};
     size_t max_memory_system_concurrent_reads() { return _dbcfg.available_memory * 0.02; };
-    size_t max_memory_pending_view_updates() const { return _dbcfg.available_memory * 0.1; }
+    size_t max_memory_pending_view_updates() const {
+        auto ret = _dbcfg.available_memory * 0.1;
+        utils::get_local_injector().inject("view_update_limit", [&ret] {
+            ret = 250000;
+        });
+        return ret;
+    }
 
     struct db_stats {
         uint64_t total_writes = 0;
@@ -1494,7 +1514,7 @@ private:
     gms::feature_service& _feat;
     std::vector<std::any> _listeners;
     const locator::shared_token_metadata& _shared_token_metadata;
-    wasm::manager& _wasm;
+    lang::manager& _lang_manager;
 
     utils::cross_shard_barrier _stop_barrier;
 
@@ -1551,6 +1571,8 @@ private:
     void drop_keyspace(const sstring& name);
     future<> update_keyspace(const keyspace_metadata& tmp_ksm);
     static future<> modify_keyspace_on_all_shards(sharded<database>& sharded_db, std::function<future<>(replica::database&)> func, std::function<future<>(replica::database&)> notifier);
+
+    future<> foreach_reader_concurrency_semaphore(std::function<future<>(reader_concurrency_semaphore&)> func);
 public:
     static table_schema_version empty_version;
 
@@ -1561,30 +1583,14 @@ public:
     void set_enable_incremental_backups(bool val) { _enable_incremental_backups = val; }
 
     void enable_autocompaction_toggle() noexcept { _enable_autocompaction_toggle = true; }
-    class autocompaction_toggle_guard {
-        database& _db;
-    public:
-        autocompaction_toggle_guard(database& db) : _db(db) {
-            assert(this_shard_id() == 0);
-            if (!_db._enable_autocompaction_toggle) {
-                throw std::runtime_error("Autocompaction toggle is busy");
-            }
-            _db._enable_autocompaction_toggle = false;
-        }
-        autocompaction_toggle_guard(const autocompaction_toggle_guard&) = delete;
-        autocompaction_toggle_guard(autocompaction_toggle_guard&&) = default;
-        ~autocompaction_toggle_guard() {
-            assert(this_shard_id() == 0);
-            _db._enable_autocompaction_toggle = true;
-        }
-    };
+    friend class api::autocompaction_toggle_guard;
 
     // Load the schema definitions kept in schema tables from disk and initialize in-memory schema data structures
     // (keyspace/table definitions, column mappings etc.)
     future<> parse_system_tables(distributed<service::storage_proxy>&, sharded<db::system_keyspace>&);
 
     database(const db::config&, database_config dbcfg, service::migration_notifier& mn, gms::feature_service& feat, const locator::shared_token_metadata& stm,
-            compaction_manager& cm, sstables::storage_manager& sstm, wasm::manager& wasm, sstables::directory_semaphore& sst_dir_sem, utils::cross_shard_barrier barrier = utils::cross_shard_barrier(utils::cross_shard_barrier::solo{}) /* for single-shard usage */);
+            compaction_manager& cm, sstables::storage_manager& sstm, lang::manager& langm, sstables::directory_semaphore& sst_dir_sem, utils::cross_shard_barrier barrier = utils::cross_shard_barrier(utils::cross_shard_barrier::solo{}) /* for single-shard usage */);
     database(database&&) = delete;
     ~database();
 
@@ -1606,7 +1612,6 @@ public:
         return &_cf_stats;
     }
 
-    seastar::scheduling_group get_statement_scheduling_group() const { return _dbcfg.statement_scheduling_group; }
     seastar::scheduling_group get_streaming_scheduling_group() const { return _dbcfg.streaming_scheduling_group; }
 
     compaction_manager& get_compaction_manager() {
@@ -1619,8 +1624,8 @@ public:
     const locator::shared_token_metadata& get_shared_token_metadata() const { return _shared_token_metadata; }
     const locator::token_metadata& get_token_metadata() const { return *_shared_token_metadata.get(); }
 
-    wasm::manager& wasm() noexcept { return _wasm; }
-    const wasm::manager& wasm() const noexcept { return _wasm; }
+    lang::manager& lang() noexcept { return _lang_manager; }
+    const lang::manager& lang() const noexcept { return _lang_manager; }
 
     service::migration_notifier& get_notifier() { return _mnotifier; }
     const service::migration_notifier& get_notifier() const { return _mnotifier; }
@@ -1870,6 +1875,8 @@ public:
     db::timeout_semaphore& view_update_sem() {
         return _view_update_concurrency_sem;
     }
+
+    future<> clear_inactive_reads_for_tablet(table_id table, dht::token_range tablet_range);
 };
 
 } // namespace replica

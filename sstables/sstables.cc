@@ -33,6 +33,7 @@
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/as_future.hh>
 
+#include "utils/error_injection.hh"
 #include "utils/to_string.hh"
 #include "data_dictionary/storage_options.hh"
 #include "dht/sharder.hh"
@@ -852,6 +853,11 @@ future<std::unordered_map<component_type, file>> sstable::readable_file_for_all_
     co_return std::move(files);
 }
 
+future<entry_descriptor> sstable::clone(generation_type new_generation) const {
+    co_await _storage->snapshot(*this, _storage->prefix(), storage::absolute_path::yes, new_generation);
+    co_return entry_descriptor(new_generation, _version, _format, component_type::TOC, _state);
+}
+
 file_writer::~file_writer() {
     if (_closed) {
         return;
@@ -1409,7 +1415,7 @@ size_t sstable::total_reclaimable_memory_size() const {
 }
 
 size_t sstable::reclaim_memory_from_components() {
-    size_t total_memory_reclaimed = 0;
+    size_t memory_reclaimed_this_iteration = 0;
 
     if (_components->filter) {
         auto filter_memory_size = _components->filter->memory_size();
@@ -1417,17 +1423,39 @@ size_t sstable::reclaim_memory_from_components() {
             // Discard it from memory by replacing it with an always present variant.
             // No need to remove it from _recognized_components as the filter is still in disk.
             _components->filter = std::make_unique<utils::filter::always_present_filter>();
-            total_memory_reclaimed += filter_memory_size;
+            memory_reclaimed_this_iteration += filter_memory_size;
         }
     }
 
     _total_reclaimable_memory.reset();
-    return total_memory_reclaimed;
+    _total_memory_reclaimed += memory_reclaimed_this_iteration;
+    return memory_reclaimed_this_iteration;
 }
 
-// This interface is only used during tests, snapshot loading and early initialization.
-// No need to set tunable priorities for it.
-future<> sstable::load(const dht::sharder& sharder, sstable_open_config cfg) noexcept {
+size_t sstable::total_memory_reclaimed() const {
+    return _total_memory_reclaimed;
+}
+
+future<> sstable::reload_reclaimed_components() {
+    if (_total_memory_reclaimed == 0) {
+        // nothing to reload
+        co_return;
+    }
+
+    co_await utils::get_local_injector().inject("reload_reclaimed_components/pause", [] (auto& handler) {
+        sstlog.info("reload_reclaimed_components/pause init");
+        auto ret = handler.wait_for_message(std::chrono::steady_clock::now() + std::chrono::seconds{5});
+        sstlog.info("reload_reclaimed_components/pause done");
+        return ret;
+    });
+
+    co_await read_filter();
+    _total_reclaimable_memory.reset();
+    _total_memory_reclaimed -= _components->filter->memory_size();
+    sstlog.info("Reloaded bloom filter of {}", get_filename());
+}
+
+future<> sstable::load_metadata(sstable_open_config cfg, bool validate) noexcept {
     co_await read_toc();
     // read scylla-meta after toc. Might need it to parse
     // rest (hint extensions)
@@ -1439,12 +1467,21 @@ future<> sstable::load(const dht::sharder& sharder, sstable_open_config cfg) noe
             [&] { return read_compression(); },
             [&] { return read_filter(cfg); },
             [&] { return read_summary(); });
-    validate_min_max_metadata();
-    validate_max_local_deletion_time();
-    validate_partitioner();
+    if (validate) {
+        validate_min_max_metadata();
+        validate_max_local_deletion_time();
+        validate_partitioner();
+    }
+}
+
+// This interface is only used during tests, snapshot loading and early initialization.
+// No need to set tunable priorities for it.
+future<> sstable::load(const dht::sharder& sharder, sstable_open_config cfg) noexcept {
+    co_await load_metadata(cfg, true);
     if (_shards.empty()) {
         set_first_and_last_keys();
-        _shards = compute_shards_for_this_sstable(sharder);
+        _shards = cfg.current_shard_as_sstable_owner ?
+                std::vector<unsigned>{this_shard_id()} : compute_shards_for_this_sstable(sharder);
     }
     co_await open_data(cfg);
 }
@@ -1597,7 +1634,7 @@ create_sharding_metadata(utils::chunked_vector<dht::partition_range> ranges) {
 
 static
 sharding_metadata
-create_sharding_metadata(schema_ptr schema, const dht::sharder& sharder, const dht::decorated_key& first_key, const dht::decorated_key& last_key, shard_id shard) {
+create_sharding_metadata(schema_ptr schema, const dht::static_sharder& sharder, const dht::decorated_key& first_key, const dht::decorated_key& last_key, shard_id shard) {
     auto prange = dht::partition_range::make(dht::ring_position(first_key), dht::ring_position(last_key));
     auto ranges = dht::split_range_to_single_shard(*schema, sharder, prange, shard).get();
     if (ranges.empty()) {
@@ -3061,10 +3098,6 @@ future<> sstable::destroy() {
     if (ex) {
         co_await coroutine::return_exception_ptr(std::move(ex));
     }
-}
-
-std::ostream& operator<<(std::ostream& out, const deletion_time& dt) {
-    return out << "{timestamp=" << dt.marked_for_delete_at << ", deletion_time=" << dt.marked_for_delete_at << "}";
 }
 
 std::optional<large_data_stats_entry> sstable::get_large_data_stat(large_data_type t) const noexcept {

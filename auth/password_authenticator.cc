@@ -132,48 +132,48 @@ future<> password_authenticator::create_default_if_missing() {
             db::consistency_level::QUORUM,
             internal_distributed_query_state(),
             {salted_pwd, _superuser},
-            cql3::query_processor::cache_internal::no).then([](auto&&) {
-            plogger.info("Created default superuser authentication record.");
-        });
+            cql3::query_processor::cache_internal::no);
+        plogger.info("Created default superuser authentication record.");
     } else {
         co_await announce_mutations(_qp, _group0_client, query,
-            {salted_pwd, _superuser}, &_as, ::service::raft_timeout{}).then([]() {
-            plogger.info("Created default superuser authentication record.");
-        });
+            {salted_pwd, _superuser}, &_as, ::service::raft_timeout{});
+        plogger.info("Created default superuser authentication record.");
     }
 }
 
 future<> password_authenticator::start() {
-     return once_among_shards([this] {
-         auto f = create_metadata_table_if_missing(
-                 meta::roles_table::name,
-                 _qp,
-                 meta::roles_table::creation_query(),
-                 _migration_manager);
+    return once_among_shards([this] {
+        _stopped = do_after_system_ready(_as, [this] {
+            return async([this] {
+                if (legacy_mode(_qp)) {
+                    _migration_manager.wait_for_schema_agreement(_qp.db().real_database(), db::timeout_clock::time_point::max(), &_as).get();
 
-         _stopped = do_after_system_ready(_as, [this] {
-             return async([this] {
-                 _migration_manager.wait_for_schema_agreement(_qp.db().real_database(), db::timeout_clock::time_point::max(), &_as).get();
+                    if (any_nondefault_role_row_satisfies(_qp, &has_salted_hash, _superuser).get()) {
+                        if (legacy_metadata_exists()) {
+                            plogger.warn("Ignoring legacy authentication metadata since nondefault data already exist.");
+                        }
 
-                 if (any_nondefault_role_row_satisfies(_qp, &has_salted_hash, _superuser).get()) {
-                     if (legacy_metadata_exists()) {
-                         plogger.warn("Ignoring legacy authentication metadata since nondefault data already exist.");
-                     }
+                        return;
+                    }
 
-                     return;
-                 }
+                    if (legacy_metadata_exists()) {
+                        migrate_legacy_metadata().get();
+                        return;
+                    }
+                }
+                create_default_if_missing().get();
+            });
+        });
 
-                 if (legacy_metadata_exists()) {
-                     migrate_legacy_metadata().get();
-                     return;
-                 }
-
-                 create_default_if_missing().get();
-             });
-         });
-
-         return f;
-     });
+        if (legacy_mode(_qp)) {
+            return create_legacy_metadata_table_if_missing(
+                    meta::roles_table::name,
+                    _qp,
+                    meta::roles_table::creation_query(),
+                    _migration_manager);
+        }
+        return make_ready_future<>();
+    });
  }
 
 future<> password_authenticator::stop() {
@@ -257,7 +257,7 @@ future<authenticated_user> password_authenticator::authenticate(
     }
 }
 
-future<> password_authenticator::create(std::string_view role_name, const authentication_options& options) {
+future<> password_authenticator::create(std::string_view role_name, const authentication_options& options, ::service::group0_batch& mc) {
     if (!options.password) {
         co_return;
     }
@@ -270,12 +270,12 @@ future<> password_authenticator::create(std::string_view role_name, const authen
                 {passwords::hash(*options.password, rng_for_salt), sstring(role_name)},
                 cql3::query_processor::cache_internal::no).discard_result();
     } else {
-        co_await announce_mutations(_qp, _group0_client, query,
-                {passwords::hash(*options.password, rng_for_salt), sstring(role_name)}, &_as, ::service::raft_timeout{});
+        co_await collect_mutations(_qp, mc, query,
+                {passwords::hash(*options.password, rng_for_salt), sstring(role_name)});
     }
 }
 
-future<> password_authenticator::alter(std::string_view role_name, const authentication_options& options) {
+future<> password_authenticator::alter(std::string_view role_name, const authentication_options& options, ::service::group0_batch& mc) {
     if (!options.password) {
         co_return;
     }
@@ -293,12 +293,12 @@ future<> password_authenticator::alter(std::string_view role_name, const authent
                 {passwords::hash(*options.password, rng_for_salt), sstring(role_name)},
                 cql3::query_processor::cache_internal::no).discard_result();
     } else {
-        co_await announce_mutations(_qp, _group0_client, query,
-            {passwords::hash(*options.password, rng_for_salt), sstring(role_name)}, &_as, ::service::raft_timeout{});
+        co_await collect_mutations(_qp, mc, query,
+                {passwords::hash(*options.password, rng_for_salt), sstring(role_name)});
     }
 }
 
-future<> password_authenticator::drop(std::string_view name) {
+future<> password_authenticator::drop(std::string_view name, ::service::group0_batch& mc) {
     const sstring query = format("DELETE {} FROM {}.{} WHERE {} = ?",
             SALTED_HASH,
             get_auth_ks_name(_qp),
@@ -311,7 +311,7 @@ future<> password_authenticator::drop(std::string_view name) {
                 {sstring(name)},
                 cql3::query_processor::cache_internal::no).discard_result();
     } else {
-        co_await announce_mutations(_qp, _group0_client, query, {sstring(name)}, &_as, ::service::raft_timeout{});
+        co_await collect_mutations(_qp, mc, query, {sstring(name)});
     }
 }
 
@@ -329,7 +329,7 @@ const resource_set& password_authenticator::protected_resources() const {
         credentials_map credentials{};
         credentials[USERNAME_KEY] = sstring(username);
         credentials[PASSWORD_KEY] = sstring(password);
-        return this->authenticate(credentials);
+        return authenticate(credentials);
     });
 }
 

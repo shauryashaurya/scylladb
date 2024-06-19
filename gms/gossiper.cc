@@ -32,7 +32,6 @@
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/exception.hh>
 #include <chrono>
-#include "db/config.hh"
 #include "locator/host_id.hh"
 #include <boost/range/algorithm/set_algorithm.hpp>
 #include <boost/range/adaptors.hpp>
@@ -86,12 +85,10 @@ std::chrono::milliseconds gossiper::quarantine_delay() const noexcept {
     return ring_delay * 2;
 }
 
-gossiper::gossiper(abort_source& as, const locator::shared_token_metadata& stm, netw::messaging_service& ms, const db::config& cfg, gossip_config gcfg)
+gossiper::gossiper(abort_source& as, const locator::shared_token_metadata& stm, netw::messaging_service& ms, gossip_config gcfg)
         : _abort_source(as)
         , _shared_token_metadata(stm)
         , _messaging(ms)
-        , _failure_detector_timeout_ms(cfg.failure_detector_timeout_in_ms)
-        , _force_gossip_generation(cfg.force_gossip_generation)
         , _gcfg(std::move(gcfg)) {
     // Gossiper's stuff below runs only on CPU0
     if (this_shard_id() != 0) {
@@ -569,6 +566,17 @@ future<> gossiper::do_apply_state_locally(gms::inet_address node, endpoint_state
     // If there is a generation tie, attempt to break it by heartbeat version.
     auto permit = co_await this->lock_endpoint(node, null_permit_id);
     auto es = this->get_endpoint_state_ptr(node);
+    if (!es && _topo_sm) {
+        // Even if there is no endpoint for the given IP the message can still belong to existing endpoint that
+        // was restarted with different IP, so lets try to locate the endpoint by host id as well. Do it in raft
+        // topology mode only to not have impact on gossiper mode.
+        auto hid = remote_state.get_host_id();
+        for (auto&& s : _endpoint_state_map) {
+            if (s.second->get_host_id() == hid) {
+                es = s.second;
+            }
+        }
+    }
     if (es) {
         endpoint_state local_state = *es;
         auto local_generation = local_state.get_heart_beat_state().get_generation();
@@ -653,13 +661,13 @@ future<> gossiper::apply_state_locally(std::map<inet_address, endpoint_state> ma
         if (ep == this->get_broadcast_address() && !this->is_in_shadow_round()) {
             return make_ready_future<>();
         }
-        if (topo_sm) {
+        if (_topo_sm) {
             locator::host_id hid = map[ep].get_host_id();
             if (hid == locator::host_id::create_null_id()) {
                 // If there is no host id in the new state there should be one locally
                 hid = get_host_id(ep);
             }
-            if (topo_sm->_topology.left_nodes.contains(raft::server_id(hid.uuid()))) {
+            if (_topo_sm->_topology.left_nodes.contains(raft::server_id(hid.uuid()))) {
                 logger.trace("Ignoring gossip for {} because it left", ep);
                 return make_ready_future<>();
             }
@@ -944,7 +952,7 @@ future<> gossiper::failure_detector_loop_for_node(gms::inet_address node, genera
     auto last = gossiper::clk::now();
     auto diff = gossiper::clk::duration(0);
     auto echo_interval = std::chrono::milliseconds(2000);
-    auto max_duration = echo_interval + std::chrono::milliseconds(_failure_detector_timeout_ms());
+    auto max_duration = echo_interval + std::chrono::milliseconds(_gcfg.failure_detector_timeout_ms());
     while (is_enabled()) {
         bool failed = false;
         try {
@@ -1140,7 +1148,7 @@ void gossiper::run() {
                         logger.trace("Failed to send gossip to unreachable members: {}", ep);
                     });
                 });
-                if (!topo_sm) {
+                if (!_topo_sm) {
                     do_status_check().get();
                 }
             }
@@ -1276,7 +1284,7 @@ void gossiper::quarantine_endpoint(inet_address endpoint) {
 }
 
 void gossiper::quarantine_endpoint(inet_address endpoint, clk::time_point quarantine_start) {
-    if (!topo_sm) {
+    if (!_topo_sm) {
         // In raft topology mode the coodinator maintains banned nodes list
         _just_removed_endpoints[endpoint] = quarantine_start;
     }
@@ -2028,8 +2036,8 @@ future<> gossiper::start_gossiping(gms::generation_type generation_nbr, applicat
     });
 
     build_seeds_list();
-    if (_force_gossip_generation() > 0) {
-        generation_nbr = gms::generation_type(_force_gossip_generation());
+    if (_gcfg.force_gossip_generation() > 0) {
+        generation_nbr = gms::generation_type(_gcfg.force_gossip_generation());
         logger.warn("Use the generation number provided by user: generation = {}", generation_nbr);
     }
     endpoint_state local_state = my_endpoint_state();

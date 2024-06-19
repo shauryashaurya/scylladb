@@ -65,8 +65,10 @@ static void write_json_result(std::string result_file, const test_config& cfg, c
     Json::Value stats;
     stats["median tps"] = median.throughput;
     stats["allocs_per_op"] = median.mallocs_per_op;
+    stats["logallocs_per_op"] = median.logallocs_per_op;
     stats["tasks_per_op"] = median.tasks_per_op;
     stats["instructions_per_op"] = median.instructions_per_op;
+    stats["cpu_cycles_per_op"] = median.cpu_cycles_per_op;
     stats["aio_writes"] = median.aio_writes;
     stats["aio_write_bytes"] = median.aio_write_bytes;
     stats["mad tps"] = mad;

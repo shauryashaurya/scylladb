@@ -8,9 +8,11 @@
    Provides helper methods to test cases.
    Manages driver refresh when cluster is cycled.
 """
-
+import pathlib
+import shutil
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional, Callable, Any, Awaitable
+from pathlib import Path
+from typing import List, Optional, Callable, Any, Awaitable, Dict, Tuple
 from time import time
 import logging
 from test.pylib.log_browsing import ScyllaLogFile
@@ -41,6 +43,7 @@ class ManagerClient():
     def __init__(self, sock_path: str, port: int, use_ssl: bool, auth_provider: Any|None,
                  con_gen: Callable[[List[IPAddress], int, bool, Any], CassandraSession]) \
                          -> None:
+        self.test_log_fh: Optional[logging.FileHandler] = None
         self.port = port
         self.use_ssl = use_ssl
         self.auth_provider = auth_provider
@@ -53,9 +56,17 @@ class ManagerClient():
         self.api = ScyllaRESTAPIClient()
         self.metrics = ScyllaMetricsClient()
         self.thread_pool = ThreadPoolExecutor()
+        self.test_finished_event = asyncio.Event()
 
     @property
     def client(self):
+        if self.test_finished_event.is_set():
+            raise Exception("ManagerClient.after_test method was called, client object is not accessible anymore")
+            # there are still can be issue when some task first obtains the client object,
+            # but usually, tests obtains the manager and uses the client as manager.client
+            # and there is an actual workaround for this case.
+            # It is better to fix the task rather than every time doing
+            # close all clients in after_test->create new during after_test->close again after after_test.
         _client = self.client_for_asyncio_loop.get(asyncio.get_running_loop(), None)
         if _client is None:
             _client = UnixRESTClient(self.sock_path)
@@ -109,8 +120,16 @@ class ManagerClient():
             logger.debug("refresh driver node list")
             self.ccluster.control_connection.refresh_node_list_and_token_map()
 
-    async def before_test(self, test_case_name: str) -> None:
-        """Before a test starts check if cluster needs cycling and update driver connection"""
+    async def before_test(self, test_case_name: str, test_log: Path) -> None:
+        # Add handler to the root logger to intercept all logs produced by pytest process
+        test_logger = logging.getLogger()
+        self.test_log_fh = logging.FileHandler(test_log, mode='w+')
+        # to have the custom formatter with a timestamp that used in a test.py but for each testcase's log, we need to
+        # extract it from the root logger and apply to the handler
+        self.test_log_fh.setFormatter(logging.getLogger().handlers[0].formatter)
+        self.test_log_fh.setLevel(test_logger.getEffectiveLevel())
+        test_logger.addHandler(self.test_log_fh)
+        # Before a test starts check if cluster needs cycling and update driver connection
         logger.debug("before_test for %s", test_case_name)
         dirty = await self.is_dirty()
         if dirty:
@@ -129,10 +148,21 @@ class ManagerClient():
 
     async def after_test(self, test_case_name: str, success: bool) -> None:
         """Tell harness this test finished"""
+        self.test_finished_event.set()
+        _client = self.client_for_asyncio_loop.get(asyncio.get_running_loop())
+        logging.getLogger().removeHandler(self.test_log_fh)
+        pathlib.Path(self.test_log_fh.baseFilename).unlink()
         logger.debug("after_test for %s (success: %s)", test_case_name, success)
-        cluster_str = await self.client.put_json(f"/cluster/after-test/{success}",
+        cluster_str = await _client.put_json(f"/cluster/after-test/{success}",
                                                  response_type = "json")
         logger.info("Cluster after test %s: %s", test_case_name, cluster_str)
+
+    async def gather_related_logs(self, failed_test_path_dir: Path, logs: Dict[str, Path]) -> None:
+        for server in await self.all_servers():
+            log_file = await self.server_open_log(server_id=server.server_id)
+            shutil.copyfile(log_file.file, failed_test_path_dir / f"{pathlib.Path(log_file.file).name}")
+        for name, log in logs.items():
+            shutil.copyfile(log, failed_test_path_dir / name)
 
     async def is_manager_up(self) -> bool:
         """Check if Manager server is up"""
@@ -160,6 +190,16 @@ class ManagerClient():
         return [ServerInfo(ServerNum(int(info[0])), IPAddress(info[1]), IPAddress(info[2]))
                 for info in server_info_list]
 
+    async def all_servers(self) -> list[ServerInfo]:
+        """Get List of server info (id and IP address) of all servers"""
+        try:
+            server_info_list = await self.client.get_json("/cluster/all-servers")
+        except RuntimeError as exc:
+            raise Exception("Failed to get list of servers") from exc
+        assert isinstance(server_info_list, list), "all_servers got unknown data type"
+        return [ServerInfo(ServerNum(int(info[0])), IPAddress(info[1]), IPAddress(info[2]))
+                for info in server_info_list]
+
     async def mark_dirty(self) -> None:
         """Manually mark current cluster dirty.
            To be used when a server was modified outside of this API."""
@@ -183,18 +223,17 @@ class ManagerClient():
         data = {"expected_error": expected_error}
         await self.client.put_json(f"/cluster/server/{server_id}/start", data, timeout=timeout)
         await self.server_sees_others(server_id, wait_others, interval = wait_interval)
-        if self.cql:
-            self._driver_update()
-        else:
-            await self.driver_connect()
+        if expected_error is None:
+            if self.cql:
+                self._driver_update()
+            else:
+                await self.driver_connect()
 
     async def server_restart(self, server_id: ServerNum, wait_others: int = 0,
                              wait_interval: float = 45) -> None:
         """Restart specified server and optionally wait for it to learn of other servers"""
-        logger.debug("ManagerClient restarting %s", server_id)
-        await self.client.put_json(f"/cluster/server/{server_id}/restart")
-        await self.server_sees_others(server_id, wait_others, interval = wait_interval)
-        self._driver_update()
+        await self.server_stop_gracefully(server_id)
+        await self.server_start(server_id=server_id, wait_others=wait_others, wait_interval=wait_interval)
 
     async def rolling_restart(self, servers: List[ServerInfo], with_down: Optional[Callable[[ServerInfo], Awaitable[Any]]] = None):
         for idx, s in enumerate(servers):
@@ -239,6 +278,10 @@ class ManagerClient():
         """Delete all files for the given table from the data directory"""
         logger.debug("ManagerClient wiping sstables on %s, keyspace=%s, table=%s", server_id, keyspace, table)
         await self.client.put_json(f"/cluster/server/{server_id}/wipe_sstables", {"keyspace": keyspace, "table": table})
+
+    async def server_get_sstables_disk_usage(self, server_id: ServerNum, keyspace: str, table: str) -> int:
+        """Get the total size of all sstable files for the given table"""
+        return await self.client.get_json(f"/cluster/server/{server_id}/sstables_disk_usage", params={"keyspace": keyspace, "table": table})
 
     def _create_server_add_data(self, replace_cfg: Optional[ReplaceConfig],
                                 cmdline: Optional[List[str]],
@@ -294,10 +337,11 @@ class ManagerClient():
         except Exception as exc:
             raise RuntimeError(f"server_add got invalid server data {server_info}") from exc
         logger.debug("ManagerClient added %s", s_info)
-        if self.cql:
-            self._driver_update()
-        elif start:
-            await self.driver_connect()
+        if expected_error is None:
+            if self.cql:
+                self._driver_update()
+            elif start:
+                await self.driver_connect()
         return s_info
 
     async def servers_add(self, servers_num: int = 1,
@@ -306,7 +350,7 @@ class ManagerClient():
                           property_file: Optional[dict[str, Any]] = None,
                           start: bool = True,
                           seeds: Optional[List[IPAddress]] = None,
-                          expected_error: Optional[str] = None) -> [ServerInfo]:
+                          expected_error: Optional[str] = None) -> List[ServerInfo]:
         """Add new servers concurrently.
         This function can be called only if the cluster uses consistent topology changes, which support
         concurrent bootstraps. If your test does not fulfill this condition and you want to add multiple
@@ -334,10 +378,11 @@ class ManagerClient():
                 raise RuntimeError(f"servers_add got invalid server data {server_info}") from exc
 
         logger.debug("ManagerClient added %s", s_infos)
-        if self.cql:
-            self._driver_update()
-        elif start:
-            await self.driver_connect()
+        if expected_error is None:
+            if self.cql:
+                self._driver_update()
+            elif start:
+                await self.driver_connect()
         return s_infos
 
     async def remove_node(self, initiator_id: ServerNum, server_id: ServerNum,

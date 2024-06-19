@@ -7,17 +7,18 @@
  */
 
 #include <seastar/core/coroutine.hh>
-#include "test/lib/scylla_test_case.hh"
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
+#include "test/lib/eventually.hh"
+#include "test/lib/exception_utils.hh"
+#include "test/lib/scylla_test_case.hh"
+#include "test/lib/select_statement_utils.hh"
 #include "transport/messages/result_message.hh"
 #include "service/pager/paging_state.hh"
 #include "types/map.hh"
 #include "types/list.hh"
 #include "types/set.hh"
-#include "test/lib/exception_utils.hh"
 #include "cql3/statements/select_statement.hh"
-#include "test/lib/select_statement_utils.hh"
 #include "utils/error_injection.hh"
 
 using namespace std::chrono_literals;
@@ -1895,7 +1896,7 @@ SEASTAR_TEST_CASE(test_deleting_ghost_rows) {
                 mutation m(schema, partition_key::from_singular(*schema, pk));
                 auto& row = m.partition().clustered_row(*schema, clustering_key::from_exploded(*schema, {int32_type->decompose(8), int32_type->decompose(7)}));
                 row.apply(row_marker{api::new_timestamp()});
-                unsigned shard = t.shard_of(m);
+                unsigned shard = t.shard_for_reads(m.token());
                 if (shard == this_shard_id()) {
                     t.apply(m);
                 }

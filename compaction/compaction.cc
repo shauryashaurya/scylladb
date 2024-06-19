@@ -451,6 +451,7 @@ protected:
     uint64_t _compacting_data_file_size = 0;
     api::timestamp_type _compacting_max_timestamp = api::min_timestamp;
     uint64_t _estimated_partitions = 0;
+    double _estimated_droppable_tombstone_ratio = 0;
     uint64_t _bloom_filter_checks = 0;
     db::replay_position _rp;
     encoding_stats_collector _stats_collector;
@@ -524,9 +525,6 @@ protected:
         , _owned_ranges_checker(_owned_ranges ? std::optional<dht::incremental_owned_ranges_checker>(*_owned_ranges) : std::nullopt)
         , _progress_monitor(progress_monitor)
     {
-        for (auto& sst : _sstables) {
-            _stats_collector.update(sst->get_encoding_stats_for_compaction());
-        }
         std::unordered_set<run_id> ssts_run_ids;
         _contains_multi_fragment_runs = std::any_of(_sstables.begin(), _sstables.end(), [&ssts_run_ids] (shared_sstable& sst) {
             return !ssts_run_ids.insert(sst->run_identifier()).second;
@@ -609,7 +607,8 @@ protected:
         sstable_writer_config cfg = _table_s.configure_writer("garbage_collection");
         cfg.run_identifier = gc_run;
         cfg.monitor = monitor.get();
-        auto writer = sst->get_writer(*schema(), partitions_per_sstable(), cfg, get_encoding_stats());
+        uint64_t estimated_partitions = std::max(1UL, uint64_t(ceil(partitions_per_sstable() * _estimated_droppable_tombstone_ratio)));
+        auto writer = sst->get_writer(*schema(), estimated_partitions, cfg, get_encoding_stats());
         return compaction_writer(std::move(monitor), std::move(writer), std::move(sst));
     }
 
@@ -727,6 +726,7 @@ private:
         auto fully_expired = _table_s.fully_expired_sstables(_sstables, gc_clock::now());
         min_max_tracker<api::timestamp_type> timestamp_tracker;
 
+        double sum_of_estimated_droppable_tombstone_ratio = 0;
         _input_sstable_generations.reserve(_sstables.size());
         for (auto& sst : _sstables) {
             co_await coroutine::maybe_yield();
@@ -745,6 +745,7 @@ private:
                 log_debug("Fully expired sstable {} will be dropped on compaction completion", sst->get_filename());
                 continue;
             }
+            _stats_collector.update(sst->get_encoding_stats_for_compaction());
 
             _cdata.compaction_size += sst->data_size();
             // We also capture the sstable, so we keep it alive while the read isn't done
@@ -753,6 +754,7 @@ private:
             // for a better estimate for the number of partitions in the merged
             // sstable than just adding up the lengths of individual sstables.
             _estimated_partitions += sst->get_estimated_key_count();
+            sum_of_estimated_droppable_tombstone_ratio += sst->estimate_droppable_tombstone_ratio(gc_clock::now(), _table_s.get_tombstone_gc_state(), _schema);
             _compacting_data_file_size += sst->ondisk_data_size();
             _compacting_max_timestamp = std::max(_compacting_max_timestamp, sst->get_stats_metadata().max_timestamp);
             if (sst->originated_on_this_node().value_or(false) && sst_stats.position.shard_id() == this_shard_id()) {
@@ -764,6 +766,8 @@ private:
             log_debug("{} out of {} input sstables are fully expired sstables that will not be actually compacted",
                       _sstables.size() - ssts->size(), _sstables.size());
         }
+        // _estimated_droppable_tombstone_ratio could exceed 1.0 in certain cases, so limit it to 1.0.
+        _estimated_droppable_tombstone_ratio = std::min(1.0, sum_of_estimated_droppable_tombstone_ratio / ssts->size());
 
         _compacting = std::move(ssts);
 
@@ -1701,7 +1705,12 @@ public:
     }
 
     compaction_writer create_compaction_writer(const dht::decorated_key& dk) override {
-        auto shard = _sharder->shard_of(dk.token());
+        auto shards = _sharder->shard_for_writes(dk.token());
+        if (shards.size() != 1) {
+            // Resharding is not supposed to run on tablets, so this case does not have to be supported.
+            on_internal_error(clogger, fmt::format("Got {} shards for token {} in table {}.{}", shards.size(), dk.token(), _schema->ks_name(), _schema->cf_name()));
+        }
+        auto shard = shards[0];
         auto sst = _sstable_creator(shard);
         setup_new_sstable(sst);
 

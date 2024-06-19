@@ -66,7 +66,7 @@ void set_failure_detector(http_context& ctx, routes& r, gms::gossiper& g) {
         return g.container().invoke_on(0, [] (gms::gossiper& g) {
             std::map<sstring, sstring> nodes_status;
             g.for_each_endpoint_state([&] (const gms::inet_address& node, const gms::endpoint_state&) {
-                nodes_status.emplace(node.to_sstring(), g.is_alive(node) ? "UP" : "DOWN");
+                nodes_status.emplace(fmt::to_string(node), g.is_alive(node) ? "UP" : "DOWN");
             });
             return make_ready_future<json::json_return_type>(map_to_key_value<fd::mapper>(nodes_status));
         });
@@ -81,9 +81,9 @@ void set_failure_detector(http_context& ctx, routes& r, gms::gossiper& g) {
 
     fd::get_endpoint_state.set(r, [&g] (std::unique_ptr<request> req) {
         return g.container().invoke_on(0, [req = std::move(req)] (gms::gossiper& g) {
-            auto state = g.get_endpoint_state_ptr(gms::inet_address(req->param["addr"]));
+            auto state = g.get_endpoint_state_ptr(gms::inet_address(req->get_path_param("addr")));
             if (!state) {
-                return make_ready_future<json::json_return_type>(format("unknown endpoint {}", req->param["addr"]));
+                return make_ready_future<json::json_return_type>(format("unknown endpoint {}", req->get_path_param("addr")));
             }
             std::stringstream ss;
             g.append_endpoint_state(ss, *state);

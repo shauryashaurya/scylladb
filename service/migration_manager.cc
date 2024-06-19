@@ -110,10 +110,6 @@ void migration_manager::init_messaging_service()
 
     if (this_shard_id() == 0) {
         for (const gms::feature& feature : {
-                std::cref(_feat.view_virtual_columns),
-                std::cref(_feat.digest_insensitive_to_expiry),
-                std::cref(_feat.cdc),
-                std::cref(_feat.per_table_partitioners),
                 std::cref(_feat.table_digest_insensitive_to_expiry)}) {
             if (!feature) {
                 _feature_listeners.push_back(feature.when_enabled(reload_schema_in_bg));
@@ -163,7 +159,7 @@ void migration_manager::init_messaging_service()
             auto cm = co_await db::schema_tables::convert_schema_to_mutations(proxy, features);
             if (options->group0_snapshot_transfer) {
                 cm.emplace_back(co_await db::system_keyspace::get_group0_history(db));
-                if (proxy.local().local_db().get_config().check_experimental(db::experimental_features_t::feature::TABLETS)) {
+                if (proxy.local().local_db().get_config().enable_tablets()) {
                     for (auto&& m: co_await replica::read_tablet_mutations(db)) {
                         cm.emplace_back(std::move(m));
                     }
@@ -719,7 +715,7 @@ future<> prepare_new_column_family_announcement(std::vector<mutation>& mutations
 }
 
 future<std::vector<mutation>> prepare_column_family_update_announcement(storage_proxy& sp,
-        schema_ptr cfm, bool from_thrift, std::vector<view_ptr> view_updates, api::timestamp_type ts) {
+        schema_ptr cfm, std::vector<view_ptr> view_updates, api::timestamp_type ts) {
     warn(unimplemented::cause::VALIDATION);
 #if 0
     cfm.validate();
@@ -735,7 +731,7 @@ future<std::vector<mutation>> prepare_column_family_update_announcement(storage_
 
         auto mutations = co_await seastar::async([&] {
             // Can call notifier when it creates new indexes, so needs to run in Seastar thread
-            return db::schema_tables::make_update_table_mutations(db, keyspace, old_schema, cfm, ts, from_thrift);
+            return db::schema_tables::make_update_table_mutations(db, keyspace, old_schema, cfm, ts);
         });
         for (auto&& view : view_updates) {
             auto& old_view = keyspace->cf_meta_data().at(view->cf_name());
@@ -840,7 +836,7 @@ future<std::vector<mutation>> prepare_column_family_drop_announcement(storage_pr
         std::vector<mutation> drop_si_mutations;
         if (!schema->all_indices().empty()) {
             auto builder = schema_builder(schema).without_indexes();
-            drop_si_mutations = db::schema_tables::make_update_table_mutations(db, keyspace, schema, builder.build(), ts, false);
+            drop_si_mutations = db::schema_tables::make_update_table_mutations(db, keyspace, schema, builder.build(), ts);
         }
         auto mutations = db::schema_tables::make_drop_table_mutations(keyspace, schema, ts);
         mutations.insert(mutations.end(), std::make_move_iterator(drop_si_mutations.begin()), std::make_move_iterator(drop_si_mutations.end()));
@@ -887,7 +883,7 @@ future<std::vector<mutation>> prepare_new_view_announcement(storage_proxy& sp, v
         }
         mlogger.info("Create new view: {}", view);
         return seastar::async([&db, keyspace = std::move(keyspace), &sp, view = std::move(view), ts] {
-            auto mutations = db::schema_tables::make_create_view_mutations(keyspace, std::move(view), ts);
+            auto mutations = db::schema_tables::make_create_view_mutations(keyspace, view, ts);
             // We don't have a separate on_before_create_view() listener to
             // call. But a view is also a column family, and we need to call
             // the on_before_create_column_family listener - notably, to
@@ -958,18 +954,19 @@ future<> migration_manager::push_schema_mutation(const gms::inet_address& endpoi
     return _messaging.send_definitions_update(id, std::vector<frozen_mutation>{}, std::move(cm));
 }
 
+template<typename mutation_type>
 future<> migration_manager::announce_with_raft(std::vector<mutation> schema, group0_guard guard, std::string_view description) {
     assert(this_shard_id() == 0);
     auto schema_features = _feat.cluster_schema_features();
     auto adjusted_schema = db::schema_tables::adjust_schema_for_schema_features(std::move(schema), schema_features);
 
     auto group0_cmd = _group0_client.prepare_command(
-        schema_change{
-            .mutations{adjusted_schema.begin(), adjusted_schema.end()},
+        mutation_type {
+                .mutations{adjusted_schema.begin(), adjusted_schema.end()},
         },
         guard, std::move(description));
 
-    co_return co_await _group0_client.add_entry(std::move(group0_cmd), std::move(guard), &_as, raft_timeout{});
+    return _group0_client.add_entry(std::move(group0_cmd), std::move(guard), &_as);
 }
 
 future<> migration_manager::announce_without_raft(std::vector<mutation> schema, group0_guard guard) {
@@ -1031,6 +1028,7 @@ static void add_committed_by_group0_flag(std::vector<mutation>& schema, const gr
 }
 
 // Returns a future on the local application of the schema
+template<typename mutation_type>
 future<> migration_manager::announce(std::vector<mutation> schema, group0_guard guard, std::string_view description) {
     if (_feat.group0_schema_versioning) {
         schema.push_back(make_group0_schema_version_mutation(_storage_proxy.data_dictionary(), guard));
@@ -1038,11 +1036,20 @@ future<> migration_manager::announce(std::vector<mutation> schema, group0_guard 
     }
 
     if (guard.with_raft()) {
-        return announce_with_raft(std::move(schema), std::move(guard), std::move(description));
+        return announce_with_raft<mutation_type>(std::move(schema), std::move(guard), std::move(description));
     } else {
         return announce_without_raft(std::move(schema), std::move(guard));
     }
 }
+template
+future<> migration_manager::announce_with_raft<schema_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+template
+future<> migration_manager::announce_with_raft<topology_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+
+template
+future<> migration_manager::announce<schema_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+template
+future<> migration_manager::announce<topology_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
 
 future<group0_guard> migration_manager::start_group0_operation() {
     assert(this_shard_id() == 0);

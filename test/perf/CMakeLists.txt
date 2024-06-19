@@ -26,11 +26,13 @@ endfunction()
 add_library(test-perf STATIC)
 target_sources(test-perf
   PRIVATE
+    perf_alternator.cc
     perf_fast_forward.cc
     perf_row_cache_update.cc
     perf_simple_query.cc
     perf_sstable.cc
     perf_tablets.cc
+    tablet_load_balancing.cc
     perf.cc)
 target_include_directories(test-perf
   PUBLIC

@@ -223,7 +223,7 @@ private:
         future<> process_request() override;
         void handle_error(future<>&& f) override;
         void on_connection_close() override;
-        static std::tuple<net::inet_address, int, client_type> make_client_key(const service::client_state& cli_state);
+        static std::pair<net::inet_address, int> make_client_key(const service::client_state& cli_state);
         client_data make_client_data() const;
         const service::client_state& get_client_state() const { return _client_state; }
     private:
@@ -329,7 +329,7 @@ public:
     virtual void on_drop_aggregate(const sstring& ks_name, const sstring& aggregate_name) override;
 
     virtual void on_join_cluster(const gms::inet_address& endpoint) override;
-    virtual void on_leave_cluster(const gms::inet_address& endpoint) override;
+    virtual void on_leave_cluster(const gms::inet_address& endpoint, const locator::host_id& hid) override;
     virtual void on_up(const gms::inet_address& endpoint) override;
     virtual void on_down(const gms::inet_address& endpoint) override;
 };

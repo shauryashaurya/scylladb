@@ -43,7 +43,6 @@
 #include "utils/small_vector.hh"
 
 #include <boost/range/algorithm/equal.hpp>
-#include <boost/algorithm/clamp.hpp>
 #include <boost/version.hpp>
 #include <memory>
 #include <type_traits>
@@ -73,14 +72,14 @@ public:
     static constexpr size_t max_chunk_capacity() {
         return std::max(max_contiguous_allocation / sizeof(T), size_t(1));
     }
-private:
-    void reserve_for_push_back() {
-        if (_size == _capacity) {
-            do_reserve_for_push_back();
-        }
+    // Minimum number of T elements allocated in the first chunk.
+    static constexpr size_t min_chunk_capacity() {
+        return std::clamp(512 / sizeof(T), size_t(1), max_chunk_capacity());
     }
-    void do_reserve_for_push_back();
-    size_t make_room(size_t n, bool stop_after_one);
+private:
+    std::pair<chunk_ptr, size_t> get_chunk_before_emplace_back();
+    void set_chunk_after_emplace_back(std::pair<chunk_ptr, size_t>) noexcept;
+    void make_room(size_t n, bool stop_after_one);
     chunk_ptr new_chunk(size_t n);
     T* addr(size_t i) const {
         return &_chunks[i / max_chunk_capacity()][i % max_chunk_capacity()];
@@ -135,22 +134,31 @@ public:
     }
 
     void push_back(const T& x) {
-        reserve_for_push_back();
-        new (addr(_size)) T(x);
-        ++_size;
+        emplace_back(x);
     }
     void push_back(T&& x) {
-        reserve_for_push_back();
-        new (addr(_size)) T(std::move(x));
-        ++_size;
+        emplace_back(std::move(x));
     }
     template <typename... Args>
     T& emplace_back(Args&&... args) {
-        reserve_for_push_back();
-        auto& ret = *new (addr(_size)) T(std::forward<Args>(args)...);
+        pointer ret;
+        if (_capacity > _size) {
+            ret = new (addr(_size)) T(std::forward<Args>(args)...);
+        } else {
+            // Allocate an empty new chunk for the new element.
+            // It's ok to lose it if `new` below throws as
+            // there are still no side effects on existing elements.
+            auto x = get_chunk_before_emplace_back();
+            // Emplace the new element in the newly allocated chunk.
+            ret = new (x.first.get() + _size % max_chunk_capacity()) T(std::forward<Args>(args)...);
+            // Setting the new chunk back is noexcept,
+            // as throwing at this stage may lose data if emplacing used the move-constructor.
+            set_chunk_after_emplace_back(std::move(x));
+        }
         ++_size;
-        return ret;
+        return *ret;
     }
+
     void pop_back() {
         --_size;
         addr(_size)->~T();
@@ -174,22 +182,19 @@ public:
     ///
     /// Allows reserving the memory chunk-by-chunk, avoiding stalls when a lot of
     /// chunks are needed. To drive the reservation to completion, call this
-    /// repeatedly with the value returned from the previous call until it
-    /// returns 0, yielding between calls when necessary. Example usage:
+    /// repeatedly until the vector's capacity reaches the expected size, yielding
+    /// between calls when necessary. Example usage:
     ///
-    ///     return do_until([&size] { return !size; }, [&my_vector, &size] () mutable {
-    ///         size = my_vector.reserve_partial(size);
+    ///     return do_until([&my_vector, size] { return my_vector.capacity() == size; }, [&my_vector, size] () mutable {
+    ///         my_vector.reserve_partial(size);
     ///     });
     ///
     /// Here, `do_until()` takes care of yielding between iterations when
     /// necessary.
-    ///
-    /// \returns the memory that remains to be reserved
-    size_t reserve_partial(size_t n) {
+    void reserve_partial(size_t n) {
         if (n > _capacity) {
-            return make_room(n, true);
+            make_room(n, true);
         }
-        return 0;
     }
 
     size_t memory_size() const {
@@ -317,8 +322,17 @@ size_t chunked_vector<T, max_contiguous_allocation>::external_memory_usage() con
 template <typename T, size_t max_contiguous_allocation>
 chunked_vector<T, max_contiguous_allocation>::chunked_vector(const chunked_vector& x)
         : chunked_vector() {
-    reserve(x.size());
-    std::copy(x.begin(), x.end(), std::back_inserter(*this));
+    auto size = x.size();
+    reserve(size);
+    for (size_t i = 0; _size < size; ++i) {
+        const T* src = x._chunks[i].get();
+        T* dst = _chunks[i].get();
+        auto now = std::min(size - _size, max_chunk_capacity());
+        std::uninitialized_copy_n(src, now, dst);
+        // Update _size incrementally to let the destructor
+        // know how much data to destroy on exception
+        _size += now;
+    }
 }
 
 template <typename T, size_t max_contiguous_allocation>
@@ -343,9 +357,14 @@ chunked_vector<T, max_contiguous_allocation>::chunked_vector(Iterator begin, Ite
 }
 
 template <typename T, size_t max_contiguous_allocation>
-chunked_vector<T, max_contiguous_allocation>::chunked_vector(size_t n, const T& value) {
+chunked_vector<T, max_contiguous_allocation>::chunked_vector(size_t n, const T& value)
+        : chunked_vector() {
     reserve(n);
-    std::fill_n(std::back_inserter(*this), n, value);
+    for (auto cp = _chunks.begin(); _size < n; ++cp) {
+        auto now = std::min(n - _size, max_chunk_capacity());
+        std::uninitialized_fill_n(cp->get(), now, value);
+        _size += now;
+    }
 }
 
 
@@ -370,8 +389,10 @@ chunked_vector<T, max_contiguous_allocation>::operator=(chunked_vector&& x) noex
 template <typename T, size_t max_contiguous_allocation>
 chunked_vector<T, max_contiguous_allocation>::~chunked_vector() {
     if constexpr (!std::is_trivially_destructible_v<T>) {
-        for (auto i = size_t(0); i != _size; ++i) {
-            addr(i)->~T();
+        for (auto cp = _chunks.begin(); _size; ++cp) {
+            auto now = std::min(_size, max_chunk_capacity());
+            std::destroy_n(cp->get(), now);
+            _size -= now;
         }
     }
 }
@@ -389,16 +410,12 @@ chunked_vector<T, max_contiguous_allocation>::new_chunk(size_t n) {
 template <typename T, size_t max_contiguous_allocation>
 void
 chunked_vector<T, max_contiguous_allocation>::migrate(T* begin, T* end, T* result) {
-    while (begin != end) {
-        new (result) T(std::move(*begin));
-        begin->~T();
-        ++begin;
-        ++result;
-    }
+    std::uninitialized_move(begin, end, result);
+    std::destroy(begin, end);
 }
 
 template <typename T, size_t max_contiguous_allocation>
-size_t
+void
 chunked_vector<T, max_contiguous_allocation>::make_room(size_t n, bool stop_after_one) {
     // First, if the last chunk is below max_chunk_capacity(), enlarge it
 
@@ -430,22 +447,59 @@ chunked_vector<T, max_contiguous_allocation>::make_room(size_t n, bool stop_afte
         _capacity += now;
         stop = stop_after_one;
     }
-    return (n - _capacity);
 }
 
 template <typename T, size_t max_contiguous_allocation>
-void
-chunked_vector<T, max_contiguous_allocation>::do_reserve_for_push_back() {
+std::pair<typename chunked_vector<T, max_contiguous_allocation>::chunk_ptr, size_t> chunked_vector<T, max_contiguous_allocation>::get_chunk_before_emplace_back() {
+    // Allocate a new chunk that will either replace the first, non-full chunk
+    // or will be appended to the chunks list
+    size_t new_chunk_capacity;
     if (_capacity == 0) {
+        // This is the first allocation in the chunked_vector, therefore
         // allocate a bit of room in case utilization will be low
-        reserve(boost::algorithm::clamp(512 / sizeof(T), 1, max_chunk_capacity()));
+        new_chunk_capacity = min_chunk_capacity();
     } else if (_capacity < max_chunk_capacity() / 2) {
+        // We're expanding the first chunk now,
         // exponential increase when only one chunk to reduce copying
-        reserve(_capacity * 2);
+        new_chunk_capacity = _capacity * 2;
     } else {
+        // This case is for expanding the first chunk to max_chunk_capacity, or when adding more chunks, so
         // add a chunk at a time later, since no copying will take place
-        reserve((_capacity / max_chunk_capacity() + 1) * max_chunk_capacity());
+        new_chunk_capacity = max_chunk_capacity();
+        if (_chunks.capacity() == _chunks.size()) {
+            // Ensure place for the new chunk before emplacing the new element
+            // Since emplacing the new chunk_ptr into _chunks below must not throw.
+            _chunks.reserve(_chunks.size() * 2);
+        }
     }
+    return std::make_pair(new_chunk(new_chunk_capacity), new_chunk_capacity);
+}
+
+template <typename T, size_t max_contiguous_allocation>
+void chunked_vector<T, max_contiguous_allocation>::set_chunk_after_emplace_back(std::pair<chunk_ptr, size_t> x) noexcept {
+    auto new_chunk_ptr = std::move(x.first);
+    auto new_chunk_capacity = x.second;
+    // If the new chunk is replacing the first chunk, migrate the existing elements onto it.
+    // Otherwise, just append it to the _chunks vector.
+    // Note that this part must not throw, since we've already emplaced the new element into the
+    // vector. If we lose the new_chunk now, we might lose data if we the new element was move-constructed.
+    auto last_chunk_size = _size % max_chunk_capacity();
+    if (last_chunk_size) {
+        // We're reallocating the last chunk, so migrate the existing elements to the newly allocated chunk.
+        // This is safe since we require that the values are nothrow_move_constructible.
+        migrate(_chunks.back().get(), _chunks.back().get() + last_chunk_size, new_chunk_ptr.get());
+        _chunks.back() = std::move(new_chunk_ptr);
+    } else {
+        // If all (or none) of the existing chunks are full,
+        // the new chunk will contain only the emplaced element,
+        // and so we just need to append it to _chunks,
+        // without migrating any existing elements.
+        _chunks.emplace_back(std::move(new_chunk_ptr));
+    }
+    // `(_chunks.size() - 1) * max_chunk_capacity()` is the capacity of all chunks except the last chunk.
+    // If this is the first chunk - that part would be 0.
+    // Add to it the last chunk `new_chunk_capacity`.
+    _capacity = (_chunks.size() - 1) * max_chunk_capacity() + new_chunk_capacity;
 }
 
 template <typename T, size_t max_contiguous_allocation>

@@ -12,6 +12,8 @@
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/closeable.hh>
 
+#include <fmt/ranges.h>
+
 #include "mutation/mutation.hh"
 #include "mutation/mutation_fragment.hh"
 #include "readers/flat_mutation_reader_v2.hh"
@@ -22,6 +24,7 @@
 #include "replica/memtable.hh"
 #include "row_cache.hh"
 #include "mutation/mutation_rebuilder.hh"
+#include "utils/to_string.hh"
 
 #include "test/lib/simple_schema.hh"
 #include "test/lib/flat_mutation_reader_assertions.hh"

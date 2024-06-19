@@ -33,6 +33,7 @@ CREATE TABLE system.large_partitions (
     partition_size bigint,
     partition_key text,
     range_tombstones bigint,
+    dead_rows bigint,
     rows bigint,
     compaction_time timestamp,
     PRIMARY KEY ((keyspace_name, table_name), sstable_name, partition_size, partition_key)
@@ -275,7 +276,7 @@ Implemented by `cluster_status_table` in `db/system_keyspace.cc`.
 ## system.protocol_servers
 
 The list of all the client-facing data-plane protocol servers and listen addresses (if running).
-Equivalent of the `nodetool statusbinary` plus the `Thrift active` and `Native Transport active` fields from `nodetool info`.
+Equivalent of the `nodetool statusbinary` plus the `Native Transport active` fields from `nodetool info`.
 
 TODO: include control-plane diagnostics-plane protocols here too.
 

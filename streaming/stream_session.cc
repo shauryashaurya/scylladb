@@ -81,6 +81,11 @@ public:
     }
 };
 
+std::function<future<>(flat_mutation_reader_v2)>
+stream_manager::make_streaming_consumer(uint64_t estimated_partitions, stream_reason reason, service::frozen_topology_guard topo_guard) {
+    return streaming::make_streaming_consumer("streaming", _db, _view_builder, estimated_partitions, reason, is_offstrategy_supported(reason), topo_guard);
+}
+
 void stream_manager::init_messaging_service_handler(abort_source& as) {
     auto& ms = _ms.local();
 
@@ -116,7 +121,7 @@ void stream_manager::init_messaging_service_handler(abort_source& as) {
         auto reason = reason_opt ? *reason_opt: stream_reason::unspecified;
         service::frozen_topology_guard topo_guard = session.value_or(service::default_session_id);
         sslog.trace("Got stream_mutation_fragments from {} reason {}, session {}", from, int(reason), session);
-        if (!_sys_dist_ks.local_is_initialized() || !_view_update_generator.local_is_initialized()) {
+        if (!_view_builder.local_is_initialized()) {
             return make_exception_future<rpc::sink<int>>(std::runtime_error(format("Node {} is not fully initialized for streaming, try again later",
                     _db.local().get_token_metadata().get_topology().my_address())));
         }
@@ -200,7 +205,7 @@ void stream_manager::init_messaging_service_handler(abort_source& as) {
             //FIXME: discarded future.
             (void)mutation_writer::distribute_reader_and_consume_on_shards(s, sharder,
                 make_generating_reader_v1(s, permit, std::move(get_next_mutation_fragment)),
-                make_streaming_consumer("streaming", _db, _sys_dist_ks, _view_update_generator, estimated_partitions, reason, is_offstrategy_supported(reason), topo_guard),
+                make_streaming_consumer(estimated_partitions, reason, topo_guard),
                 std::move(op)
             ).then_wrapped([s, plan_id, from, sink, estimated_partitions, log_done, sh_ptr = std::move(sharder_ptr)] (future<uint64_t> f) mutable {
                 int32_t status = 0;

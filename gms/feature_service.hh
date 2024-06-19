@@ -81,18 +81,6 @@ public:
 
 public:
     gms::feature user_defined_functions { *this, "UDF"sv };
-    gms::feature md_sstable { *this, "MD_SSTABLE_FORMAT"sv };
-    gms::feature me_sstable { *this, "ME_SSTABLE_FORMAT"sv };
-    gms::feature view_virtual_columns { *this, "VIEW_VIRTUAL_COLUMNS"sv };
-    gms::feature digest_insensitive_to_expiry { *this, "DIGEST_INSENSITIVE_TO_EXPIRY"sv };
-    gms::feature cdc { *this, "CDC"sv };
-    gms::feature nonfrozen_udts { *this, "NONFROZEN_UDTS"sv };
-    gms::feature hinted_handoff_separate_connection { *this, "HINTED_HANDOFF_SEPARATE_CONNECTION"sv };
-    gms::feature lwt { *this, "LWT"sv };
-    gms::feature per_table_partitioners { *this, "PER_TABLE_PARTITIONERS"sv };
-    gms::feature per_table_caching { *this, "PER_TABLE_CACHING"sv };
-    gms::feature digest_for_null_values { *this, "DIGEST_FOR_NULL_VALUES"sv };
-    gms::feature correct_idx_token_in_secondary_index { *this, "CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX"sv };
     gms::feature alternator_streams { *this, "ALTERNATOR_STREAMS"sv };
     gms::feature alternator_ttl { *this, "ALTERNATOR_TTL"sv };
     gms::feature range_scan_data_variant { *this, "RANGE_SCAN_DATA_VARIANT"sv };
@@ -123,6 +111,7 @@ public:
     gms::feature aggregate_storage_options { *this, "AGGREGATE_STORAGE_OPTIONS"sv };
     gms::feature collection_indexing { *this, "COLLECTION_INDEXING"sv };
     gms::feature large_collection_detection { *this, "LARGE_COLLECTION_DETECTION"sv };
+    gms::feature range_tombstone_and_dead_rows_detection { *this, "RANGE_TOMBSTONE_AND_DEAD_ROWS_DETECTION"sv };
     gms::feature secondary_indexes_on_static_columns { *this, "SECONDARY_INDEXES_ON_STATIC_COLUMNS"sv };
     gms::feature tablets { *this, "TABLETS"sv };
     gms::feature uuid_sstable_identifiers { *this, "UUID_SSTABLE_IDENTIFIERS"sv };
@@ -136,6 +125,7 @@ public:
     // revert to the digest method when necessary (if we must perform a schema change during RECOVERY).
     gms::feature group0_schema_versioning { *this, "GROUP0_SCHEMA_VERSIONING"sv };
     gms::feature supports_consistent_topology_changes { *this, "SUPPORTS_CONSISTENT_TOPOLOGY_CHANGES"sv };
+    gms::feature host_id_based_hinted_handoff { *this, "HOST_ID_BASED_HINTED_HANDOFF"sv };
 
     // A feature just for use in tests. It must not be advertised unless
     // the "features_enable_test_feature" injection is enabled.

@@ -8,7 +8,8 @@
 
 #pragma once
 
-#include "seastar/core/timer.hh"
+#include <seastar/core/timer.hh>
+#include "seastar/core/future.hh"
 #include "seastarx.hh"
 #include "auth/role_manager.hh"
 #include <seastar/core/sstring.hh>
@@ -56,8 +57,9 @@ public:
     public:
         virtual future<qos::service_levels_info> get_service_levels() const = 0;
         virtual future<qos::service_levels_info> get_service_level(sstring service_level_name) const = 0;
-        virtual future<> set_service_level(sstring service_level_name, qos::service_level_options slo, std::optional<service::group0_guard> guard, abort_source& as) const = 0;
-        virtual future<> drop_service_level(sstring service_level_name, std::optional<service::group0_guard> guard, abort_source& as) const = 0;
+        virtual future<> set_service_level(sstring service_level_name, qos::service_level_options slo, service::group0_batch& mc) const = 0;
+        virtual future<> drop_service_level(sstring service_level_name, service::group0_batch& mc) const = 0;
+        virtual future<> commit_mutations(service::group0_batch&& mc, abort_source& as) const = 0;
 
         virtual bool is_v2() const = 0;
         // Returns v2(raft) data accessor. If data accessor is already a raft one, returns nullptr.
@@ -90,11 +92,14 @@ private:
     service_level _default_service_level;
     service_level_distributed_data_accessor_ptr _sl_data_accessor;
     sharded<auth::service>& _auth_service;
+    locator::shared_token_metadata& _token_metadata;
     std::chrono::time_point<seastar::lowres_clock> _last_successful_config_update;
     unsigned _logged_intervals;
     atomic_vector<qos_configuration_change_subscriber*> _subscribers;
+    optimized_optional<abort_source::subscription> _early_abort_subscription;
+    void do_abort() noexcept;
 public:
-    service_level_controller(sharded<auth::service>& auth_service, service_level_options default_service_level_config);
+    service_level_controller(sharded<auth::service>& auth_service, locator::shared_token_metadata& tm, abort_source& as, service_level_options default_service_level_config);
 
     /**
      * this function must be called *once* from any shard before any other functions are called.
@@ -131,12 +136,6 @@ public:
     future<> remove_service_level(sstring name, bool remove_static);
 
     /**
-     * stops the distributed updater
-     * @return a future that is resolved when the updates stopped
-     */
-    future<> drain();
-
-    /**
      * stops all ongoing operations if exists
      * @return a future that is resolved when all operations has stopped
      */
@@ -147,7 +146,7 @@ public:
     /**
      * Check the distributed data for changes in a constant interval and updates
      * the service_levels configuration in accordance (adds, removes, or updates
-     * service levels as necessairy).
+     * service levels as necessary).
      * @param interval_f - lambda function which returns a interval in milliseconds.
                            The interval is time to check the distributed data.
      * @return a future that is resolved when the update loop stops.
@@ -161,9 +160,9 @@ public:
     future<> update_service_levels_from_distributed_data();
 
 
-    future<> add_distributed_service_level(sstring name, service_level_options slo, bool if_not_exsists, std::optional<service::group0_guard> guard);
-    future<> alter_distributed_service_level(sstring name, service_level_options slo, std::optional<service::group0_guard> guard);
-    future<> drop_distributed_service_level(sstring name, bool if_exists, std::optional<service::group0_guard> guard);
+    future<> add_distributed_service_level(sstring name, service_level_options slo, bool if_not_exsists, service::group0_batch& mc);
+    future<> alter_distributed_service_level(sstring name, service_level_options slo, service::group0_batch& mc);
+    future<> drop_distributed_service_level(sstring name, bool if_exists, service::group0_batch& mc);
     future<service_levels_info> get_distributed_service_levels();
     future<service_levels_info> get_distributed_service_level(sstring service_level_name);
 
@@ -190,7 +189,12 @@ public:
         return sl_it->second;
     }
 
-public:
+    future<> commit_mutations(::service::group0_batch&& mc) {
+        if (_sl_data_accessor->is_v2()) {
+            return _sl_data_accessor->commit_mutations(std::move(mc), _global_controller_db->group0_aborter);
+        }
+        return make_ready_future();
+    }
 
     /**
      * Returns true if service levels module is running under raft
@@ -240,7 +244,7 @@ private:
         alter
     };
 
-    future<> set_distributed_service_level(sstring name, service_level_options slo, set_service_level_op_type op_type, std::optional<service::group0_guard> guard);
+    future<> set_distributed_service_level(sstring name, service_level_options slo, set_service_level_op_type op_type, service::group0_batch& mc);
 public:
 
     /**
@@ -259,7 +263,7 @@ public:
     static sstring default_service_level_name;
 
     virtual void on_join_cluster(const gms::inet_address& endpoint) override;
-    virtual void on_leave_cluster(const gms::inet_address& endpoint) override;
+    virtual void on_leave_cluster(const gms::inet_address& endpoint, const locator::host_id& hid) override;
     virtual void on_up(const gms::inet_address& endpoint) override;
     virtual void on_down(const gms::inet_address& endpoint) override;
 };

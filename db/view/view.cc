@@ -1625,25 +1625,26 @@ get_view_natural_endpoint(
         }
     }
 
+    auto& view_topology = view_erm->get_token_metadata_ptr()->get_topology();
     for (auto&& view_endpoint : view_erm->get_replicas(view_token)) {
         if (use_legacy_self_pairing) {
+            auto it = std::find(base_endpoints.begin(), base_endpoints.end(),
+                view_endpoint);
             // If this base replica is also one of the view replicas, we use
             // ourselves as the view replica.
-            if (view_endpoint == me) {
+            if (view_endpoint == me && it != base_endpoints.end()) {
                 return topology.my_address();
             }
             // We have to remove any endpoint which is shared between the base
             // and the view, as it will select itself and throw off the counts
             // otherwise.
-            auto it = std::find(base_endpoints.begin(), base_endpoints.end(),
-                view_endpoint);
             if (it != base_endpoints.end()) {
                 base_endpoints.erase(it);
-            } else if (!network_topology || topology.get_datacenter(view_endpoint) == my_datacenter) {
+            } else if (!network_topology || view_topology.get_datacenter(view_endpoint) == my_datacenter) {
                 view_endpoints.push_back(view_endpoint);
             }
         } else {
-            if (!network_topology || topology.get_datacenter(view_endpoint) == my_datacenter) {
+            if (!network_topology || view_topology.get_datacenter(view_endpoint) == my_datacenter) {
                 view_endpoints.push_back(view_endpoint);
             }
         }
@@ -1658,7 +1659,7 @@ get_view_natural_endpoint(
         return {};
     }
     auto replica = view_endpoints[base_it - base_endpoints.begin()];
-    return topology.get_node(replica).endpoint();
+    return view_topology.get_node(replica).endpoint();
 }
 
 static future<> apply_to_remote_endpoints(service::storage_proxy& proxy, locator::effective_replication_map_ptr ermp,
@@ -1715,6 +1716,7 @@ future<> view_update_generator::mutate_MV(
 {
     auto base_ermp = base->table().get_effective_replication_map();
     static constexpr size_t max_concurrent_updates = 128;
+    co_await utils::get_local_injector().inject("delay_before_get_view_natural_endpoint", 8000ms);
     co_await max_concurrent_for_each(view_updates, max_concurrent_updates,
             [this, base_token, &stats, &cf_stats, tr_state, &pending_view_updates, allow_hints, wait_for_all, base_ermp] (frozen_mutation_and_schema mut) mutable -> future<> {
         auto view_token = dht::get_token(*mut.s, mut.fm.key());
@@ -1777,8 +1779,10 @@ future<> view_update_generator::mutate_MV(
                     mut.s->ks_name(), mut.s->cf_name(), base_token, view_token);
             local_view_update = _proxy.local().mutate_mv_locally(mut.s, *mut_ptr, tr_state, db::commitlog::force_sync::no).then_wrapped(
                     [s = mut.s, &stats, &cf_stats, tr_state, base_token, view_token, my_address, mut_ptr = std::move(mut_ptr),
-                            sem_units] (future<>&& f) {
+                            sem_units, this] (future<>&& f) mutable {
                 --stats.writes;
+                sem_units = nullptr;
+                _proxy.local().update_view_update_backlog();
                 if (f.failed()) {
                     ++stats.view_updates_failed_local;
                     ++cf_stats.total_view_updates_failed_local;
@@ -1813,7 +1817,9 @@ future<> view_update_generator::mutate_MV(
             schema_ptr s = mut.s;
             future<> remote_view_update = apply_to_remote_endpoints(_proxy.local(), std::move(view_ermp), *target_endpoint, std::move(remote_endpoints), std::move(mut), base_token, view_token, allow_hints, tr_state).then_wrapped(
                 [s = std::move(s), &stats, &cf_stats, tr_state, base_token, view_token, target_endpoint, updates_pushed_remote,
-                 sem_units, apply_update_synchronously] (future<>&& f) mutable {
+                 sem_units, apply_update_synchronously, this] (future<>&& f) mutable {
+                sem_units = nullptr;
+                _proxy.local().update_view_update_backlog();
                 if (f.failed()) {
                     stats.view_updates_failed_remote += updates_pushed_remote;
                     cf_stats.total_view_updates_failed_remote += updates_pushed_remote;
@@ -1954,6 +1960,7 @@ future<> view_builder::drain() {
     _as.request_abort();
     co_await std::move(_started);
     co_await _mnotifier.unregister_listener(this);
+    co_await _vug.drain();
     co_await _sem.wait();
     _sem.broken();
     co_await _build_step.join();
@@ -2078,23 +2085,15 @@ void view_builder::setup_shard_build_step(
         std::vector<system_keyspace_view_build_progress> in_progress) {
     // Shard 0 makes cleanup changes to the system tables, but none that could conflict
     // with the other shards; everyone is thus able to proceed independently.
-    auto base_table_exists = [this] (const view_ptr& view) {
-        // This is a safety check in case this node missed a create MV statement
-        // but got a drop table for the base, and another node didn't get the
-        // drop notification and sent us the view schema.
-        try {
-            _db.find_schema(view->view_info()->base_id());
-            return true;
-        } catch (const replica::no_such_column_family&) {
-            return false;
-        }
-    };
     auto maybe_fetch_view = [&, this] (system_keyspace_view_name& name) {
         try {
             auto s = _db.find_schema(name.first, name.second);
             if (s->is_view()) {
                 auto view = view_ptr(std::move(s));
-                if (base_table_exists(view)) {
+                // This is a safety check in case this node missed a create MV statement
+                // but got a drop table for the base, and another node didn't get the
+                // drop notification and sent us the view schema.
+                if (_db.column_family_exists(view->view_info()->base_id())) {
                     return view;
                 }
             }
@@ -2140,17 +2139,6 @@ void view_builder::setup_shard_build_step(
 }
 
 future<> view_builder::calculate_shard_build_step(view_builder_init_state& vbi) {
-    auto base_table_exists = [this] (const view_ptr& view) {
-        // This is a safety check in case this node missed a create MV statement
-        // but got a drop table for the base, and another node didn't get the
-        // drop notification and sent us the view schema.
-        try {
-            _db.find_schema(view->view_info()->base_id());
-            return true;
-        } catch (const replica::no_such_column_family&) {
-            return false;
-        }
-    };
     std::unordered_set<table_id> loaded_views;
     if (vbi.status_per_shard.size() != smp::count) {
         reshard(std::move(vbi.status_per_shard), loaded_views);
@@ -2171,7 +2159,10 @@ future<> view_builder::calculate_shard_build_step(view_builder_init_state& vbi) 
 
     auto all_views = _db.get_views();
     auto is_new = [&] (const view_ptr& v) {
-        return base_table_exists(v) && !loaded_views.contains(v->id())
+        // This is a safety check in case this node missed a create MV statement
+        // but got a drop table for the base, and another node didn't get the
+        // drop notification and sent us the view schema.
+        return _db.column_family_exists(v->view_info()->base_id()) && !loaded_views.contains(v->id())
                 && !vbi.built_views.contains(v->id());
     };
     for (auto&& view : all_views | boost::adaptors::filtered(is_new)) {
@@ -2195,7 +2186,7 @@ view_builder::view_build_statuses(sstring keyspace, sstring view_name) const {
     topo.for_each_node([&] (const locator::node *node) {
         auto it = status.find(node->host_id());
         auto s = it != status.end() ? std::move(it->second) : "UNKNOWN";
-        status_map.emplace(node->endpoint().to_sstring(), std::move(s));
+        status_map.emplace(fmt::to_string(node->endpoint()), std::move(s));
     });
     co_return status_map;
 }
@@ -2581,6 +2572,20 @@ void view_builder::execute(build_step& step, exponential_backoff_retry r) {
     }).get();
 }
 
+future<> view_builder::mark_as_built(view_ptr view) {
+    return seastar::when_all_succeed(
+            _sys_ks.mark_view_as_built(view->ks_name(), view->cf_name()),
+            _sys_dist_ks.finish_view_build(view->ks_name(), view->cf_name())).discard_result();
+}
+
+future<> view_builder::mark_existing_views_as_built() {
+    assert(this_shard_id() == 0);
+    auto views = _db.get_views();
+    co_await coroutine::parallel_for_each(views, [this] (view_ptr& view) {
+        return mark_as_built(view);
+    });
+}
+
 future<> view_builder::maybe_mark_view_as_built(view_ptr view, dht::token next_token) {
     _built_views.emplace(view->id());
     vlogger.debug("Shard finished building view {}.{}", view->ks_name(), view->cf_name());
@@ -2600,9 +2605,7 @@ future<> view_builder::maybe_mark_view_as_built(view_ptr view, dht::token next_t
                 }
                 auto view = builder._db.find_schema(view_id);
                 vlogger.info("Finished building view {}.{}", view->ks_name(), view->cf_name());
-                return seastar::when_all_succeed(
-                        builder._sys_ks.mark_view_as_built(view->ks_name(), view->cf_name()),
-                        builder._sys_dist_ks.finish_view_build(view->ks_name(), view->cf_name())).then_unpack([&builder, view] {
+                return builder.mark_as_built(view_ptr(view)).then([&builder, view] {
                     // The view is built, so shard 0 can remove the entry in the build progress system table on
                     // behalf of all shards. It is guaranteed to have a higher timestamp than the per-shard entries.
                     return builder._sys_ks.remove_view_build_progress_across_all_shards(view->ks_name(), view->cf_name());
@@ -2625,8 +2628,12 @@ future<> view_builder::wait_until_built(const sstring& ks_name, const sstring& v
     });
 }
 
-update_backlog node_update_backlog::add_fetch(unsigned shard, update_backlog backlog) {
-    _backlogs[shard].backlog.store(backlog, std::memory_order_relaxed);
+void node_update_backlog::add(update_backlog backlog) {
+    _backlogs[this_shard_id()].backlog.store(backlog, std::memory_order_relaxed);
+    _backlogs[this_shard_id()].need_publishing = need_publishing::yes;
+}
+
+update_backlog node_update_backlog::fetch() {
     auto now = clock::now();
     if (now >= _last_update.load(std::memory_order_relaxed) + _interval) {
         _last_update.store(now, std::memory_order_relaxed);
@@ -2639,13 +2646,33 @@ update_backlog node_update_backlog::add_fetch(unsigned shard, update_backlog bac
         _max.store(new_max, std::memory_order_relaxed);
         return new_max;
     }
-    return std::max(backlog, _max.load(std::memory_order_relaxed));
+    return std::max(fetch_shard(this_shard_id()), _max.load(std::memory_order_relaxed));
 }
 
-future<bool> check_view_build_ongoing(db::system_distributed_keyspace& sys_dist_ks, const locator::token_metadata& tm, const sstring& ks_name,
-        const sstring& cf_name) {
+future<std::optional<update_backlog>> node_update_backlog::fetch_if_changed() {
+    _last_update.store(clock::now(), std::memory_order_relaxed);
+    auto [np, max] = co_await map_reduce(boost::irange(0u, smp::count),
+            [this] (shard_id shard) {
+                return smp::submit_to(shard, [this, shard] {
+                    // Even if the shard's backlog didn't change, we still need to take it into account when calculating the new max.
+                    return std::make_pair(std::exchange(_backlogs[shard].need_publishing, need_publishing::no), fetch_shard(shard));
+                });
+            },
+            std::make_pair(need_publishing::no, db::view::update_backlog()),
+            [] (std::pair<need_publishing, db::view::update_backlog> a, std::pair<need_publishing, db::view::update_backlog> b) {
+                return std::make_pair(a.first || b.first, std::max(a.second, b.second));
+            });
+    _max.store(max, std::memory_order_relaxed);
+    co_return np ? std::make_optional(max) : std::nullopt;
+}
+
+update_backlog node_update_backlog::fetch_shard(unsigned shard) {
+    return _backlogs[shard].backlog.load(std::memory_order_relaxed);
+}
+
+future<bool> view_builder::check_view_build_ongoing(const locator::token_metadata& tm, const sstring& ks_name, const sstring& cf_name) {
     using view_statuses_type = std::unordered_map<locator::host_id, sstring>;
-    return sys_dist_ks.view_status(ks_name, cf_name).then([&tm] (view_statuses_type&& view_statuses) {
+    return _sys_dist_ks.view_status(ks_name, cf_name).then([&tm] (view_statuses_type&& view_statuses) {
         return boost::algorithm::any_of(view_statuses, [&tm] (const view_statuses_type::value_type& view_status) {
             // Only consider status of known hosts.
             return view_status.second == "STARTED" && tm.get_endpoint_for_host_id_if_known(view_status.first);
@@ -2653,17 +2680,20 @@ future<bool> check_view_build_ongoing(db::system_distributed_keyspace& sys_dist_
     });
 }
 
-future<bool> check_needs_view_update_path(db::system_distributed_keyspace& sys_dist_ks, const locator::token_metadata& tm, const replica::table& t,
-        streaming::stream_reason reason) {
+future<> view_builder::register_staging_sstable(sstables::shared_sstable sst, lw_shared_ptr<replica::table> table) {
+    return _vug.register_staging_sstable(std::move(sst), std::move(table));
+}
+
+future<bool> check_needs_view_update_path(view_builder& vb, const locator::token_metadata& tm, const replica::table& t, streaming::stream_reason reason) {
     if (is_internal_keyspace(t.schema()->ks_name())) {
         return make_ready_future<bool>(false);
     }
     if (reason == streaming::stream_reason::repair && !t.views().empty()) {
         return make_ready_future<bool>(true);
     }
-    return do_with(t.views(), [&sys_dist_ks, &tm] (auto& views) {
+    return do_with(t.views(), [&vb, &tm] (auto& views) {
         return map_reduce(views,
-                [&sys_dist_ks, &tm] (const view_ptr& view) { return check_view_build_ongoing(sys_dist_ks, tm, view->ks_name(), view->cf_name()); },
+                [&vb, &tm] (const view_ptr& view) { return vb.check_view_build_ongoing(tm, view->ks_name(), view->cf_name()); },
                 false,
                 std::logical_or<bool>());
     });
@@ -2779,5 +2809,23 @@ void delete_ghost_rows_visitor::accept_new_row(const clustering_key& ck, const q
     }
 }
 
+std::chrono::microseconds calculate_view_update_throttling_delay(db::view::update_backlog backlog,
+                                                                 db::timeout_clock::time_point timeout) {
+    constexpr auto delay_limit_us = 1000000;
+    auto adjust = [] (float x) { return x * x * x; };
+    auto budget = std::max(service::storage_proxy::clock_type::duration(0),
+        timeout - service::storage_proxy::clock_type::now());
+    std::chrono::microseconds ret(uint32_t(adjust(backlog.relative_size()) * delay_limit_us));
+    // "budget" has millisecond resolution and can potentially be long
+    // in the future so converting it to microseconds may overflow.
+    // So to compare buget and ret we need to convert both to the lower
+    // resolution.
+    if (std::chrono::duration_cast<service::storage_proxy::clock_type::duration>(ret) < budget) {
+        return ret;
+    } else {
+        // budget is small (< ret) so can be converted to microseconds
+        return std::chrono::duration_cast<std::chrono::microseconds>(budget);
+    }
+}
 } // namespace view
 } // namespace db

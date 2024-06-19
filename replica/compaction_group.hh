@@ -8,6 +8,7 @@
 
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/rwlock.hh>
 
 #include "database_fwd.hh"
 #include "compaction/compaction_descriptor.hh"
@@ -147,8 +148,8 @@ public:
     const lw_shared_ptr<sstables::sstable_set>& maintenance_sstables() const noexcept;
     void set_maintenance_sstables(lw_shared_ptr<sstables::sstable_set> new_maintenance_sstables);
 
-    // Makes a compound set, which includes main and maintenance sets
-    lw_shared_ptr<sstables::sstable_set> make_compound_sstable_set() const;
+    // Makes a sstable set, which includes all sstables managed by this group
+    lw_shared_ptr<sstables::sstable_set> make_sstable_set() const;
 
     const std::vector<sstables::shared_sstable>& compacted_undeleted_sstables() const noexcept;
     // Triggers regular compaction.
@@ -222,7 +223,10 @@ public:
     future<> split(compaction_group_list&, sstables::compaction_type_options::split opt);
 
     // Make an sstable set spanning all sstables in the storage_group
-    lw_shared_ptr<sstables::sstable_set> make_sstable_set() const;
+    lw_shared_ptr<const sstables::sstable_set> make_sstable_set() const;
+
+    // Flush all memtables.
+    future<> flush() noexcept;
 };
 
 using storage_group_map = absl::flat_hash_map<size_t, std::unique_ptr<storage_group>, absl::Hash<size_t>>;
@@ -233,9 +237,15 @@ protected:
     // The list entries are unlinked automatically when the storage group, they belong to, is removed.
     compaction_group_list _compaction_groups;
     storage_group_map _storage_groups;
-
+    // Prevents _storage_groups from having its elements inserted or deleted while other layer iterates
+    // over them (or over _compaction_groups).
+    seastar::rwlock _lock;
 public:
     virtual ~storage_group_manager();
+
+    seastar::rwlock& get_rwlock() noexcept {
+        return _lock;
+    }
 
     const compaction_group_list& compaction_groups() const noexcept {
         return _compaction_groups;
@@ -244,33 +254,28 @@ public:
         return _compaction_groups;
     }
 
-    const storage_group_map& storage_groups() const noexcept {
-        return _storage_groups;
-    }
-    storage_group_map& storage_groups() noexcept {
-        return _storage_groups;
-    }
-    // FIXME: Cannot return nullptr, signature can be changed to return storage_group&.
-    storage_group* storage_group_for_id(const schema_ptr&, size_t i) const;
-
-    compaction_group* single_compaction_group_if_available() noexcept {
-        return _compaction_groups.size() == 1 ? &_compaction_groups.front() : nullptr;
-    }
+    future<> for_each_storage_group_gently(std::function<future<>(size_t, storage_group&)> f);
+    void for_each_storage_group(std::function<void(size_t, storage_group&)> f) const;
+    void remove_storage_group(size_t id);
+    storage_group& storage_group_for_id(const schema_ptr&, size_t i) const;
 
     // Caller must keep the current effective_replication_map_ptr valid
     // until the storage_group_manager finishes update_effective_replication_map
-    virtual future<> update_effective_replication_map(const locator::effective_replication_map& erm) = 0;
+    //
+    // refresh_mutation_source must be called when there are changes to data source
+    // structures but logical state of data is not changed (e.g. when state for a
+    // new tablet replica is allocated).
+    virtual future<> update_effective_replication_map(const locator::effective_replication_map& erm, noncopyable_function<void()> refresh_mutation_source) = 0;
 
     virtual compaction_group& compaction_group_for_token(dht::token token) const noexcept = 0;
     virtual utils::chunked_vector<compaction_group*> compaction_groups_for_token_range(dht::token_range tr) const = 0;
     virtual compaction_group& compaction_group_for_key(partition_key_view key, const schema_ptr& s) const noexcept = 0;
     virtual compaction_group& compaction_group_for_sstable(const sstables::shared_sstable& sst) const noexcept = 0;
 
-    virtual std::pair<size_t, locator::tablet_range_side> storage_group_of(dht::token) const = 0;
     virtual size_t log2_storage_groups() const = 0;
-    virtual storage_group* storage_group_for_token(dht::token) const noexcept = 0;
+    virtual storage_group& storage_group_for_token(dht::token) const noexcept = 0;
 
-    virtual locator::resize_decision::seq_number_t split_ready_seq_number() const noexcept = 0;
+    virtual locator::table_load_stats table_load_stats(std::function<bool(const locator::tablet_map&, locator::global_tablet_id)> tablet_filter) const noexcept = 0;
     virtual bool all_storage_groups_split() = 0;
     virtual future<> split_all_storage_groups() = 0;
     virtual future<> maybe_split_compaction_group_of(size_t idx) = 0;

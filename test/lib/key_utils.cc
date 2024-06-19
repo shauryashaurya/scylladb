@@ -9,7 +9,6 @@
 #include "test/lib/key_utils.hh"
 #include "test/lib/random_schema.hh"
 #include "test/lib/random_utils.hh"
-#include "test/lib/test_utils.hh"
 #include "dht/i_partitioner.hh"
 
 namespace tests {
@@ -106,5 +105,14 @@ clustering_key generate_clustering_key(schema_ptr s, bool allow_prefix, std::opt
     auto&& keys = generate_clustering_keys(1, std::move(s), allow_prefix, size);
     return std::move(keys.front());
 }
+
+__attribute__((no_sanitize("undefined")))
+int64_t d2t(double d) {
+    // Double to unsigned long conversion will overflow if the
+    // input is greater than numeric_limits<long>::max(), so divide by two and
+    // multiply again later.
+    auto scale = std::numeric_limits<unsigned long>::max();
+    return static_cast<unsigned long>(d * static_cast<double>(scale >> 1)) << 1;
+};
 
 } // namespace tests

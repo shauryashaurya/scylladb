@@ -70,6 +70,9 @@ namespace db {
 class system_distributed_keyspace;
 class system_keyspace;
 class batchlog_manager;
+namespace view {
+class view_builder;
+}
 }
 
 namespace netw {
@@ -179,6 +182,9 @@ private:
                                  sstring op_name,
                                  std::function<future<>(locator::tablet_metadata_guard&)> op);
     future<> stream_tablet(locator::global_tablet_id);
+    // Clones storage of leaving tablet into pending one. Done in the context of intra-node migration,
+    // when both of which sit on the same node. So all the movement is local.
+    future<> clone_locally_tablet_storage(locator::global_tablet_id, locator::tablet_replica leaving, locator::tablet_replica pending);
     future<> cleanup_tablet(locator::global_tablet_id);
     inet_address host2ip(locator::host_id) const;
     // Handler for table load stats RPC.
@@ -203,8 +209,10 @@ public:
         sharded<locator::snitch_ptr>& snitch,
         sharded<service::tablet_allocator>& tablet_allocator,
         sharded<cdc::generation_service>& cdc_gs,
+        sharded<db::view::view_builder>& view_builder,
         cql3::query_processor& qp,
-        sharded<qos::service_level_controller>& sl_controller);
+        sharded<qos::service_level_controller>& sl_controller,
+        topology_state_machine& topology_state_machine);
 
     // Needed by distributed<>
     future<> stop();
@@ -322,9 +330,7 @@ public:
     // should only be called via JMX
     future<bool> is_gossip_running();
 
-    void register_protocol_server(protocol_server& server) {
-        _protocol_servers.push_back(&server);
-    }
+    future<> register_protocol_server(protocol_server& server, bool start_instantly = false);
 
     // All pointers are valid.
     const std::vector<protocol_server*>& protocol_servers() const {
@@ -391,8 +397,6 @@ public:
 
 private:
     void set_mode(mode m);
-    // Can only be called on shard-0
-    future<> mark_existing_views_as_built();
 
     // Stream data for which we become a new replica.
     // Before that, if we're not replacing another node, inform other nodes about our chosen tokens
@@ -429,6 +433,15 @@ public:
      * @return a map of tokens to endpoints in ascending order
      */
     std::map<token, inet_address> get_token_to_endpoint_map();
+
+    /**
+     * Retrieve a map of tablet tokens to endpoints.
+     *
+     * Tablet variant of get_token_to_endpoint_map().
+     *
+     * @return a map of tablet tokens to endpoints in ascending order
+     */
+    future<std::map<token, inet_address>> get_tablet_to_endpoint_map(table_id table);
 
     /**
      * Construct the range to endpoint mapping based on the true view
@@ -513,6 +526,7 @@ private:
     locator::snitch_signal_slot_t _snitch_reconfigure;
     sharded<service::tablet_allocator>& _tablet_allocator;
     sharded<cdc::generation_service>& _cdc_gens;
+    sharded<db::view::view_builder>& _view_builder;
 private:
     /**
      * Handle node bootstrap
@@ -546,8 +560,10 @@ private:
     future<> handle_state_removed(inet_address endpoint, std::vector<sstring> pieces, gms::permit_id);
 
 private:
-    future<> excise(std::unordered_set<token> tokens, inet_address endpoint, gms::permit_id);
-    future<> excise(std::unordered_set<token> tokens, inet_address endpoint, long expire_time, gms::permit_id);
+    future<> excise(std::unordered_set<token> tokens, inet_address endpoint_ip, locator::host_id endpoint_hid,
+            gms::permit_id);
+    future<> excise(std::unordered_set<token> tokens, inet_address endpoint_ip, locator::host_id endpoint_hid,
+            long expire_time, gms::permit_id);
 
     /** unlike excise we just need this endpoint gone without going through any notifications **/
     future<> remove_endpoint(inet_address endpoint, gms::permit_id pid);
@@ -728,12 +744,18 @@ public:
             return func(ss);
         });
     }
+
+    template <typename Func>
+    auto run_with_api_lock_conditionally(sstring operation, bool lock, Func&& func) {
+        return lock ? run_with_api_lock(std::move(operation), std::forward<Func>(func)) : run_with_no_api_lock(std::forward<Func>(func));
+    }
+
 private:
     void do_isolate_on_error(disk_error type);
     future<> isolate();
 
     future<> notify_down(inet_address endpoint);
-    future<> notify_left(inet_address endpoint);
+    future<> notify_left(inet_address endpoint, locator::host_id hid);
     future<> notify_up(inet_address endpoint);
     future<> notify_joined(inet_address endpoint);
     future<> notify_cql_change(inet_address endpoint, bool ready);
@@ -795,8 +817,13 @@ private:
     // coordinator fiber
     future<> raft_state_monitor_fiber(raft::server&, sharded<db::system_distributed_keyspace>& sys_dist_ks);
 
+public:
+    bool topology_global_queue_empty() const {
+        return !_topology_state_machine._topology.global_request.has_value();
+    }
+private:
      // State machine that is responsible for topology change
-    topology_state_machine _topology_state_machine;
+    topology_state_machine& _topology_state_machine;
 
     future<> _topology_change_coordinator = make_ready_future<>();
     future<> topology_change_coordinator_fiber(raft::server&, raft::term_t, cdc::generation_service&, sharded<db::system_distributed_keyspace>&, abort_source&);
@@ -862,6 +889,7 @@ public:
     future<> add_tablet_replica(table_id, dht::token, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
     future<> del_tablet_replica(table_id, dht::token, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
     future<> set_tablet_balancing_enabled(bool);
+    future<> await_topology_quiesced();
 
     // In the maintenance mode, other nodes won't be available thus we disabled joining
     // the token ring and the token metadata won't be populated with the local node's endpoint.
@@ -871,13 +899,28 @@ public:
     // It is incompatible with the `join_cluster` method.
     future<> start_maintenance_mode();
 
+    // Waits for a topology request with a given ID to complete and return non empty error string
+    // if request completes with an error
+    future<sstring> wait_for_topology_request_completion(utils::UUID id);
+    future<> wait_for_topology_not_busy();
+
 private:
     future<std::vector<canonical_mutation>> get_system_mutations(schema_ptr schema);
     future<std::vector<canonical_mutation>> get_system_mutations(const sstring& ks_name, const sstring& cf_name);
+
+    struct nodes_to_notify_after_sync {
+        std::vector<std::pair<gms::inet_address, locator::host_id>> left;
+        std::vector<gms::inet_address> joined;
+    };
+
     // Synchronizes the local node state (token_metadata, system.peers/system.local tables,
     // gossiper) to align it with the other raft topology nodes.
     // Optional target_node can be provided to restrict the synchronization to the specified node.
-    future<> sync_raft_topology_nodes(mutable_token_metadata_ptr tmptr, std::optional<locator::host_id> target_node, std::unordered_set<raft::server_id> prev_normal);
+    // Returns a structure that describes which notifications to trigger after token metadata is updated.
+    future<nodes_to_notify_after_sync> sync_raft_topology_nodes(mutable_token_metadata_ptr tmptr, std::optional<locator::host_id> target_node, std::unordered_set<raft::server_id> prev_normal);
+    // Triggers notifications (on_joined, on_left) based on the recent changes to token metadata, as described by the passed in structure.
+    // This function should be called on the result of `sync_raft_topology_nodes`, after the global token metadata is updated.
+    future<> notify_nodes_after_sync(nodes_to_notify_after_sync&& nodes_to_notify);
     // load topology state machine snapshot into memory
     // raft_group0_client::_read_apply_mutex must be held
     future<> topology_state_load();
@@ -897,9 +940,6 @@ private:
 
     future<> _sstable_cleanup_fiber = make_ready_future<>();
     future<> sstable_cleanup_fiber(raft::server& raft, sharded<service::storage_proxy>& proxy) noexcept;
-    // Waits for a topology request with a given ID to complete and return non empty error string
-    // if request completes with an error
-    future<sstring> wait_for_topology_request_completion(utils::UUID id);
 
     // We need to be able to abort all group0 operation during shutdown, so we need special abort source for that
     abort_source _group0_as;

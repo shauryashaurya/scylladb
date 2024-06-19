@@ -78,10 +78,13 @@ public:
     ~view_update_generator();
 
     future<> start();
+    future<> drain();
     future<> stop();
     future<> register_staging_sstable(sstables::shared_sstable sst, lw_shared_ptr<replica::table> table);
 
     replica::database& get_db() noexcept { return _db; }
+
+    const sharded<service::storage_proxy>& get_storage_proxy() const noexcept { return _proxy; };
 
 private:
     future<> mutate_MV(
@@ -113,7 +116,8 @@ public:
             mutation&& m,
             flat_mutation_reader_v2_opt existings,
             tracing::trace_state_ptr tr_state,
-            gc_clock::time_point now);
+            gc_clock::time_point now,
+            db::timeout_clock::time_point timeout);
 
 private:
     bool should_throttle() const;

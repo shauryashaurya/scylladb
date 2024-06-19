@@ -1251,7 +1251,7 @@ future<executor::request_return_type> executor::update_table(client_state& clien
 
         auto schema = builder.build();
 
-        auto m = co_await service::prepare_column_family_update_announcement(p.local(), schema, false,  std::vector<view_ptr>(), group0_guard.write_timestamp());
+        auto m = co_await service::prepare_column_family_update_announcement(p.local(), schema,  std::vector<view_ptr>(), group0_guard.write_timestamp());
 
         co_await mm.announce(std::move(m), std::move(group0_guard), format("alternator-executor: update {} table", tab->cf_name()));
 
@@ -4576,7 +4576,7 @@ static lw_shared_ptr<keyspace_metadata> create_keyspace_metadata(std::string_vie
     // used by default on new Alternator tables. Change this initialization
     // to 0 enable tablets by default, with automatic number of tablets.
     std::optional<unsigned> initial_tablets;
-    if (sp.get_db().local().get_config().check_experimental(db::experimental_features_t::feature::TABLETS)) {
+    if (sp.get_db().local().get_config().enable_tablets()) {
         auto it = tags_map.find(INITIAL_TABLETS_TAG_KEY);
         if (it != tags_map.end()) {
             // Tag set. If it's a valid number, use it. If not - e.g., it's

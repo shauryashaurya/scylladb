@@ -240,10 +240,9 @@ future<> view_update_backlog_broker::start() {
         // Gossiper runs only on shard 0, and there's no API to add multiple, per-shard application states.
         // Also, right now we aggregate all backlogs, since the coordinator doesn't keep per-replica shard backlogs.
         _started = seastar::async([this] {
-            std::optional<db::view::update_backlog> backlog_published;
             while (!_as.abort_requested()) {
-                auto backlog = _sp.local().get_view_update_backlog();
-                if (backlog_published && *backlog_published == backlog) {
+                auto backlog = _sp.local().get_view_update_backlog_if_changed().get();
+                if (!backlog) {
                     sleep_abortable(gms::gossiper::INTERVAL, _as).get();
                     continue;
                 }
@@ -252,8 +251,7 @@ future<> view_update_backlog_broker::start() {
                 //FIXME: discarded future.
                 (void)_gossiper.add_local_application_state(
                         gms::application_state::VIEW_BACKLOG,
-                        gms::versioned_value(seastar::format("{}:{}:{}", backlog.current, backlog.max, now)));
-                backlog_published = backlog;
+                        gms::versioned_value(seastar::format("{}:{}:{}", backlog->current, backlog->max, now)));
                 sleep_abortable(gms::gossiper::INTERVAL, _as).get();
             }
         }).handle_exception_type([] (const seastar::sleep_aborted& ignored) { });
@@ -276,25 +274,29 @@ future<> view_update_backlog_broker::on_change(gms::inet_address endpoint, const
         const char* start_bound = value.value().data();
         char* end_bound;
         for (auto* ptr : {&current, &max}) {
+            errno = 0;
             *ptr = std::strtoull(start_bound, &end_bound, 10);
-            if (*ptr == ULLONG_MAX) {
-                return make_ready_future();;
+            if (errno == ERANGE) {
+                return make_ready_future();
             }
             start_bound = end_bound + 1;
         }
         if (max == 0) {
             return make_ready_future();
         }
+        errno = 0;
         ticks = std::strtoll(start_bound, &end_bound, 10);
-        if (ticks == 0 || ticks == LLONG_MAX || end_bound != value.value().data() + value.value().size()) {
+        if (ticks == 0 || errno == ERANGE || end_bound != value.value().data() + value.value().size()) {
             return make_ready_future();
         }
         auto backlog = view_update_backlog_timestamped{db::view::update_backlog{current, max}, ticks};
-        auto[it, inserted] = _sp.local()._view_update_backlogs.try_emplace(endpoint, std::move(backlog));
-        if (!inserted && it->second.ts < backlog.ts) {
-            it->second = std::move(backlog);
-        }
-        return make_ready_future();
+        return _sp.invoke_on_all([endpoint, backlog] (service::storage_proxy& sp) {
+            auto[it, inserted] = sp._view_update_backlogs.try_emplace(endpoint, backlog);
+            if (!inserted && it->second.ts < backlog.ts) {
+                it->second = backlog;
+            }
+            return make_ready_future();
+        });
     });
 }
 

@@ -13,7 +13,6 @@
 #include "utils/lister.hh"
 #include "replica/database.hh"
 #include <seastar/core/future-util.hh>
-#include "db/system_auth_keyspace.hh"
 #include "db/system_keyspace.hh"
 #include "db/system_keyspace_sstables_registry.hh"
 #include "db/system_distributed_keyspace.hh"
@@ -39,6 +38,7 @@
 #include <boost/range/algorithm/min_element.hpp>
 #include <boost/container/static_vector.hpp>
 #include "mutation/frozen_mutation.hh"
+#include "mutation/async_utils.hh"
 #include <seastar/core/do_with.hh>
 #include "service/migration_listener.hh"
 #include "cell_locking.hh"
@@ -75,6 +75,8 @@
 #include "replica/exceptions.hh"
 #include "readers/multi_range.hh"
 #include "readers/multishard.hh"
+
+#include <algorithm>
 
 using namespace std::chrono_literals;
 using namespace db;
@@ -311,7 +313,7 @@ public:
 };
 
 database::database(const db::config& cfg, database_config dbcfg, service::migration_notifier& mn, gms::feature_service& feat, const locator::shared_token_metadata& stm,
-        compaction_manager& cm, sstables::storage_manager& sstm, wasm::manager& wasm, sstables::directory_semaphore& sst_dir_sem, utils::cross_shard_barrier barrier)
+        compaction_manager& cm, sstables::storage_manager& sstm, lang::manager& langm, sstables::directory_semaphore& sst_dir_sem, utils::cross_shard_barrier barrier)
     : _stats(make_lw_shared<db_stats>())
     , _user_types(std::make_shared<db_user_types_storage>(*this))
     , _cl_stats(std::make_unique<cell_locker_stats>())
@@ -338,7 +340,7 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
     // No timeouts or queue length limits - a failure here can kill an entire repair.
     // Trust the caller to limit concurrency.
     , _streaming_concurrency_sem(
-            max_count_streaming_concurrent_reads,
+            _cfg.maintenance_reader_concurrency_semaphore_count_limit,
             max_memory_streaming_concurrent_reads(),
             "streaming",
             std::numeric_limits<size_t>::max(),
@@ -371,14 +373,14 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
               _cfg.compaction_rows_count_warning_threshold,
               _cfg.compaction_collection_elements_count_warning_threshold))
     , _nop_large_data_handler(std::make_unique<db::nop_large_data_handler>())
-    , _user_sstables_manager(std::make_unique<sstables::sstables_manager>("user", *_large_data_handler, _cfg, feat, _row_cache_tracker, dbcfg.available_memory, sst_dir_sem, [&stm]{ return stm.get()->get_my_id(); }, &sstm))
-    , _system_sstables_manager(std::make_unique<sstables::sstables_manager>("system", *_nop_large_data_handler, _cfg, feat, _row_cache_tracker, dbcfg.available_memory, sst_dir_sem, [&stm]{ return stm.get()->get_my_id(); }))
+    , _user_sstables_manager(std::make_unique<sstables::sstables_manager>("user", *_large_data_handler, _cfg, feat, _row_cache_tracker, dbcfg.available_memory, sst_dir_sem, [&stm]{ return stm.get()->get_my_id(); }, dbcfg.streaming_scheduling_group, &sstm))
+    , _system_sstables_manager(std::make_unique<sstables::sstables_manager>("system", *_nop_large_data_handler, _cfg, feat, _row_cache_tracker, dbcfg.available_memory, sst_dir_sem, [&stm]{ return stm.get()->get_my_id(); }, dbcfg.streaming_scheduling_group))
     , _result_memory_limiter(dbcfg.available_memory / 10)
     , _data_listeners(std::make_unique<db::data_listeners>())
     , _mnotifier(mn)
     , _feat(feat)
     , _shared_token_metadata(stm)
-    , _wasm(wasm)
+    , _lang_manager(langm)
     , _stop_barrier(std::move(barrier))
     , _update_memtable_flush_static_shares_action([this, &cfg] { return _memtable_controller.update_static_shares(cfg.memtable_flush_static_shares()); })
     , _memtable_flush_static_shares_observer(cfg.memtable_flush_static_shares.observe(_update_memtable_flush_static_shares_action.make_observer()))
@@ -683,7 +685,7 @@ future<> database::parse_system_tables(distributed<service::storage_proxy>& prox
     }));
     co_await do_parse_schema_tables(proxy, db::schema_tables::TYPES, coroutine::lambda([&] (schema_result_value_type &v) -> future<> {
         auto& ks = this->find_keyspace(v.first);
-        auto&& user_types = create_types_from_schema_partition(*ks.metadata(), v.second);
+        auto&& user_types = co_await create_types_from_schema_partition(*ks.metadata(), v.second);
         for (auto&& type : user_types) {
             ks.add_user_type(type);
         }
@@ -809,7 +811,6 @@ future<> database::drop_keyspace_on_all_shards(sharded<database>& sharded_db, co
 static bool is_system_table(const schema& s) {
     auto& k = s.ks_name();
     return k == db::system_keyspace::NAME ||
-        k == db::system_auth_keyspace::NAME ||
         k == db::system_distributed_keyspace::NAME ||
         k == db::system_distributed_keyspace::NAME_EVERYWHERE;
 }
@@ -818,6 +819,7 @@ void database::init_schema_commitlog() {
     assert(this_shard_id() == 0);
 
     db::commitlog::config c;
+    c.sched_group = _dbcfg.schema_commitlog_scheduling_group;
     c.commit_log_location = _cfg.schema_commitlog_directory();
     c.fname_prefix = db::schema_tables::COMMITLOG_FILENAME_PREFIX;
     c.metrics_category_name = "schema-commitlog";
@@ -976,9 +978,9 @@ future<> database::detach_column_family(table& cf) {
     co_await remove(cf);
     cf.clear_views();
     co_await cf.await_pending_ops();
-    for (auto* sem : {&_read_concurrency_sem, &_streaming_concurrency_sem, &_compaction_concurrency_sem, &_system_read_concurrency_sem}) {
-        co_await sem->evict_inactive_reads_for_table(uuid);
-    }
+    co_await foreach_reader_concurrency_semaphore([uuid] (reader_concurrency_semaphore& sem) -> future<> {
+        co_await sem.evict_inactive_reads_for_table(uuid);
+    });
 }
 
 global_table_ptr::global_table_ptr() {
@@ -1217,10 +1219,10 @@ keyspace::make_column_family_config(const schema& s, const database& db) const {
     column_family::config cfg;
     const db::config& db_config = db.get_config();
 
-    for (auto& extra : _config.all_datadirs) {
+    for (auto& extra : db_config.data_file_directories()) {
         auto uuid_sstring = s.id().to_sstring();
         boost::erase_all(uuid_sstring, "-");
-        cfg.all_datadirs.push_back(format("{}/{}-{}", extra, s.cf_name(), uuid_sstring));
+        cfg.all_datadirs.push_back(format("{}/{}/{}-{}", extra, s.ks_name(), s.cf_name(), uuid_sstring));
     }
     cfg.datadir = cfg.all_datadirs[0];
     cfg.enable_disk_reads = _config.enable_disk_reads;
@@ -1247,7 +1249,7 @@ keyspace::make_column_family_config(const schema& s, const database& db) const {
     cfg.tombstone_warn_threshold = db_config.tombstone_warn_threshold();
     cfg.view_update_concurrency_semaphore_limit = _config.view_update_concurrency_semaphore_limit;
     cfg.data_listeners = &db.data_listeners();
-    cfg.enable_compacting_data_for_streaming_and_repair = db_config.enable_compacting_data_for_streaming_and_repair();
+    cfg.enable_compacting_data_for_streaming_and_repair = db_config.enable_compacting_data_for_streaming_and_repair;
 
     return cfg;
 }
@@ -1696,6 +1698,19 @@ bool database::is_user_semaphore(const reader_concurrency_semaphore& semaphore) 
         && &semaphore != &_system_read_concurrency_sem;
 }
 
+future<> database::clear_inactive_reads_for_tablet(table_id table, dht::token_range tablet_range) {
+    const auto partition_range = dht::to_partition_range(tablet_range);
+    co_await foreach_reader_concurrency_semaphore([table, &partition_range] (reader_concurrency_semaphore& sem) -> future<> {
+        co_await sem.evict_inactive_reads_for_table(table, &partition_range);
+    });
+}
+
+future<> database::foreach_reader_concurrency_semaphore(std::function<future<>(reader_concurrency_semaphore&)> func) {
+    for (auto* sem : {&_read_concurrency_sem, &_streaming_concurrency_sem, &_compaction_concurrency_sem, &_system_read_concurrency_sem}) {
+        co_await func(*sem);
+    }
+}
+
 std::ostream& operator<<(std::ostream& out, const column_family& cf) {
     fmt::print(out, "{{column_family: {}/{}}}", cf._schema->ks_name(), cf._schema->cf_name());
     return out;
@@ -1808,6 +1823,14 @@ future<> database::apply_in_memory(const frozen_mutation& m, schema_ptr m_schema
 
     data_listeners().on_write(m_schema, m);
 
+    if (m.representation().size() > 128*1024) {
+        return unfreeze_gently(m, std::move(m_schema)).then([&cf, h = std::move(h), timeout] (auto m) mutable {
+            return do_with(std::move(m), [&cf, h = std::move(h), timeout] (auto& m) mutable {
+                return cf.apply(m, std::move(h), timeout);
+            });
+        });
+    }
+
     return cf.apply(m, std::move(m_schema), std::move(h), timeout);
 }
 
@@ -1909,7 +1932,6 @@ future<> database::apply(const std::vector<frozen_mutation>& muts, db::timeout_c
 future<> database::do_apply_many(const std::vector<frozen_mutation>& muts, db::timeout_clock::time_point timeout) {
     std::vector<commitlog_entry_writer> writers;
     db::commitlog* cl = nullptr;
-    std::optional<shard_id> shard;
 
     if (muts.empty()) {
         co_return;
@@ -1930,14 +1952,9 @@ future<> database::do_apply_many(const std::vector<frozen_mutation>& muts, db::t
                               first_cf.schema()->ks_name(), first_cf.schema()->cf_name()));
         }
 
-        auto m_shard = cf.shard_of(dht::get_token(*s, muts[i].key()));
-        if (!shard) {
-            if (this_shard_id() != m_shard) {
-                on_internal_error(dblog, format("Must call apply() on the owning shard ({} != {})", this_shard_id(), m_shard));
-            }
-            shard = m_shard;
-        } else if (*shard != m_shard) {
-            on_internal_error(dblog, "Cannot apply atomically across shards");
+        auto m_shards = cf.shard_for_writes(dht::get_token(*s, muts[i].key()));
+        if (std::ranges::find(m_shards, this_shard_id()) == std::ranges::end(m_shards)) {
+            on_internal_error(dblog, format("Must call apply() on the owning shard ({} not in {})", this_shard_id(), m_shards));
         }
 
         dblog.trace("apply [{}/{}]: {}", i, muts.size() - 1, muts[i].pretty_printer(s));
@@ -2099,9 +2116,6 @@ database::make_keyspace_config(const keyspace_metadata& ksm) {
     keyspace::config cfg;
     if (_cfg.data_file_directories().size() > 0) {
         cfg.datadir = format("{}/{}", _cfg.data_file_directories()[0], ksm.name());
-        for (auto& extra : _cfg.data_file_directories()) {
-            cfg.all_datadirs.push_back(format("{}/{}", extra, ksm.name()));
-        }
         cfg.enable_disk_writes = !_cfg.enable_in_memory_data_store();
         cfg.enable_disk_reads = true; // we always read from disk
         cfg.enable_commitlog = _cfg.enable_commitlog() && !_cfg.enable_in_memory_data_store();

@@ -23,6 +23,8 @@ namespace tm = httpd::task_manager_json;
 using namespace json;
 using namespace seastar::httpd;
 
+using task_variant = std::variant<tasks::task_manager::foreign_task_ptr, tasks::task_manager::task::task_essentials>;
+
 inline bool filter_tasks(tasks::task_manager::task_ptr task, std::unordered_map<sstring, sstring>& query_params) {
     return (!query_params.contains("keyspace") || query_params["keyspace"] == task->get_status().keyspace) &&
         (!query_params.contains("table") || query_params["table"] == task->get_status().table);
@@ -32,7 +34,6 @@ struct full_task_status {
     tasks::task_manager::task::status task_status;
     std::string type;
     tasks::task_manager::task::progress progress;
-    std::string module;
     tasks::task_id parent_id;
     tasks::is_abortable abortable;
     std::vector<std::string> children_ids;
@@ -99,16 +100,16 @@ future<full_task_status> retrieve_status(const tasks::task_manager::foreign_task
     s.type = task->type();
     s.parent_id = task->get_parent_id();
     s.abortable = task->is_abortable();
-    s.module = task->get_module_name();
     s.progress.completed = progress.completed;
     s.progress.total = progress.total;
-    std::vector<std::string> ct{task->get_children().size()};
-    boost::transform(task->get_children(), ct.begin(), [] (const auto& child) {
+    std::vector<std::string> ct = co_await task->get_children().map_each_task<std::string>([] (const tasks::task_manager::foreign_task_ptr& child) {
         return child->id().to_sstring();
+    }, [] (const tasks::task_manager::task::task_essentials& child) {
+        return child.task_status.id.to_sstring();
     });
     s.children_ids = std::move(ct);
     co_return s;
-}
+};
 
 void set_task_manager(http_context& ctx, routes& r, sharded<tasks::task_manager>& tm, db::config& cfg) {
     tm::get_modules.set(r, [&tm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
@@ -123,7 +124,7 @@ void set_task_manager(http_context& ctx, routes& r, sharded<tasks::task_manager>
             chunked_stats local_res;
             tasks::task_manager::module_ptr module;
             try {
-                module = tm.find_module(req->param["module"]);
+                module = tm.find_module(req->get_path_param("module"));
             } catch (...) {
                 throw bad_param_exception(fmt::format("{}", std::current_exception()));
             }
@@ -156,7 +157,7 @@ void set_task_manager(http_context& ctx, routes& r, sharded<tasks::task_manager>
     });
 
     tm::get_task_status.set(r, [&tm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
-        auto id = tasks::task_id{utils::UUID{req->param["task_id"]}};
+        auto id = tasks::task_id{utils::UUID{req->get_path_param("task_id")}};
         tasks::task_manager::foreign_task_ptr task;
         try {
             task = co_await tasks::task_manager::invoke_on_task(tm, id, std::function([] (tasks::task_manager::task_ptr task) -> future<tasks::task_manager::foreign_task_ptr> {
@@ -173,7 +174,7 @@ void set_task_manager(http_context& ctx, routes& r, sharded<tasks::task_manager>
     });
 
     tm::abort_task.set(r, [&tm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
-        auto id = tasks::task_id{utils::UUID{req->param["task_id"]}};
+        auto id = tasks::task_id{utils::UUID{req->get_path_param("task_id")}};
         try {
             co_await tasks::task_manager::invoke_on_task(tm, id, [] (tasks::task_manager::task_ptr task) -> future<> {
                 if (!task->is_abortable()) {
@@ -188,12 +189,11 @@ void set_task_manager(http_context& ctx, routes& r, sharded<tasks::task_manager>
     });
 
     tm::wait_task.set(r, [&tm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
-        auto id = tasks::task_id{utils::UUID{req->param["task_id"]}};
+        auto id = tasks::task_id{utils::UUID{req->get_path_param("task_id")}};
         tasks::task_manager::foreign_task_ptr task;
         try {
             task = co_await tasks::task_manager::invoke_on_task(tm, id, std::function([] (tasks::task_manager::task_ptr task) {
                 return task->done().then_wrapped([task] (auto f) {
-                    task->unregister_task();
                     // done() is called only because we want the task to be complete before getting its status.
                     // The future should be ignored here as the result does not matter.
                     f.ignore_ready_future();
@@ -209,8 +209,8 @@ void set_task_manager(http_context& ctx, routes& r, sharded<tasks::task_manager>
 
     tm::get_task_status_recursively.set(r, [&_tm = tm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
         auto& tm = _tm;
-        auto id = tasks::task_id{utils::UUID{req->param["task_id"]}};
-        std::queue<tasks::task_manager::foreign_task_ptr> q;
+        auto id = tasks::task_id{utils::UUID{req->get_path_param("task_id")}};
+        std::queue<task_variant> q;
         utils::chunked_vector<full_task_status> res;
 
         tasks::task_manager::foreign_task_ptr task;
@@ -230,10 +230,33 @@ void set_task_manager(http_context& ctx, routes& r, sharded<tasks::task_manager>
         q.push(co_await task.copy());   // Task cannot be moved since we need it to be alive during whole loop execution.
         while (!q.empty()) {
             auto& current = q.front();
-            res.push_back(co_await retrieve_status(current));
-            for (auto& child: current->get_children()) {
-                q.push(co_await child.copy());
-            }
+            co_await std::visit(overloaded_functor {
+                [&] (const tasks::task_manager::foreign_task_ptr& task) -> future<> {
+                    res.push_back(co_await retrieve_status(task));
+                    co_await task->get_children().for_each_task([&q] (const tasks::task_manager::foreign_task_ptr& child) -> future<> {
+                        q.push(co_await child.copy());
+                    }, [&] (const tasks::task_manager::task::task_essentials& child) {
+                        q.push(child);
+                        return make_ready_future();
+                    });
+                },
+                [&] (const tasks::task_manager::task::task_essentials& task) -> future<> {
+                    res.push_back(full_task_status{
+                        .task_status = task.task_status,
+                        .type = task.type,
+                        .progress = task.task_progress,
+                        .parent_id = task.parent_id,
+                        .abortable = task.abortable,
+                        .children_ids = boost::copy_range<std::vector<std::string>>(task.failed_children | boost::adaptors::transformed([] (auto& child) {
+                            return child.task_status.id.to_sstring();
+                        }))
+                    });
+                    for (auto& child: task.failed_children) {
+                        q.push(child);
+                    }
+                    return make_ready_future();
+                }
+            }, current);
             q.pop();
         }
 

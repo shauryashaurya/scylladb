@@ -6,9 +6,11 @@
 
 import random
 from typing import NamedTuple
+
 import pytest
-from rest_api_mock import expected_request
-from utils import format_size
+
+from test.nodetool.rest_api_mock import expected_request
+from test.nodetool.utils import format_size
 
 
 class moving_average(NamedTuple):
@@ -98,7 +100,7 @@ def test_info(request, nodetool, display_all_tokens):
     expected_requests = [
         expected_request('GET', '/storage_service/gossiping', response=True),
         expected_request('GET', '/storage_service/hostid/local', response=host_id),
-        expected_request('GET', '/storage_service/rpc_server', response=True),
+        expected_request('GET', '/storage_service/rpc_server', response=False),
         expected_request('GET', '/storage_service/native_transport', response=True),
         expected_request('GET', '/storage_service/load', response=load),
         expected_request('GET', '/storage_service/generation_number', response=generation_number),
@@ -173,7 +175,7 @@ def test_info(request, nodetool, display_all_tokens):
     expected_output = f'''\
 {'ID':<23}: {host_id}
 {'Gossip active':<23}: true
-{'Thrift active':<23}: true
+{'Thrift active':<23}: false
 {'Native Transport active':<23}: true
 {'Load':<23}: {format_size(load)}
 {'Generation No':<23}: {generation_number}

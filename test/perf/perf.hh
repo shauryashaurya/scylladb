@@ -23,6 +23,7 @@
 #include <chrono>
 #include <iosfwd>
 #include <boost/range/irange.hpp>
+#include <vector>
 
 template <typename Func>
 static
@@ -50,8 +51,10 @@ void time_it(Func func, int iterations = 5, int iterations_between_clock_reading
 struct executor_shard_stats {
     uint64_t invocations = 0;
     uint64_t allocations = 0;
+    uint64_t log_allocations = 0;
     uint64_t tasks_executed = 0;
     uint64_t instructions_retired = 0;
+    uint64_t cpu_cycles_retired = 0;
     uint64_t errors = 0;
 };
 
@@ -60,8 +63,10 @@ executor_shard_stats
 operator+(executor_shard_stats a, executor_shard_stats b) {
     a.invocations += b.invocations;
     a.allocations += b.allocations;
+    a.log_allocations += b.log_allocations;
     a.tasks_executed += b.tasks_executed;
     a.instructions_retired += b.instructions_retired;
+    a.cpu_cycles_retired += b.cpu_cycles_retired;
     a.errors += b.errors;
     return a;
 }
@@ -71,14 +76,17 @@ executor_shard_stats
 operator-(executor_shard_stats a, executor_shard_stats b) {
     a.invocations -= b.invocations;
     a.allocations -= b.allocations;
+    a.log_allocations -= b.log_allocations;
     a.tasks_executed -= b.tasks_executed;
     a.instructions_retired -= b.instructions_retired;
+    a.cpu_cycles_retired -= b.cpu_cycles_retired;
     a.errors -= b.errors;
     return a;
 }
 
 uint64_t perf_tasks_processed();
 uint64_t perf_mallocs();
+uint64_t perf_logallocs();
 
 // Drives concurrent and continuous execution of given asynchronous action
 // until a deadline. Counts invocations and collects statistics.
@@ -92,6 +100,7 @@ class executor {
     uint64_t _count;
     uint64_t _errors;
     linux_perf_event _instructions_retired_counter = linux_perf_event::user_instructions_retired();
+    linux_perf_event _cpu_cycles_retired_counter = linux_perf_event::user_cpu_cycles_retired();
 private:
     executor_shard_stats executor_shard_stats_snapshot();
     future<> run_worker() {
@@ -122,11 +131,13 @@ public:
     future<executor_shard_stats> run() {
         auto stats_start = executor_shard_stats_snapshot();
         _instructions_retired_counter.enable();
+        _cpu_cycles_retired_counter.enable();
         auto idx = boost::irange(0, (int)_n_workers);
         return parallel_for_each(idx.begin(), idx.end(), [this] (auto idx) mutable {
             return this->run_worker();
         }).then([this, stats_start] {
             _instructions_retired_counter.disable();
+            _cpu_cycles_retired_counter.disable();
             auto stats_end = executor_shard_stats_snapshot();
             return stats_end - stats_start;
         });
@@ -143,8 +154,10 @@ executor<Func>::executor_shard_stats_snapshot() {
     return executor_shard_stats{
         .invocations = _count,
         .allocations = perf_mallocs(),
+        .log_allocations = perf_logallocs(),
         .tasks_executed = perf_tasks_processed(),
         .instructions_retired = _instructions_retired_counter.read(),
+        .cpu_cycles_retired = _cpu_cycles_retired_counter.read(),
         .errors = _errors,
     };
 }
@@ -152,11 +165,28 @@ executor<Func>::executor_shard_stats_snapshot() {
 struct perf_result {
     double throughput;
     double mallocs_per_op;
+    double logallocs_per_op;
     double tasks_per_op;
     double instructions_per_op;
+    double cpu_cycles_per_op;
     uint64_t errors;
 };
 
+
+struct aggregated_perf_results {
+    struct throughput_t {
+        double median;
+        double median_absolute_deviation;
+        double min;
+        double max;
+    };
+    throughput_t throughput;
+    perf_result median_by_throughput; // Simplification, median element is considered based on throughput value
+
+    aggregated_perf_results(std::vector<perf_result>& results);
+};
+
+std::ostream& operator<<(std::ostream& os, const aggregated_perf_results& result);
 // Use to make a perf_result with aio_writes added. Need to give "update" as
 // update-func to time_parallel_ex to make it work.
 struct aio_writes_result_mixin {
@@ -207,8 +237,10 @@ std::vector<Res> time_parallel_ex(Func func, unsigned concurrency_per_core, int 
 
         result.throughput = static_cast<double>(stats.invocations) / duration;
         result.mallocs_per_op = double(stats.allocations) / stats.invocations;
+        result.logallocs_per_op = double(stats.log_allocations) / stats.invocations;
         result.tasks_per_op = double(stats.tasks_executed) / stats.invocations;
         result.instructions_per_op = double(stats.instructions_retired) / stats.invocations;
+        result.cpu_cycles_per_op = double(stats.cpu_cycles_retired) / stats.invocations;
         result.errors = stats.errors;
 
         uf(result, stats);

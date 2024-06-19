@@ -537,22 +537,32 @@ std::pair<std::optional<secondary_index::index>, expr::expression> statement_res
     int chosen_index_score = 0;
     expr::expression chosen_index_restrictions = expr::conjunction({});
 
-    for (const auto& index : sim.list_indexes()) {
-        auto cdef = _schema->get_column_definition(to_bytes(index.target_column()));
-        for (const expr::expression& restriction : index_restrictions()) {
-            if (has_partition_token(restriction, *_schema) || contains_multi_column_restriction(restriction)) {
-                continue;
-            }
-
-            expr::single_column_restrictions_map rmap = expr::get_single_column_restrictions_map(restriction);
-            const auto found = rmap.find(cdef);
-            if (found != rmap.end() && is_supported_by(found->second, index)
-                && score(index) > chosen_index_score) {
-                chosen_index = index;
-                chosen_index_score = score(index);
-                chosen_index_restrictions = restriction;
-            }
+    // Several indexes may be usable for this query. When their score is tied,
+    // let's pick one by order of the columns mentioned in the restriction
+    // expression. This specific order isn't important (and maybe in the
+    // future we could plan a better order based on the specificity of each
+    // index), but it is critical that two coordinators - or the same
+    // coordinator over time - must choose the same index for the same query.
+    // Otherwise, paging can break (see issue #7969).
+    for (const expr::expression& restriction : index_restrictions()) {
+        if (has_partition_token(restriction, *_schema) || contains_multi_column_restriction(restriction)) {
+            continue;
         }
+        expr::for_each_expression<expr::column_value>(restriction, [&](const expr::column_value& cval) {
+            auto& cdef = cval.col;
+            expr::expression col_restrictions = expr::conjunction {
+                .children = expr::extract_single_column_restrictions_for_column(restriction, *cdef)
+            };
+            for (const auto& index : sim.list_indexes()) {
+                if (cdef->name_as_text() == index.target_column() &&
+                        expr::is_supported_by(col_restrictions, index) &&
+                        score(index) > chosen_index_score) {
+                    chosen_index = index;
+                    chosen_index_score = score(index);
+                    chosen_index_restrictions = restriction;
+                }
+            }
+        });
     }
     return {chosen_index, chosen_index_restrictions};
 }
@@ -1135,13 +1145,14 @@ bool starts_before_start(
     const auto len1 = r1.start()->value().representation().size();
     const auto len2 = r2.start()->value().representation().size();
     if (len1 == len2) { // The values truly are equal.
+        // (a)>=(1) starts before (a)>(1)
         return r1.start()->is_inclusive() && !r2.start()->is_inclusive();
     } else if (len1 < len2) { // r1 start is a prefix of r2 start.
         // (a)>=(1) starts before (a,b)>=(1,1), but (a)>(1) doesn't.
         return r1.start()->is_inclusive();
     } else { // r2 start is a prefix of r1 start.
         // (a,b)>=(1,1) starts before (a)>(1) but after (a)>=(1).
-        return r2.start()->is_inclusive();
+        return !r2.start()->is_inclusive();
     }
 }
 
@@ -1166,6 +1177,7 @@ bool starts_before_or_at_end(
     const auto len1 = r1.start()->value().representation().size();
     const auto len2 = r2.end()->value().representation().size();
     if (len1 == len2) { // The values truly are equal.
+        // (a)>=(1) starts at end of (a)<=(1)
         return r1.start()->is_inclusive() && r2.end()->is_inclusive();
     } else if (len1 < len2) { // r1 start is a prefix of r2 end.
         // a>=(1) starts before (a,b)<=(1,1) ends, but (a)>(1) doesn't.
@@ -1197,6 +1209,7 @@ bool ends_before_end(
     const auto len1 = r1.end()->value().representation().size();
     const auto len2 = r2.end()->value().representation().size();
     if (len1 == len2) { // The values truly are equal.
+        // (a)<(1) ends before (a)<=(1) ends
         return !r1.end()->is_inclusive() && r2.end()->is_inclusive();
     } else if (len1 < len2) { // r1 end is a prefix of r2 end.
         // (a)<(1) ends before (a,b)<=(1,1), but (a)<=(1) doesn't.
@@ -1212,7 +1225,10 @@ std::optional<query::clustering_range> intersection(
         const query::clustering_range& r1,
         const query::clustering_range& r2,
         const clustering_key_prefix::prefix_equal_tri_compare& cmp) {
-    // Assume r1's start is to the left of r2's start.
+    // If needed, swap r1 and r2 so that r1's start is to the left of r2's
+    // start. Note that to avoid infinite recursion (#18688) the function
+    // starts_before_start() must never return true for both (r1,r2) and
+    // (r2,r1) - in other words, it must be a *strict* partial order.
     if (starts_before_start(r2, r1, cmp)) {
         return intersection(r2, r1, cmp);
     }

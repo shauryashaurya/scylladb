@@ -42,9 +42,8 @@ class database;
 class repair_service;
 namespace db {
     namespace view {
-        class view_update_generator;
+        class view_builder;
     }
-    class system_distributed_keyspace;
 }
 namespace netw { class messaging_service; }
 namespace service {
@@ -270,6 +269,7 @@ struct tablet_repair_task_meta {
     dht::token_range range;
     repair_neighbors neighbors;
     locator::tablet_replica_set replicas;
+    locator::effective_replication_map_ptr erm;
 };
 
 namespace std {

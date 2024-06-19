@@ -290,7 +290,7 @@ seastar::future<> raft_group_registry::start() {
     // then to send VoteRequest messages.
     init_rpc_verbs();
 
-    direct_fd_clock::base::duration threshold{std::chrono::seconds{1}};
+    direct_fd_clock::base::duration threshold{std::chrono::seconds{2}};
     if (const auto ms = utils::get_local_injector().inject_parameter<int64_t>("raft-group-registry-fd-threshold-in-ms"); ms) {
         threshold = direct_fd_clock::base::duration{std::chrono::milliseconds{*ms}};
     }
@@ -382,6 +382,8 @@ future<> raft_group_registry::start_server_for_group(raft_server_for_group new_g
         // By the time the tick() is executed the server should already be initialized.
         co_await new_grp.server->start();
         new_grp.server->register_metrics();
+    } catch (abort_requested_exception&) {
+        throw;
     } catch (...) {
         on_internal_error(rslog, format("Failed to start a Raft group {}: {}", gid,
                 std::current_exception()));
@@ -536,7 +538,7 @@ future<> raft_server_with_timeouts::read_barrier(seastar::abort_source* as, std:
 }
 
 future<bool> direct_fd_pinger::ping(direct_failure_detector::pinger::endpoint_id id, abort_source& as) {
-    auto dst_id = raft::server_id{std::move(id)};
+    auto dst_id = raft::server_id{id};
     auto addr = _address_map.find(dst_id);
     if (!addr) {
         {

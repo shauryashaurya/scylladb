@@ -8,6 +8,7 @@
 
 #include <fmt/ranges.h>
 #include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/switch_to.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/rpc/rpc.hh>
 #include "sstables_loader.hh"
@@ -407,6 +408,8 @@ future<> sstables_loader::load_new_sstables(sstring ks_name, sstring cf_name,
         _loading_new_sstables = true;
     }
 
+    co_await coroutine::switch_to(_sched_group);
+
     sstring load_and_stream_desc = fmt::format("{}", load_and_stream);
     const auto& rs = _db.local().find_keyspace(ks_name).get_replication_strategy();
     if (rs.is_per_table() && !load_and_stream) {
@@ -430,7 +433,7 @@ future<> sstables_loader::load_new_sstables(sstring ks_name, sstring cf_name,
                 co_await loader.load_and_stream(ks_name, cf_name, table_id, std::move(sstables_on_shards[this_shard_id()]), primary_replica_only);
             });
         } else {
-            co_await replica::distributed_loader::process_upload_dir(_db, _sys_dist_ks, _view_update_generator, ks_name, cf_name);
+            co_await replica::distributed_loader::process_upload_dir(_db, _view_builder, ks_name, cf_name);
         }
     } catch (...) {
         llog.warn("Done loading new SSTables for keyspace={}, table={}, load_and_stream={}, primary_replica_only={}, status=failed: {}",

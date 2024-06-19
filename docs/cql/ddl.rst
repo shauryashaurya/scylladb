@@ -107,12 +107,6 @@ For example:
    WITH replication = {'class': 'NetworkTopologyStrategy', 'DC1' : 1, 'DC2' : 3}
    AND durable_writes = true;
 
-.. TODO Add a link to the description of minimum_keyspace_rf when the ScyllaDB options section is added to the docs.
-
-You can configure the minimum acceptable replication factor using the ``minimum_keyspace_rf`` option. 
-Attempting to create a keyspace with a replication factor lower than the value set with 
-``minimum_keyspace_rf`` will return an error (the default value is 0). 
-
 The supported ``options`` are:
 
 =================== ========== =========== ========= ===================================================================
@@ -122,7 +116,7 @@ name                 kind       mandatory   default   description
                                                       details below).
 ``durable_writes``   *simple*   no          true      Whether to use the commit log for updates on this keyspace
                                                       (disable this option at your own risk!).
-``tablets``          *map*      no                    Experimental - enables tablets for this keyspace (see :ref:`tablets<tablets>`)
+``tablets``          *map*      no                    Enables or disables tablets for the keyspace (see :ref:`tablets<tablets>`)
 =================== ========== =========== ========= ===================================================================
 
 The ``replication`` property is mandatory and must at least contains the ``'class'`` sub-option, which defines the
@@ -142,7 +136,12 @@ query latency. For a production ready strategy, see *NetworkTopologyStrategy* . 
 ========================= ====== ======= =============================================
 sub-option                 type   since   description
 ========================= ====== ======= =============================================
-``'replication_factor'``   int    all     The number of replicas to store per range
+``'replication_factor'``   int    all     The number of replicas to store per range.
+
+                                          The replication factor should be equal to
+                                          or lower than the number of nodes.
+                                          Configuring a higher RF may prevent
+                                          creating tables in that keyspace. 
 ========================= ====== ======= =============================================
 
 .. note:: Using NetworkTopologyStrategy is recommended. Using SimpleStrategy will make it harder to add Data Center in the future.
@@ -166,6 +165,11 @@ sub-option                             type  description
                                              definitions or explicit datacenter settings.
                                              For example, to have three replicas per
                                              datacenter, supply this with a value of 3.
+
+                                             The replication factor configured for a DC
+                                             should be equal to or lower than the number
+                                             of nodes in that DC. Configuring a higher RF 
+                                             may prevent creating tables in that keyspace. 
 ===================================== ====== =============================================
 
 Note that when ``ALTER`` ing keyspaces and supplying ``replication_factor``,
@@ -213,39 +217,30 @@ An example that excludes a datacenter while using ``replication_factor``::
 
 .. _tablets:
 
-The ``tablets`` property :label-caution:`Experimental`
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The ``tablets`` property
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The ``tablets`` property is used to make keyspace replication tablets-based.
-It is only valid when ``experimental_features: tablets`` is specified in ``scylla.yaml`` (which
-in turn requires ``consistent_cluster_management: true``); it must be a power of two.
+The ``tablets`` property enables or disables tablets-based distribution
+for a keyspace. 
 
 Options:
 
 ===================================== ====== =============================================
 sub-option                             type  description
 ===================================== ====== =============================================
-``'enabled'``                          bool  Whether or not to enable tablets for keyspace
+``'enabled'``                          bool  Whether or not to enable tablets for a keyspace
 ``'initial'``                          int   The number of tablets to start with
 ===================================== ====== =============================================
 
-By default if tablets cluster feature is enabled, any keyspace will be created with tablets
-enabled. The ``tablets`` option is used to opt-out a keyspace from tablets replication.
+By default, a keyspace is created with tablets enabled. The ``tablets`` option 
+is used to opt out a keyspace from tablets-based distribution; see :ref:`Enabling Tablets <tablets-enable-tablets>`
+for details.
 
 A good rule of thumb to calculate initial tablets is to divide the expected total storage used
 by tables in this keyspace by (``replication_factor`` * 5GB). For example, if you expect a 30TB
 table and have a replication factor of 3, divide 30TB by (3*5GB) for a result of 2000. Since the
 value must be a power of two, round up to 2048.
-
-.. note::
-   The calculation applies to every table in the keyspace independently; so it can only realistically be
-   used for a keyspace containing a single table. It is expected that per-table controls will be available
-   in the future.
-
-.. caution::
-   The ``initial`` option may change its definition or be completely removed as it is part
-   of an experimental feature.
-
+The calculation applies to every table in the keyspace.
 
 An example that creates a keyspace with 2048 tablets per table::
 
@@ -256,6 +251,9 @@ An example that creates a keyspace with 2048 tablets per table::
     } AND tablets = {
         'initial': 2048
     };
+
+
+See :doc:`Data Distribution with Tablets </architecture/tablets>` for more information about tablets.
 
 .. _use-statement:        
         
@@ -288,6 +286,17 @@ For instance::
 
 
 The supported options are the same as :ref:`creating a keyspace <create-keyspace-statement>`.
+
+ALTER KEYSPACE with Tablets :label-caution:`Experimental`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Modifying a keyspace with tablets enabled is possible and doesn't require any special CQL syntax. However, there are some limitations:
+
+- The replication factor (RF) can be increased or decreased by at most 1 at a time. To reach the desired RF value, modify the RF repeatedly.
+- The ``ALTER`` statement rejects the ``replication_factor`` tag. List the DCs explicitly when altering a keyspace. See :ref:`NetworkTopologyStrategy <replication-strategy>`.
+- If there's any other ongoing global topology operation, executing the ``ALTER`` statement will fail (with an explicit and specific error) and needs to be repeated.
+- The ``ALTER`` statement may take longer than the regular query timeout, and even if it times out, it will continue to execute in the background.
+- The replication strategy cannot be modified, as keyspaces with tablets only support ``NetworkTopologyStrategy``.
 
 .. _drop-keyspace-statement:
 
@@ -913,8 +922,8 @@ Altering an existing table uses the ``ALTER TABLE`` statement:
 
    alter_table_statement: ALTER TABLE `table_name` `alter_table_instruction`
    alter_table_instruction: ADD `column_name` `cql_type` ( ',' `column_name` `cql_type` )*
-                          : | DROP `column_name`
-                          : | DROP '(' `column_name` ( ',' `column_name` )* ')'
+                          : | DROP `column_name` [ USING TIMESTAMP `timestamp` ]
+                          : | DROP '(' `column_name` ( ',' `column_name` )* ')' [ USING TIMESTAMP `timestamp` ]
                           : | ALTER `column_name` TYPE `cql_type`
                           : | WITH `options`
                           : | scylla_encryption_options: '=' '{'[`cipher_algorithm` : <hash>]','[`secret_key_strength` : <len>]','[`key_provider`: <provider>]'}'
@@ -968,6 +977,19 @@ The ``ALTER TABLE`` statement can:
 
 .. warning:: Once a column is dropped, it is allowed to re-add a column with the same name as the dropped one
    **unless** the type of the dropped column was a (non-frozen) column (due to an internal technical limitation).
+
+It is also possible to drop a column with specified timestamp ``ALTER TABLE ... DROP ... USING TIMESTAMP ...``.
+The purpose of this statement is to be able to safely restore schema (see :doc:`Backup and Restore Procedures </operating-scylla/procedures/backup-restore/index>`) in the case a column was dropped and re-added later.
+The timestamp should be obtained by describing schema with internals ``DESC SCHEMA WITH INTERNALS`` (or other descriptions like ``DESC TABLE ks.cf WITH INTERNALS``)
+
+For example: 
+Let's say you have a table with some data. Then you drop one of the column and re-add it later.
+In the future, when you wish to restore the schema, you **have to** also drop the column with specified timestamp (the same timestamp as the original drop)
+and re-add it again.
+Otherwise, you can resurrect your data (if you skip ``ALTER ... DROP/ADD ...`` entirely) 
+or you can lose data inserted after column re-addition (if you drop the column without the timestamp).
+
+.. warning:: Dropping a column with specified timestamp should only be used to restore schema from description (``DESCRIBE SCHEMA WITH INTERNALS``).
 
 .. _drop-table-statement:
 

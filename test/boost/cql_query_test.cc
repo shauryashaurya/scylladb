@@ -27,6 +27,7 @@
 #include <seastar/core/future-util.hh>
 #include <seastar/core/sleep.hh>
 #include "transport/messages/result_message.hh"
+#include "transport/messages/result_message_base.hh"
 #include "utils/big_decimal.hh"
 #include "types/map.hh"
 #include "types/list.hh"
@@ -4819,8 +4820,6 @@ SEASTAR_THREAD_TEST_CASE(test_query_limit) {
             e.execute_prepared(id, {cql3_pk, cql3_ck, cql3_value}).get();
         }
 
-        auto& db = e.local_db();
-
         const auto make_expected_row = [&] (int ck) -> std::vector<bytes_opt> {
             return {raw_pk, int32_type->decompose(ck), raw_value};
         };
@@ -4831,10 +4830,12 @@ SEASTAR_THREAD_TEST_CASE(test_query_limit) {
         db_config->max_memory_for_unlimited_query_soft_limit.set(256, utils::config_file::config_source::CommandLine);
         db_config->max_memory_for_unlimited_query_hard_limit.set(1024, utils::config_file::config_source::CommandLine);
 
+        auto groups = get_scheduling_groups().get();
+
         for (auto is_paged : {true, false}) {
             for (auto is_reversed : {true, false}) {
-                for (auto scheduling_group : {db.get_statement_scheduling_group(), db.get_streaming_scheduling_group(), default_scheduling_group()}) {
-                    const auto should_fail = !is_paged && scheduling_group == db.get_statement_scheduling_group();
+                for (auto scheduling_group : {groups.statement_scheduling_group, groups.streaming_scheduling_group, default_scheduling_group()}) {
+                    const auto should_fail = !is_paged && scheduling_group == groups.statement_scheduling_group;
                     testlog.info("checking: is_paged={}, is_reversed={}, scheduling_group={}, should_fail={}", is_paged, is_reversed, scheduling_group.name(), should_fail);
                     const auto select_query = format("SELECT * FROM test WHERE pk = {} ORDER BY ck {};", pk, is_reversed ? "DESC" : "ASC");
 
@@ -5057,7 +5058,8 @@ SEASTAR_THREAD_TEST_CASE(test_query_unselected_columns) {
 
     do_with_cql_env_thread([] (cql_test_env& e) {
         // Sanity test, this test-case has to run in the statement group that is != default group.
-        BOOST_REQUIRE(e.local_db().get_statement_scheduling_group() == current_scheduling_group());
+        auto groups = get_scheduling_groups().get();
+        BOOST_REQUIRE(groups.statement_scheduling_group == current_scheduling_group());
         BOOST_REQUIRE(default_scheduling_group() != current_scheduling_group());
 
         e.execute_cql("CREATE TABLE tbl (pk int, ck int, v text, PRIMARY KEY (pk, ck))").get();
@@ -5696,9 +5698,7 @@ SEASTAR_TEST_CASE(test_setting_synchronous_updates_property) {
 static
 cql_test_config tablet_cql_test_config() {
     cql_test_config c;
-    c.db_config->experimental_features({
-            db::experimental_features_t::feature::TABLETS,
-        }, db::config::config_source::CommandLine);
+    c.db_config->enable_tablets.set(true);
     return c;
 }
 
@@ -5770,7 +5770,7 @@ SEASTAR_TEST_CASE(test_sending_tablet_info_insert) {
 
         auto pk = partition_key::from_singular(*sptr, int32_t(1));
 
-        unsigned local_shard = sptr->table().shard_of(dht::get_token(*sptr, pk.view()));
+        unsigned local_shard = sptr->table().shard_for_reads(dht::get_token(*sptr, pk.view()));
 
         smp::submit_to(local_shard, [&] {
             return seastar::async([&] { 
@@ -5786,7 +5786,7 @@ SEASTAR_TEST_CASE(test_sending_tablet_info_insert) {
 
         auto pk2 = partition_key::from_singular(*sptr, int32_t(2));
 
-        unsigned local_shard2 = sptr->table().shard_of(dht::get_token(*sptr, pk2.view()));
+        unsigned local_shard2 = sptr->table().shard_for_reads(dht::get_token(*sptr, pk2.view()));
         unsigned foreign_shard = (local_shard2 + 1) % smp::count;
 
         smp::submit_to(foreign_shard, [&] { 
@@ -5812,7 +5812,7 @@ SEASTAR_TEST_CASE(test_sending_tablet_info_select) {
 
         auto pk = partition_key::from_singular(*sptr, int32_t(1));
 
-        unsigned local_shard = sptr->table().shard_of(dht::get_token(*sptr, pk.view()));
+        unsigned local_shard = sptr->table().shard_for_reads(dht::get_token(*sptr, pk.view()));
         unsigned foreign_shard = (local_shard + 1) % smp::count;
 
         smp::submit_to(local_shard, [&] { 
@@ -5829,4 +5829,35 @@ SEASTAR_TEST_CASE(test_sending_tablet_info_select) {
             });
         }).get();
     }, tablet_cql_test_config());
+}
+
+// check if create statements emit schema change event properly
+// we emit it even if resource wasn't created due to github.com/scylladb/scylladb/issues/16909
+SEASTAR_TEST_CASE(test_schema_change_events) {
+     return do_with_cql_env_thread([] (cql_test_env& e) {
+        using event_t = cql_transport::messages::result_message::schema_change;
+        // keyspace
+        auto res = e.execute_cql("create keyspace ks2 with replication = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 };").get();
+        BOOST_REQUIRE(dynamic_pointer_cast<event_t>(res));
+        res = e.execute_cql("create keyspace if not exists ks2 with replication = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 };").get();
+        BOOST_REQUIRE(dynamic_pointer_cast<event_t>(res));
+
+        // table
+        res = e.execute_cql("create table users (user_name varchar PRIMARY KEY);").get();
+        BOOST_REQUIRE(dynamic_pointer_cast<event_t>(res));
+        res = e.execute_cql("create table if not exists users (user_name varchar PRIMARY KEY);").get();
+        BOOST_REQUIRE(dynamic_pointer_cast<event_t>(res));
+
+        // view
+        res = e.execute_cql("create materialized view users_view as select user_name from users where user_name is not null primary key (user_name)").get();
+        BOOST_REQUIRE(dynamic_pointer_cast<event_t>(res));
+        res = e.execute_cql("create materialized view if not exists users_view as select user_name from users where user_name is not null primary key (user_name)").get();
+        BOOST_REQUIRE(dynamic_pointer_cast<event_t>(res));
+
+        // type
+        res = e.execute_cql("create type my_type (first text);").get();
+        BOOST_REQUIRE(dynamic_pointer_cast<event_t>(res));
+        res = e.execute_cql("create type if not exists my_type (first text);").get();
+        BOOST_REQUIRE(dynamic_pointer_cast<event_t>(res));
+     });
 }

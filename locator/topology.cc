@@ -206,7 +206,7 @@ const node* topology::add_node(node_holder nptr) {
 }
 
 const node* topology::update_node(node* node, std::optional<host_id> opt_id, std::optional<inet_address> opt_ep, std::optional<endpoint_dc_rack> opt_dr, std::optional<node::state> opt_st, std::optional<shard_id> opt_shard_count) {
-    tlogger.debug("topology[{}]: update_node: {}: to: host_id={} endpoint={} dc={} rack={} state={}, at {}", fmt::ptr(this), node_printer(node),
+    tlogger.debug("topology[{}]: update_node: {}: to: host_id={} endpoint={} dc={} rack={} state={} shard_count={}, at {}", fmt::ptr(this), node_printer(node),
         opt_id ? format("{}", *opt_id) : "unchanged",
         opt_ep ? format("{}", *opt_ep) : "unchanged",
         opt_dr ? format("{}", opt_dr->dc) : "unchanged",
@@ -567,17 +567,6 @@ void topology::for_each_node(std::function<void(const node*)> func) const {
 } // namespace locator
 
 namespace std {
-
-std::ostream& operator<<(std::ostream& out, const locator::topology& t) {
-    out << "{this_endpoint: " << t._cfg.this_endpoint
-        << ", dc: " << t._cfg.local_dc_rack.dc
-        << ", rack: " << t._cfg.local_dc_rack.rack
-        << ", nodes:\n";
-    for (auto&& node : t._nodes) {
-        out << "  " << fmt::format("{}", node_printer(node.get())) << "\n";
-    }
-    return out << "}";
-}
 
 std::ostream& operator<<(std::ostream& out, const locator::node& node) {
     fmt::print(out, "{}", node);

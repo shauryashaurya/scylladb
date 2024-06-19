@@ -56,11 +56,13 @@ public:
 
     // Functions we need to override to subclass schema_altering_statement
     virtual future<> check_access(query_processor& qp, const service::client_state& state) const override;
-    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, api::timestamp_type) const override;
+    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const override;
 
     virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
 
     // FIXME: continue here. See create_table_statement.hh and CreateViewStatement.java
+private:
+    ::shared_ptr<event_t> created_event() const;
 };
 
 }

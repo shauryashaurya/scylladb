@@ -8,29 +8,20 @@
 
 #include "counters.hh"
 
+#include <algorithm>
 #include <random>
 
 #include <seastar/core/thread.hh>
 #include <seastar/testing/random.hh>
 
 #include <boost/range/algorithm/sort.hpp>
-#include <boost/range/algorithm/random_shuffle.hpp>
 
 #include "test/lib/scylla_test_case.hh"
+#include "test/lib/test_utils.hh"
 #include "schema/schema_builder.hh"
 #include "keys.hh"
 #include "mutation/mutation.hh"
 #include "mutation/frozen_mutation.hh"
-
-std::ostream& boost_test_print_type(std::ostream& os, const counter_shard_view& csv) {
-    fmt::print(os, "{}", csv);
-    return os;
-}
-
-std::ostream& boost_test_print_type(std::ostream& os, const counter_cell_view& ccv) {
-    fmt::print(os, "{}", ccv);
-    return os;
-}
 
 void verify_shard_order(counter_cell_view ccv) {
     if (ccv.shards().begin() == ccv.shards().end()) {
@@ -504,7 +495,7 @@ SEASTAR_TEST_CASE(test_sanitize_corrupted_cells) {
             auto c1 = atomic_cell_or_collection(b1.build(0));
 
             // Corrupt it by changing shard order and adding duplicates
-            boost::range::random_shuffle(shards);
+            std::ranges::shuffle(shards, gen);
 
             std::uniform_int_distribution<unsigned> duplicate_count_dist(1, shard_count / 2);
             auto duplicate_count = duplicate_count_dist(gen);
@@ -513,7 +504,7 @@ SEASTAR_TEST_CASE(test_sanitize_corrupted_cells) {
                 shards.emplace_back(cs);
             }
 
-            boost::range::random_shuffle(shards);
+            std::ranges::shuffle(shards, gen);
 
             // Sanitize
             counter_cell_builder b2;

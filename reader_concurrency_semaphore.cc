@@ -28,15 +28,18 @@ logger rcslog("reader_concurrency_semaphore");
 
 struct reader_concurrency_semaphore::inactive_read {
     flat_mutation_reader_v2 reader;
+    const dht::partition_range* range = nullptr;
     eviction_notify_handler notify_handler;
     timer<lowres_clock> ttl_timer;
     inactive_read_handle* handle = nullptr;
 
-    explicit inactive_read(flat_mutation_reader_v2 reader_) noexcept
+    explicit inactive_read(flat_mutation_reader_v2 reader_, const dht::partition_range* range_) noexcept
         : reader(std::move(reader_))
+        , range(range_)
     { }
     inactive_read(inactive_read&& o)
         : reader(std::move(o.reader))
+        , range(o.range)
         , notify_handler(std::move(o.notify_handler))
         , ttl_timer(std::move(o.ttl_timer))
         , handle(o.handle)
@@ -849,6 +852,12 @@ void reader_concurrency_semaphore::inactive_read_handle::abandon() noexcept {
         auto& sem = permit.semaphore();
         sem.close_reader(std::move(permit.aux_data().ir->reader));
         sem.dequeue_permit(permit);
+        // Break the handle <-> inactive read connection, to prevent the inactive
+        // read attempting to detach(). Not only is that unnecessary (the handle
+        // is abandoning the inactive read), but detach() will reset _permit,
+        // which might be the last permit instance alive. Destroying it could
+        // yank out *this from under our feet.
+        permit.aux_data().ir->handle = nullptr;
         permit.aux_data().ir.reset();
     }
 }
@@ -974,10 +983,11 @@ void reader_concurrency_semaphore::signal(const resources& r) noexcept {
 namespace sm = seastar::metrics;
 static const sm::label class_label("class");
 
-reader_concurrency_semaphore::reader_concurrency_semaphore(int count, ssize_t memory, sstring name, size_t max_queue_length,
+reader_concurrency_semaphore::reader_concurrency_semaphore(utils::updateable_value<int> count, ssize_t memory, sstring name, size_t max_queue_length,
             utils::updateable_value<uint32_t> serialize_limit_multiplier, utils::updateable_value<uint32_t> kill_limit_multiplier, register_metrics metrics)
-    : _initial_resources(count, memory)
-    , _resources(count, memory)
+    : _initial_resources(count(), memory)
+    , _resources(count(), memory)
+    , _count_observer(count.observe([this] (const int& new_count) { set_resources({new_count, _initial_resources.memory}); }))
     , _name(std::move(name))
     , _max_queue_length(max_queue_length)
     , _serialize_limit_multiplier(std::move(serialize_limit_multiplier))
@@ -1040,7 +1050,7 @@ reader_concurrency_semaphore::reader_concurrency_semaphore(int count, ssize_t me
 
 reader_concurrency_semaphore::reader_concurrency_semaphore(no_limits, sstring name, register_metrics metrics)
     : reader_concurrency_semaphore(
-            std::numeric_limits<int>::max(),
+            utils::updateable_value(std::numeric_limits<int>::max()),
             std::numeric_limits<ssize_t>::max(),
             std::move(name),
             std::numeric_limits<size_t>::max(),
@@ -1063,7 +1073,8 @@ reader_concurrency_semaphore::~reader_concurrency_semaphore() {
     }
 }
 
-reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore::register_inactive_read(flat_mutation_reader_v2 reader) noexcept {
+reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore::register_inactive_read(flat_mutation_reader_v2 reader,
+        const dht::partition_range* range) noexcept {
     auto& permit = reader.permit();
     if (permit->get_state() == reader_permit::state::waiting_for_memory) {
         // Kill all outstanding memory requests, the read is going to be evicted.
@@ -1077,7 +1088,7 @@ reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore:
     }
     if (!should_evict_inactive_read()) {
       try {
-        permit->aux_data().ir.emplace(std::move(reader));
+        permit->aux_data().ir.emplace(std::move(reader), range);
         permit->unlink();
         _inactive_reads.push_back(*permit);
         ++_stats.inactive_reads;
@@ -1151,14 +1162,21 @@ void reader_concurrency_semaphore::clear_inactive_reads() {
     }
 }
 
-future<> reader_concurrency_semaphore::evict_inactive_reads_for_table(table_id id) noexcept {
+future<> reader_concurrency_semaphore::evict_inactive_reads_for_table(table_id id, const dht::partition_range* range) noexcept {
+    auto overlaps_with_range = [range] (const reader_concurrency_semaphore::inactive_read& ir) {
+        if (!range || !ir.range) {
+            return true;
+        }
+        return ir.range->overlaps(*range, dht::ring_position_comparator(*ir.reader.schema()));
+    };
+
     permit_list_type evicted_readers;
     auto it = _inactive_reads.begin();
     while (it != _inactive_reads.end()) {
         auto& permit = *it;
         auto& ir = *permit.aux_data().ir;
         ++it;
-        if (ir.reader.schema()->id() == id) {
+        if (ir.reader.schema()->id() == id && overlaps_with_range(ir)) {
             do_detach_inactive_reader(permit, evict_reason::manual);
             permit.unlink();
             evicted_readers.push_back(permit);

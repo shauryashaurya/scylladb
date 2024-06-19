@@ -9,7 +9,6 @@
 #include "seastarx.hh"
 #include "cql3/statements/drop_service_level_statement.hh"
 #include "service/qos/service_level_controller.hh"
-#include "transport/messages/result_message.hh"
 #include "service/client_state.hh"
 #include "service/query_state.hh"
 
@@ -35,11 +34,11 @@ drop_service_level_statement::execute(query_processor& qp,
         service::query_state &state,
         const query_options &,
         std::optional<service::group0_guard> guard) const {
-    return state.get_service_level_controller().drop_distributed_service_level(_service_level, _if_exists, std::move(guard)).then([] {
-        using void_result_msg = cql_transport::messages::result_message::void_message;
-        using result_msg = cql_transport::messages::result_message;
-        return ::static_pointer_cast<result_msg>(make_shared<void_result_msg>());
-    });
+    service::group0_batch mc{std::move(guard)};
+    auto& sl = state.get_service_level_controller();
+    co_await sl.drop_distributed_service_level(_service_level, _if_exists, mc);
+    co_await sl.commit_mutations(std::move(mc));
+    co_return nullptr;
 }
 }
 }

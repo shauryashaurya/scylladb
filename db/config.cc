@@ -74,9 +74,9 @@ hinted_handoff_enabled_to_json(const db::config::hinted_handoff_enabled_type& h)
     return value_to_json(h.to_configuration_string());
 }
 
-// Convert a value that can be printed with operator<<, or a vector of
+// Convert a value that can be printed with fmt::format, or a vector of
 // such values, to JSON. An example is enum_option<T>, because enum_option<T>
-// has a operator<<.
+// has a specialization for fmt::formatter.
 template <typename T>
 static json::json_return_type
 printable_to_json(const T& e) {
@@ -416,16 +416,16 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     */
     , commit_failure_policy(this, "commit_failure_policy", value_status::Unused, "stop",
         "Policy for commit disk failures:\n"
-        "* die          Shut down gossip and Thrift and kill the JVM, so the node can be replaced.\n"
-        "* stop         Shut down gossip and Thrift, leaving the node effectively dead, but can be inspected using JMX.\n"
+        "* die          Shut down gossip, so the node can be replaced.\n"
+        "* stop         Shut down gossip, leaving the node effectively dead, but can be inspected using the RESTful APIs.\n"
         "* stop_commit  Shut down the commit log, letting writes collect but continuing to service reads (as in pre-2.0.5 Cassandra).\n"
         "* ignore       Ignore fatal errors and let the batches fail."
         , {"die", "stop", "stop_commit", "ignore"})
     , disk_failure_policy(this, "disk_failure_policy", value_status::Unused, "stop",
         "Sets how Scylla responds to disk failure. Recommend settings are stop or best_effort.\n"
-        "* die              Shut down gossip and Thrift and kill the JVM for any file system errors or single SSTable errors, so the node can be replaced.\n"
-        "* stop_paranoid    Shut down gossip and Thrift even for single SSTable errors.\n"
-        "* stop             Shut down gossip and Thrift, leaving the node effectively dead, but available for inspection using JMX.\n"
+        "* die              Shut down gossip for any file system errors or single SSTable errors, so the node can be replaced.\n"
+        "* stop_paranoid    Shut down gossip even for single SSTable errors.\n"
+        "* stop             Shut down gossip, leaving the node effectively dead, but available for inspection using the RESTful APIs.\n"
         "* best_effort      Stop using the failed disk and respond to requests based on the remaining available SSTables. This means you will see obsolete data at consistency level of ONE.\n"
         "* ignore           Ignores fatal errors and lets the requests fail; all file system errors are logged but otherwise ignored. Scylla acts as in versions prior to Cassandra 1.2.\n"
         "Related information: Handling Disk Failures In Cassandra 1.2 blog and Recovering from a single disk failure using JBOD.\n"
@@ -442,7 +442,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "\n"
         "Related information: Snitches\n")
     , rpc_address(this, "rpc_address", value_status::Used, "localhost",
-        "The listen address for client connections (Thrift RPC service and native transport).Valid values are:\n"
+        "The listen address for client connections (native transport).Valid values are:\n"
         "* unset: Resolves the address using the hostname configuration of the node. If left unset, the hostname must resolve to the IP address of this node using /etc/hostname, /etc/hosts, or DNS.\n"
         "* 0.0.0.0: Listens on all configured interfaces, but you must set the broadcast_rpc_address to a value other than 0.0.0.0.\n"
         "* IP address\n"
@@ -515,6 +515,8 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "\n"
         "Related information: Failure detection and recovery")
     , failure_detector_timeout_in_ms(this, "failure_detector_timeout_in_ms", liveness::LiveUpdate, value_status::Used, 20 * 1000, "Maximum time between two successful echo message before gossip mark a node down in milliseconds.\n")
+    , direct_failure_detector_ping_timeout_in_ms(this, "direct_failure_detector_ping_timeout_in_ms", value_status::Used, 600, "Duration after which the direct failure detector aborts a ping message, so the next ping can start.\n"
+        "Note: this failure detector is used by Raft, and is different from gossiper's failure detector (configured by `failure_detector_timeout_in_ms`).\n")
     /**
     * @Group Performance tuning properties
     * @GroupDescription Tuning performance and system resource utilization, including commit log, compaction, memory, disk I/O, CPU, reads, and writes.
@@ -797,26 +799,12 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     */
     , broadcast_rpc_address(this, "broadcast_rpc_address", value_status::Used, {/* unset */},
         "RPC address to broadcast to drivers and other Scylla nodes. This cannot be set to 0.0.0.0. If blank, it is set to the value of the rpc_address or rpc_interface. If rpc_address or rpc_interfaceis set to 0.0.0.0, this property must be set.\n")
-    , rpc_port(this, "rpc_port", "thrift_port", value_status::Used, 9160,
+    , rpc_port(this, "rpc_port", "thrift_port", value_status::Unused, 0,
         "Thrift port for client connections.")
-    , start_rpc(this, "start_rpc", value_status::Used, false,
+    , start_rpc(this, "start_rpc", value_status::Unused, false,
         "Starts the Thrift RPC server")
     , rpc_keepalive(this, "rpc_keepalive", value_status::Used, true,
-        "Enable or disable keepalive on client connections (RPC or native).")
-    , rpc_max_threads(this, "rpc_max_threads", value_status::Invalid, 0,
-        "Regardless of your choice of RPC server (rpc_server_type), the number of maximum requests in the RPC thread pool dictates how many concurrent requests are possible. However, if you are using the parameter sync in the rpc_server_type, it also dictates the number of clients that can be connected. For a large number of client connections, this could cause excessive memory usage for the thread stack. Connection pooling on the client side is highly recommended. Setting a maximum thread pool size acts as a safeguard against misbehaved clients. If the maximum is reached, Cassandra blocks additional connections until a client disconnects.")
-    , rpc_min_threads(this, "rpc_min_threads", value_status::Invalid, 16,
-        "Sets the minimum thread pool size for remote procedure calls.")
-    , rpc_recv_buff_size_in_bytes(this, "rpc_recv_buff_size_in_bytes", value_status::Unused, 0,
-        "Sets the receiving socket buffer size for remote procedure calls.")
-    , rpc_send_buff_size_in_bytes(this, "rpc_send_buff_size_in_bytes", value_status::Unused, 0,
-        "Sets the sending socket buffer size in bytes for remote procedure calls.")
-    , rpc_server_type(this, "rpc_server_type", value_status::Unused, "sync",
-        "Cassandra provides three options for the RPC server. On Windows, sync is about 30% slower than hsha. On Linux, sync and hsha performance is about the same, but hsha uses less memory.\n"
-        "* sync    (Default One thread per Thrift connection.) For a very large number of clients, memory is the limiting factor. On a 64-bit JVM, 180KB is the minimum stack size per thread and corresponds to your use of virtual memory. Physical memory may be limited depending on use of stack space.\n"
-        "* hsh      Half synchronous, half asynchronous. All Thrift clients are handled asynchronously using a small number of threads that does not vary with the number of clients and thus scales well to many clients. The RPC requests are synchronous (one thread per active request).\n"
-        "*         Note: When selecting this option, you must change the default value (unlimited) of rpc_max_threads.\n"
-        "* Your own RPC server: You must provide a fully-qualified class name of an o.a.c.t.TServerFactory that can create a server instance.")
+        "Enable or disable keepalive on client connections (CQL native, Redis and the maintenance socket).")
     , cache_hit_rate_read_balancing(this, "cache_hit_rate_read_balancing", value_status::Used, true,
         "This boolean controls whether the replicas for read query will be chosen based on cache hit ratio.")
     /**
@@ -862,14 +850,6 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "* throttle_limit: The number of in-flight requests per client. Requests beyond this limit are queued up until running requests complete. Recommended value is ((concurrent_reads + concurrent_writes) × 2)\n"
         "* default_weight: (Default: 1 **)  How many requests are handled during each turn of the RoundRobin.\n"
         "* weights: (Default: Keyspace: 1)  Takes a list of keyspaces. It sets how many requests are handled during each turn of the RoundRobin, based on the request_scheduler_id.")
-    /**
-    * @Group Thrift interface properties
-    * @GroupDescription Legacy API for older clients. CQL is a simpler and better API for Scylla.
-    */
-    , thrift_framed_transport_size_in_mb(this, "thrift_framed_transport_size_in_mb", value_status::Unused, 15,
-        "Frame size (maximum field length) for Thrift. The frame is the row or part of the row the application is inserting.")
-    , thrift_max_message_length_in_mb(this, "thrift_max_message_length_in_mb", value_status::Used, 16,
-        "The maximum length of a Thrift message in megabytes, including all fields and internal Thrift overhead (1 byte of overhead for each frame). Message length is usually used in conjunction with batches. A frame length greater than or equal to 24 accommodates a batch with four inserts, each of which is 24 bytes. The required message length is greater than or equal to 24+24+24+24+4 (number of frames).")
     /**
     * @Group Security properties
     * @GroupDescription Server and client security settings.
@@ -968,6 +948,8 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , enable_repair_based_node_ops(this, "enable_repair_based_node_ops", liveness::LiveUpdate, value_status::Used, true, "Set true to use enable repair based node operations instead of streaming based.")
     , allowed_repair_based_node_ops(this, "allowed_repair_based_node_ops", liveness::LiveUpdate, value_status::Used, "replace,removenode,rebuild,bootstrap,decommission", "A comma separated list of node operations which are allowed to enable repair based node operations. The operations can be bootstrap, replace, removenode, decommission and rebuild.")
     , enable_compacting_data_for_streaming_and_repair(this, "enable_compacting_data_for_streaming_and_repair", liveness::LiveUpdate, value_status::Used, true, "Enable the compacting reader, which compacts the data for streaming and repair (load'n'stream included) before sending it to, or synchronizing it with peers. Can reduce the amount of data to be processed by removing dead data, but adds CPU overhead.")
+    , repair_partition_count_estimation_ratio(this, "repair_partition_count_estimation_ratio", liveness::LiveUpdate, value_status::Used, 0.1,
+        "Specify the fraction of partitions written by repair out of the total partitions. The value is currently only used for bloom filter estimation. Value is between 0 and 1.")
     , ring_delay_ms(this, "ring_delay_ms", value_status::Used, 30 * 1000, "Time a node waits to hear from other nodes before joining the ring in milliseconds. Same as -Dcassandra.ring_delay_ms in cassandra.")
     , shadow_round_ms(this, "shadow_round_ms", value_status::Used, 300 * 1000, "The maximum gossip shadow round time. Can be used to reduce the gossip feature check time during node boot up.")
     , fd_max_interval_ms(this, "fd_max_interval_ms", value_status::Used, 2 * 1000, "The maximum failure_detector interval time in milliseconds. Interval larger than the maximum will be ignored. Larger cluster may need to increase the default.")
@@ -987,7 +969,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , unspooled_dirty_soft_limit(this, "unspooled_dirty_soft_limit", value_status::Used, 0.6, "Soft limit of unspooled dirty memory expressed as a portion of the hard limit.")
     , sstable_summary_ratio(this, "sstable_summary_ratio", value_status::Used, 0.0005, "Enforces that 1 byte of summary is written for every N (2000 by default)"
         "bytes written to data file. Value must be between 0 and 1.")
-    , components_memory_reclaim_threshold(this, "components_memory_reclaim_threshold", liveness::LiveUpdate, value_status::Used, .1, "Ratio of available memory for all in-memory components of SSTables in a shard beyond which the memory will be reclaimed from components until it falls back under the threshold. Currently, this limit is only enforced for bloom filters.")
+    , components_memory_reclaim_threshold(this, "components_memory_reclaim_threshold", liveness::LiveUpdate, value_status::Used, .2, "Ratio of available memory for all in-memory components of SSTables in a shard beyond which the memory will be reclaimed from components until it falls back under the threshold. Currently, this limit is only enforced for bloom filters.")
     , large_memory_allocation_warning_threshold(this, "large_memory_allocation_warning_threshold", value_status::Used, size_t(1) << 20, "Warn about memory allocations above this size; set to zero to disable.")
     , enable_deprecated_partitioners(this, "enable_deprecated_partitioners", value_status::Used, false, "Enable the byteordered and random partitioners. These partitioners are deprecated and will be removed in a future version.")
     , enable_keyspace_column_family_metrics(this, "enable_keyspace_column_family_metrics", value_status::Used, false, "Enable per keyspace and per column family metrics reporting.")
@@ -1027,6 +1009,8 @@ db::config::config(std::shared_ptr<db::extensions> exts)
             "Start serializing reads after their collective memory consumption goes above $normal_limit * $multiplier.")
     , reader_concurrency_semaphore_kill_limit_multiplier(this, "reader_concurrency_semaphore_kill_limit_multiplier", liveness::LiveUpdate, value_status::Used, 4,
             "Start killing reads after their collective memory consumption goes above $normal_limit * $multiplier.")
+    , maintenance_reader_concurrency_semaphore_count_limit(this, "maintenance_reader_concurrency_semaphore_count_limit", liveness::LiveUpdate, value_status::Used, 10,
+            "Allow up to this many maintenance (e.g. streaming and repair) reads per shard to progress at the same time.")
     , twcs_max_window_count(this, "twcs_max_window_count", liveness::LiveUpdate, value_status::Used, 50,
             "The maximum number of compaction windows allowed when making use of TimeWindowCompactionStrategy. A setting of 0 effectively disables the restriction.")
     , initial_sstable_loading_concurrency(this, "initial_sstable_loading_concurrency", value_status::Used, 4u,
@@ -1153,6 +1137,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , service_levels_interval(this, "service_levels_interval_ms", liveness::LiveUpdate, value_status::Used, 10000, "Controls how often service levels module polls configuration table")
     , error_injections_at_startup(this, "error_injections_at_startup", error_injection_value_status, {}, "List of error injections that should be enabled on startup.")
     , topology_barrier_stall_detector_threshold_seconds(this, "topology_barrier_stall_detector_threshold_seconds", value_status::Used, 2, "Report sites blocking topology barrier if it takes longer than this.")
+    , enable_tablets(this, "enable_tablets", value_status::Used, false, "Enable tablets for newly created keyspaces")
     , default_log_level(this, "default_log_level", value_status::Used)
     , logger_log_level(this, "logger_log_level", value_status::Used)
     , log_to_stdout(this, "log_to_stdout", value_status::Used)
@@ -1224,21 +1209,11 @@ struct fmt::formatter<db::seed_provider_type> {
 
 namespace db {
 
-std::ostream& operator<<(std::ostream& os, const db::seed_provider_type& s) {
-    os << "seed_provider_type{class=" << s.class_name << ", params=" << s.parameters << "}";
-    return os;
-}
-
 std::istream& operator>>(std::istream& is, db::seed_provider_type& s) {
     // FIXME -- this operator is used, in particular, by boost lexical_cast<>
     // it's here just to make the code compile, but it's not yet called for real
     throw std::runtime_error("reading seed_provider_type from istream is not implemented");
     return is;
-}
-
-std::ostream& operator<<(std::ostream& os, const error_injection_at_startup& eias) {
-    fmt::print(os, "{}", eias);
-    return os;
 }
 
 std::istream& operator>>(std::istream& is, error_injection_at_startup& eias) {
@@ -1348,7 +1323,7 @@ std::map<sstring, db::experimental_features_t::feature> db::experimental_feature
         {"consistent-topology-changes", feature::UNUSED},
         {"broadcast-tables", feature::BROADCAST_TABLES},
         {"keyspace-storage-options", feature::KEYSPACE_STORAGE_OPTIONS},
-        {"tablets", feature::TABLETS},
+        {"tablets", feature::UNUSED},
     };
 }
 

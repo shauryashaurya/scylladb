@@ -29,6 +29,7 @@
 #include "mutation_partition_view.hh"
 #include "tombstone_gc.hh"
 #include "utils/unconst.hh"
+#include "mutation/async_utils.hh"
 
 logging::logger mplog("mutation_partition");
 
@@ -465,29 +466,6 @@ stop_iteration mutation_partition::apply_monotonically(const schema& s, mutation
     return stop_iteration::yes;
 }
 
-stop_iteration mutation_partition::apply_monotonically(const schema& s, mutation_partition&& p, const schema& p_schema,
-        mutation_application_stats& app_stats, is_preemptible preemptible, apply_resume& res) {
-    if (s.version() == p_schema.version()) {
-        return apply_monotonically(s, std::move(p), no_cache_tracker, app_stats, preemptible, res);
-    } else {
-        mutation_partition p2(p_schema, p);
-        p2.upgrade(p_schema, s);
-        return apply_monotonically(s, std::move(p2), no_cache_tracker, app_stats, is_preemptible::no, res); // FIXME: make preemptible
-    }
-}
-
-stop_iteration mutation_partition::apply_monotonically(const schema& s, mutation_partition&& p, cache_tracker *tracker,
-                                                       mutation_application_stats& app_stats) {
-    apply_resume res;
-    return apply_monotonically(s, std::move(p), tracker, app_stats, is_preemptible::no, res);
-}
-
-stop_iteration mutation_partition::apply_monotonically(const schema& s, mutation_partition&& p, const schema& p_schema,
-                                                       mutation_application_stats& app_stats) {
-    apply_resume res;
-    return apply_monotonically(s, std::move(p), p_schema, app_stats, is_preemptible::no, res);
-}
-
 void
 mutation_partition::apply(const schema& s, mutation_partition_view p,
         const schema& p_schema, mutation_application_stats& app_stats) {
@@ -495,17 +473,27 @@ mutation_partition::apply(const schema& s, mutation_partition_view p,
     mutation_partition p2(*this, copy_comparators_only{});
     partition_builder b(p_schema, p2);
     p.accept(p_schema, b);
-    apply_monotonically(s, std::move(p2), p_schema, app_stats);
+    if (s.version() != p_schema.version()) {
+        p2.upgrade(p_schema, s);
+    }
+    apply_resume res;
+    apply_monotonically(s, std::move(p2), no_cache_tracker, app_stats, is_preemptible::no, res);
 }
 
 void mutation_partition::apply(const schema& s, const mutation_partition& p,
         const schema& p_schema, mutation_application_stats& app_stats) {
     // FIXME: Optimize
-    apply_monotonically(s, mutation_partition(p_schema, p), p_schema, app_stats);
+    mutation_partition p2(p_schema, p);
+    if (s.version() != p_schema.version()) {
+        p2.upgrade(p_schema, s);
+    }
+    apply_resume res;
+    apply_monotonically(s, std::move(p2), no_cache_tracker, app_stats, is_preemptible::no, res);
 }
 
 void mutation_partition::apply(const schema& s, mutation_partition&& p, mutation_application_stats& app_stats) {
-    apply_monotonically(s, std::move(p), no_cache_tracker, app_stats);
+    apply_resume res;
+    apply_monotonically(s, std::move(p), no_cache_tracker, app_stats, is_preemptible::no, res);
 }
 
 tombstone
@@ -857,37 +845,6 @@ void appending_hash<row>::operator()(Hasher& h, const row& cells, const schema& 
 }
 // Instantiation for mutation_test.cc
 template void appending_hash<row>::operator()<xx_hasher>(xx_hasher& h, const row& cells, const schema& s, column_kind kind, const query::column_id_vector& columns, max_timestamp& max_ts) const;
-
-template<>
-void appending_hash<row>::operator()<legacy_xx_hasher_without_null_digest>(legacy_xx_hasher_without_null_digest& h, const row& cells, const schema& s, column_kind kind, const query::column_id_vector& columns, max_timestamp& max_ts) const {
-    for (auto id : columns) {
-        const cell_and_hash* cell_and_hash = cells.find_cell_and_hash(id);
-        if (!cell_and_hash) {
-            return;
-        }
-        auto&& def = s.column_at(kind, id);
-        if (def.is_atomic()) {
-            max_ts.update(cell_and_hash->cell.as_atomic_cell(def).timestamp());
-            if (cell_and_hash->hash) {
-                feed_hash(h, *cell_and_hash->hash);
-            } else {
-                legacy_xx_hasher_without_null_digest cellh;
-                feed_hash(cellh, cell_and_hash->cell.as_atomic_cell(def), def);
-                feed_hash(h, cellh.finalize_uint64());
-            }
-        } else {
-            auto cm = cell_and_hash->cell.as_collection_mutation();
-            max_ts.update(cm.last_update(*def.type));
-            if (cell_and_hash->hash) {
-                feed_hash(h, *cell_and_hash->hash);
-            } else {
-                legacy_xx_hasher_without_null_digest cellh;
-                feed_hash(cellh, cm, def);
-                feed_hash(h, cellh.finalize_uint64());
-            }
-        }
-    }
-}
 
 cell_hash_opt row::cell_hash_for(column_id id) const {
     const cell_and_hash* cah = _cells.get(id);
@@ -2307,7 +2264,7 @@ to_data_query_result(const reconcilable_result& r, schema_ptr s, const query::pa
         }
     } else {
         for (const partition& p : r.partitions()) {
-            auto m = co_await p.mut().unfreeze_gently(s);
+            auto m = co_await unfreeze_gently(p.mut(), s);
             const auto res = co_await std::move(m).consume_gently(consumer, reverse);
             if (res.stop == stop_iteration::yes) {
                 break;

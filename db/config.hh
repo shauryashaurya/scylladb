@@ -62,10 +62,8 @@ struct seed_provider_type {
     bool operator==(const seed_provider_type& other) const {
         return class_name == other.class_name && parameters == other.parameters;
     }
-    friend std::ostream& operator<<(std::ostream& os, const seed_provider_type&);
 };
 
-std::ostream& operator<<(std::ostream& os, const db::seed_provider_type& s);
 inline std::istream& operator>>(std::istream& is, seed_provider_type&);
 
 // Describes a single error injection that should be enabled at startup.
@@ -81,7 +79,6 @@ struct error_injection_at_startup {
     }
 };
 
-std::ostream& operator<<(std::ostream& os, const error_injection_at_startup&);
 std::istream& operator>>(std::istream& is, error_injection_at_startup&);
 
 }
@@ -112,7 +109,6 @@ struct experimental_features_t {
         ALTERNATOR_STREAMS,
         BROADCAST_TABLES,
         KEYSPACE_STORAGE_OPTIONS,
-        TABLETS,
     };
     static std::map<sstring, feature> map(); // See enum_option.
     static std::vector<enum_option<experimental_features_t>> all();
@@ -210,6 +206,7 @@ public:
     named_value<bool> snapshot_before_compaction;
     named_value<uint32_t> phi_convict_threshold;
     named_value<uint32_t> failure_detector_timeout_in_ms;
+    named_value<uint32_t> direct_failure_detector_ping_timeout_in_ms;
     named_value<sstring> commitlog_sync;
     named_value<uint32_t> commitlog_segment_size_in_mb;
     named_value<uint32_t> schema_commitlog_segment_size_in_mb;
@@ -296,11 +293,6 @@ public:
     named_value<uint16_t> rpc_port;
     named_value<bool> start_rpc;
     named_value<bool> rpc_keepalive;
-    named_value<uint32_t> rpc_max_threads;
-    named_value<uint32_t> rpc_min_threads;
-    named_value<uint32_t> rpc_recv_buff_size_in_bytes;
-    named_value<uint32_t> rpc_send_buff_size_in_bytes;
-    named_value<sstring> rpc_server_type;
     named_value<bool> cache_hit_rate_read_balancing;
     named_value<double> dynamic_snitch_badness_threshold;
     named_value<uint32_t> dynamic_snitch_reset_interval_in_ms;
@@ -314,8 +306,6 @@ public:
     named_value<sstring> request_scheduler;
     named_value<sstring> request_scheduler_id;
     named_value<string_map> request_scheduler_options;
-    named_value<uint32_t> thrift_framed_transport_size_in_mb;
-    named_value<uint32_t> thrift_max_message_length_in_mb;
     named_value<sstring> authenticator;
     named_value<sstring> internode_authenticator;
     named_value<sstring> authorizer;
@@ -347,6 +337,7 @@ public:
     named_value<bool> enable_repair_based_node_ops;
     named_value<sstring> allowed_repair_based_node_ops;
     named_value<bool> enable_compacting_data_for_streaming_and_repair;
+    named_value<double> repair_partition_count_estimation_ratio;
     named_value<uint32_t> ring_delay_ms;
     named_value<uint32_t> shadow_round_ms;
     named_value<uint32_t> fd_max_interval_ms;
@@ -389,6 +380,7 @@ public:
     named_value<uint64_t> max_memory_for_unlimited_query_hard_limit;
     named_value<uint32_t> reader_concurrency_semaphore_serialize_limit_multiplier;
     named_value<uint32_t> reader_concurrency_semaphore_kill_limit_multiplier;
+    named_value<int> maintenance_reader_concurrency_semaphore_count_limit;
     named_value<uint32_t> twcs_max_window_count;
     named_value<unsigned> initial_sstable_loading_concurrency;
     named_value<bool> enable_3_1_0_compatibility_mode;
@@ -494,6 +486,7 @@ public:
 
     named_value<std::vector<error_injection_at_startup>> error_injections_at_startup;
     named_value<double> topology_barrier_stall_detector_threshold_seconds;
+    named_value<bool> enable_tablets;
 
     static const sstring default_tls_priority;
 private:

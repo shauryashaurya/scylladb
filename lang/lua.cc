@@ -794,7 +794,7 @@ struct from_lua_visitor {
         if (error_pos) {
             throw exceptions::invalid_request_exception(format("value is not valid utf8, invalid character at byte offset {}", *error_pos));
         }
-        return std::move(s);
+        return s;
     }
 
     data_value operator()(const ascii_type_impl& t) {
@@ -1047,14 +1047,6 @@ static void push_argument(lua_State* l, const data_value& arg) {
         return;
     }
     ::visit(arg, to_lua_visitor{l});
-}
-
-lua::runtime_config lua::make_runtime_config(const db::config& config) {
-    utils::updateable_value<unsigned> max_bytes(config.user_defined_function_allocation_limit_bytes);
-    utils::updateable_value<unsigned> max_contiguous(config.user_defined_function_contiguous_allocation_limit_bytes());
-    utils::updateable_value<unsigned> timeout_in_ms(config.user_defined_function_time_limit_ms());
-
-    return lua::runtime_config{std::move(timeout_in_ms), std::move(max_bytes), std::move(max_contiguous)};
 }
 
 // run the script for at most max_instructions

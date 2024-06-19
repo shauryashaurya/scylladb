@@ -83,20 +83,19 @@ void set_task_manager_test(http_context& ctx, routes& r, sharded<tasks::task_man
     });
 
     tmt::finish_test_task.set(r, [&tm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
-        auto id = tasks::task_id{utils::UUID{req->param["task_id"]}};
+        auto id = tasks::task_id{utils::UUID{req->get_path_param("task_id")}};
         auto it = req->query_parameters.find("error");
         bool fail = it != req->query_parameters.end();
         std::string error = fail ? it->second : "";
 
         try {
-            co_await tasks::task_manager::invoke_on_task(tm, id, [fail, error = std::move(error)] (tasks::task_manager::task_ptr task) {
+            co_await tasks::task_manager::invoke_on_task(tm, id, [fail, error = std::move(error)] (tasks::task_manager::task_ptr task) -> future<> {
                 tasks::test_task test_task{task};
                 if (fail) {
-                    test_task.finish_failed(std::make_exception_ptr(std::runtime_error(error)));
+                    co_await test_task.finish_failed(std::make_exception_ptr(std::runtime_error(error)));
                 } else {
-                    test_task.finish();
+                    co_await test_task.finish();
                 }
-                return make_ready_future<>();
             });
         } catch (tasks::task_manager::task_not_found& e) {
             throw bad_param_exception(e.what());

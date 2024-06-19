@@ -25,6 +25,8 @@
 #include "auth/resource.hh"
 #include "auth/sasl_challenge.hh"
 
+#include "service/raft/raft_group0_client.hh"
+
 namespace db {
     class config;
 }
@@ -106,7 +108,7 @@ public:
     ///
     /// The options provided must be a subset of `supported_options()`.
     ///
-    virtual future<> create(std::string_view role_name, const authentication_options& options) = 0;
+    virtual future<> create(std::string_view role_name, const authentication_options& options, ::service::group0_batch& mc) = 0;
 
     ///
     /// Alter the authentication record of an existing user.
@@ -115,12 +117,12 @@ public:
     ///
     /// Callers must ensure that the specification of `alterable_options()` is adhered to.
     ///
-    virtual future<> alter(std::string_view role_name, const authentication_options& options) = 0;
+    virtual future<> alter(std::string_view role_name, const authentication_options& options, ::service::group0_batch& mc) = 0;
 
     ///
     /// Delete the authentication record for a user. This will disallow the user from logging in.
     ///
-    virtual future<> drop(std::string_view role_name) = 0;
+    virtual future<> drop(std::string_view role_name, ::service::group0_batch&) = 0;
 
     ///
     /// Query for custom options (those corresponding to \ref authentication_options::options).
