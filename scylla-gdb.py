@@ -3867,11 +3867,11 @@ class scylla_fiber(gdb.Command):
         # So if the task is a coroutine, we should be able to find the resume function via offsetting by -2.
         # AFAIK both major compilers respect this convention.
         if resolved_symbol.startswith('vtable for seastar::internal::coroutine_traits_base'):
-            coroutine_resume_fn = resolve((gdb.Value(ptr).cast(self._vptr_type) - 2).dereference())
-            if coroutine_resume_fn:
-                resolved_symbol += f" (.resume is {coroutine_resume_fn})"
+            if block := gdb.block_for_pc((gdb.Value(ptr).cast(self._vptr_type) - 2).dereference()):
+                resume = block.function
+                resolved_symbol += f" ({resume.print_name} at {resume.symtab.filename}:{resume.line})"
             else:
-                resolved_symbol += f" (.resume is unknown)"
+                resolved_symbol += f" (unknown coroutine)"
 
         if using_seastar_allocator:
             if ptr_meta is None:
@@ -5741,12 +5741,12 @@ class scylla_gdb_func_downcast_vptr(gdb.Function):
 
     Example:
     (gdb) p $1
-    $2 = (flat_mutation_reader::impl *) 0x60b03363b900
+    $2 = (mutation_reader::impl *) 0x60b03363b900
     (gdb) p $downcast_vptr(0x60b03363b900)
     $3 = (combined_mutation_reader *) 0x60b03363b900
     # The return value can also be dereferenced on the spot.
     (gdb) p *$downcast_vptr($1)
-    $4 = {<flat_mutation_reader::impl> = {_vptr.impl = 0x46a3ea8 <vtable for combined_mutation_reader+16>, _buffer = {_impl = {<std::allocator<mutation_fragment>> = ...
+    $4 = {<mutation_reader::impl> = {_vptr.impl = 0x46a3ea8 <vtable for combined_mutation_reader+16>, _buffer = {_impl = {<std::allocator<mutation_fragment>> = ...
     """
 
     def __init__(self):

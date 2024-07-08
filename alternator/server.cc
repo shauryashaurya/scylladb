@@ -22,6 +22,7 @@
 #include "auth.hh"
 #include <cctype>
 #include <string_view>
+#include <utility>
 #include "service/storage_proxy.hh"
 #include "gms/gossiper.hh"
 #include "utils/overloaded_functor.hh"
@@ -211,7 +212,9 @@ protected:
         std::unordered_set<gms::inet_address> local_dc_nodes = topology.get_datacenter_endpoints().at(local_dc);
         for (auto& ip : local_dc_nodes) {
             if (_gossiper.is_alive(ip)) {
-                rjson::push_back(results, rjson::from_string(fmt::to_string(ip)));
+                // Use the gossiped broadcast_rpc_address if available instead
+                // of the internal IP address "ip". See discussion in #18711.
+                rjson::push_back(results, rjson::from_string(_gossiper.get_rpc_address(ip)));
             }
         }
         rep->set_status(reply::status_type::ok);
@@ -633,7 +636,7 @@ future<> server::json_parser::stop() {
 
 const char* api_error::what() const noexcept {
     if (_what_string.empty()) {
-        _what_string = format("{} {}: {}", static_cast<int>(_http_code), _type, _msg);
+        _what_string = format("{} {}: {}", std::to_underlying(_http_code), _type, _msg);
     }
     return _what_string.c_str();
 }

@@ -17,7 +17,6 @@
 #include "sstables/sstables.hh"
 #include "sstables/compress.hh"
 #include "sstables/metadata_collector.hh"
-#include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
 #include "schema/schema.hh"
 #include "schema/schema_builder.hh"
@@ -29,7 +28,7 @@
 #include <seastar/core/do_with.hh>
 #include <seastar/testing/test_case.hh>
 #include "dht/i_partitioner.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/mutation_assertions.hh"
 #include "counters.hh"
 #include "test/lib/index_reader_assertions.hh"
@@ -54,7 +53,6 @@
 #include "readers/from_fragments_v2.hh"
 #include "test/lib/random_schema.hh"
 #include "test/lib/exception_utils.hh"
-#include "test/lib/eventually.hh"
 
 namespace fs = std::filesystem;
 
@@ -288,12 +286,12 @@ SEASTAR_TEST_CASE(datafile_generation_16_s3, *boost::unit_test::precondition(tes
 }
 
 // mutation_reader for sstable keeping all the required objects alive.
-static flat_mutation_reader_v2 sstable_reader_v2(shared_sstable sst, schema_ptr s, reader_permit permit) {
+static mutation_reader sstable_reader_v2(shared_sstable sst, schema_ptr s, reader_permit permit) {
     return sst->as_mutation_source().make_reader_v2(s, std::move(permit), query::full_partition_range, s->full_slice());
 
 }
 
-static flat_mutation_reader_v2 sstable_reader_v2(shared_sstable sst, schema_ptr s, reader_permit permit, const dht::partition_range& pr) {
+static mutation_reader sstable_reader_v2(shared_sstable sst, schema_ptr s, reader_permit permit, const dht::partition_range& pr) {
     return sst->as_mutation_source().make_reader_v2(s, std::move(permit), pr, s->full_slice());
 }
 
@@ -509,7 +507,7 @@ SEASTAR_TEST_CASE(check_multi_schema) {
                 auto reader = sstable_reader_v2(sst, s, env.make_reader_permit());
                 auto close_reader = deferred_close(reader);
                 std::invoke([&] {
-                    mutation_opt m = read_mutation_from_flat_mutation_reader(reader).get();
+                    mutation_opt m = read_mutation_from_mutation_reader(reader).get();
                     BOOST_REQUIRE(m);
                     BOOST_REQUIRE(m->key().equal(*s, partition_key::from_singular(*s, 0)));
                     auto rows = m->partition().clustered_rows();
@@ -1676,7 +1674,7 @@ SEASTAR_TEST_CASE(test_repeated_tombstone_skipping) {
         for (auto&& mf : fragments) {
             mut.apply(mf);
         }
-        auto ms = make_sstable_easy(env, make_flat_mutation_reader_from_mutations_v2(table.schema(), std::move(permit), std::move(mut)), cfg, version)->as_mutation_source();
+        auto ms = make_sstable_easy(env, make_mutation_reader_from_mutations_v2(table.schema(), std::move(permit), std::move(mut)), cfg, version)->as_mutation_source();
 
         for (uint32_t i = 3; i < seq; i++) {
             auto ck1 = table.make_ckey(1);
@@ -1724,7 +1722,7 @@ SEASTAR_TEST_CASE(test_skipping_using_index) {
         sstable_writer_config cfg = env.manager().configure_writer();
         cfg.promoted_index_block_size = 1; // So that every fragment is indexed
         cfg.promoted_index_auto_scale_threshold = 0; // disable auto-scaling
-        auto ms = make_sstable_easy(env, make_flat_mutation_reader_from_mutations_v2(table.schema(), env.make_reader_permit(), partitions), cfg, version)->as_mutation_source();
+        auto ms = make_sstable_easy(env, make_mutation_reader_from_mutations_v2(table.schema(), env.make_reader_permit(), partitions), cfg, version)->as_mutation_source();
         auto rd = ms.make_reader_v2(table.schema(),
             env.make_reader_permit(),
             query::full_partition_range,
@@ -2413,7 +2411,7 @@ SEASTAR_TEST_CASE(sstable_run_identifier_correctness) {
 
         sstable_writer_config cfg = env.manager().configure_writer();
         cfg.run_identifier = sstables::run_id::create_random_id();
-        auto sst = make_sstable_easy(env, make_flat_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), std::move(mut)), cfg);
+        auto sst = make_sstable_easy(env, make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), std::move(mut)), cfg);
 
         BOOST_REQUIRE(sst->run_identifier() == cfg.run_identifier);
     });
@@ -2590,13 +2588,13 @@ SEASTAR_TEST_CASE(test_zero_estimated_partitions) {
         for (const auto version : writable_sstable_versions) {
             testlog.info("version={}", version);
 
-            auto mr = make_flat_mutation_reader_from_mutations_v2(ss.schema(), env.make_reader_permit(), mut);
+            auto mr = make_mutation_reader_from_mutations_v2(ss.schema(), env.make_reader_permit(), mut);
             sstable_writer_config cfg = env.manager().configure_writer();
             auto sst = make_sstable_easy(env, std::move(mr), cfg, version, 0);
 
             auto sst_mr = sst->as_mutation_source().make_reader_v2(s, env.make_reader_permit(), query::full_partition_range, s->full_slice());
             auto close_mr = deferred_close(sst_mr);
-            auto sst_mut = read_mutation_from_flat_mutation_reader(sst_mr).get();
+            auto sst_mut = read_mutation_from_mutation_reader(sst_mr).get();
 
             // The real test here is that we don't assert() in
             // sstables::prepare_summary() with the write_components() call above,
@@ -2661,7 +2659,7 @@ SEASTAR_TEST_CASE(test_missing_partition_end_fragment) {
             frags.push_back(mutation_fragment_v2(*s, env.make_reader_permit(), clustering_row(ss.make_ckey(0))));
             frags.push_back(mutation_fragment_v2(*s, env.make_reader_permit(), partition_end()));
 
-            auto mr = make_flat_mutation_reader_from_fragments(s, env.make_reader_permit(), std::move(frags));
+            auto mr = make_mutation_reader_from_fragments(s, env.make_reader_permit(), std::move(frags));
             auto close_mr = deferred_close(mr);
 
             auto sst = env.make_sstable(s, version);
@@ -2693,13 +2691,13 @@ SEASTAR_TEST_CASE(test_sstable_origin) {
             }
 
             // Test empty sstable_origin.
-            auto mr = make_flat_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), mut);
+            auto mr = make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), mut);
             sstable_writer_config cfg = env.manager().configure_writer("");
             auto sst = make_sstable_easy(env, std::move(mr), cfg, version, 0);
             BOOST_REQUIRE_EQUAL(sst->get_origin(), "");
 
             // Test that a random sstable_origin is stored and retrieved properly.
-            mr = make_flat_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), mut);
+            mr = make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), mut);
             sstring origin = fmt::format("test-{}", tests::random::get_sstring());
             cfg = env.manager().configure_writer(origin);
             sst = make_sstable_easy(env, std::move(mr), cfg, version, 0);
@@ -2772,7 +2770,7 @@ SEASTAR_TEST_CASE(sstable_reader_with_timeout) {
             auto timeout = db::timeout_clock::now();
             auto rd = sstp->make_reader(s, env.make_reader_permit(timeout), pr, s->full_slice());
             auto close_rd = deferred_close(rd);
-            auto f = read_mutation_from_flat_mutation_reader(rd);
+            auto f = read_mutation_from_mutation_reader(rd);
             BOOST_REQUIRE_THROW(f.get(), timed_out_error);
     });
 }
@@ -2802,7 +2800,7 @@ SEASTAR_TEST_CASE(test_validate_checksums) {
                 testlog.info("compression={}", compression_params);
                 auto sst_schema = schema_builder(schema).set_compressor_params(compression_params).build();
 
-                auto mr = make_flat_mutation_reader_from_mutations_v2(schema, permit, muts);
+                auto mr = make_mutation_reader_from_mutations_v2(schema, permit, muts);
                 auto close_mr = deferred_close(mr);
 
                 auto sst = env.make_sstable(sst_schema, version);
@@ -2883,7 +2881,7 @@ SEASTAR_TEST_CASE(test_index_fast_forwarding_after_eof) {
 
         auto sst = env.make_sstable(schema, writable_sstable_versions.back());
         {
-            auto mr = make_flat_mutation_reader_from_mutations_v2(schema, permit, muts);
+            auto mr = make_mutation_reader_from_mutations_v2(schema, permit, muts);
             auto close_mr = deferred_close(mr);
 
             sstable_writer_config cfg = env.manager().configure_writer();
@@ -3068,6 +3066,10 @@ future<> test_sstable_bytes_correctness(sstring tname, test_env_config cfg) {
 
         auto sst = make_sstable_containing(env.make_sstable(schema), muts);
 
+        auto free_space = sst->get_storage().free_space().get();
+        BOOST_REQUIRE(free_space > 0);
+        testlog.info("prefix: {}, free space: {}", sst->get_storage().prefix(), free_space);
+
         auto get_bytes_on_disk_from_storage = [&] (const sstables::shared_sstable& sst) {
             uint64_t bytes_on_disk = 0;
             auto& underlying_storage = const_cast<sstables::storage&>(sst->get_storage());
@@ -3141,9 +3143,9 @@ SEASTAR_TEST_CASE(test_sstable_set_predicate) {
                                                        pred);
         };
 
-        auto verify_reader_result = [&] (flat_mutation_reader_v2 sst_mr, bool expect_eos) {
+        auto verify_reader_result = [&] (mutation_reader sst_mr, bool expect_eos) {
             auto close_mr = deferred_close(sst_mr);
-            auto sst_mut = read_mutation_from_flat_mutation_reader(sst_mr).get();
+            auto sst_mut = read_mutation_from_mutation_reader(sst_mr).get();
 
             if (expect_eos) {
                 BOOST_REQUIRE(sst_mr.is_buffer_empty());
@@ -3178,167 +3180,3 @@ SEASTAR_TEST_CASE(test_sstable_set_predicate) {
     });
 }
 
-SEASTAR_TEST_CASE(test_sstable_reclaim_memory_from_components_and_reload_reclaimed_components) {
-    return test_env::do_with_async([] (test_env& env) {
-        simple_schema ss;
-        auto schema_ptr = ss.schema();
-        auto sst = env.make_sstable(schema_ptr);
-
-        // create a bloom filter
-        auto sst_test = sstables::test(sst);
-        sst_test.create_bloom_filter(100);
-        sst_test.write_filter();
-        auto total_reclaimable_memory = sst_test.total_reclaimable_memory_size();
-
-        // Test sstable::reclaim_memory_from_components() :
-        BOOST_REQUIRE_EQUAL(sst_test.reclaim_memory_from_components(), total_reclaimable_memory);
-        // No more memory to reclaim in the sstable
-        BOOST_REQUIRE_EQUAL(sst_test.total_reclaimable_memory_size(), 0);
-        BOOST_REQUIRE_EQUAL(sst->filter_memory_size(), 0);
-
-        // Test sstable::reload_reclaimed_components() :
-        // Reloading should load the bloom filter back into memory
-        sst_test.reload_reclaimed_components();
-        // SSTable should have reclaimable memory from the bloom filter
-        BOOST_REQUIRE_EQUAL(sst_test.total_reclaimable_memory_size(), total_reclaimable_memory);
-        BOOST_REQUIRE_EQUAL(sst->filter_memory_size(), total_reclaimable_memory);
-    });
-}
-
-std::pair<shared_sstable, size_t> create_sstable_with_bloom_filter(test_env& env, test_env_sstables_manager& sst_mgr, schema_ptr sptr, uint64_t estimated_partitions) {
-    auto sst = env.make_sstable(sptr);
-    sstables::test(sst).create_bloom_filter(estimated_partitions);
-    sstables::test(sst).write_filter();
-    auto sst_bf_memory = sst->filter_memory_size();
-    sst_mgr.increment_total_reclaimable_memory_and_maybe_reclaim(sst.get());
-    return {sst, sst_bf_memory};
-}
-
-SEASTAR_TEST_CASE(test_sstable_manager_auto_reclaim_and_reload_of_bloom_filter) {
-    return test_env::do_with_async([] (test_env& env) {
-        simple_schema ss;
-        auto schema_ptr = ss.schema();
-
-        auto& sst_mgr = env.manager();
-
-        // Verify nothing it reclaimed when under threshold
-        auto [sst1, sst1_bf_memory] = create_sstable_with_bloom_filter(env, sst_mgr, schema_ptr, 70);
-        BOOST_REQUIRE_EQUAL(sst1->filter_memory_size(), sst1_bf_memory);
-        BOOST_REQUIRE_EQUAL(sst_mgr.get_total_memory_reclaimed(), 0);
-
-        auto [sst2, sst2_bf_memory] = create_sstable_with_bloom_filter(env, sst_mgr, schema_ptr, 20);
-        // Confirm reclaim was still not triggered
-        BOOST_REQUIRE_EQUAL(sst1->filter_memory_size(), sst1_bf_memory);
-        BOOST_REQUIRE_EQUAL(sst2->filter_memory_size(), sst2_bf_memory);
-        BOOST_REQUIRE_EQUAL(sst_mgr.get_total_memory_reclaimed(), 0);
-
-        // Verify manager reclaims from the largest sst when the total usage crosses thresold.
-        auto [sst3, sst3_bf_memory] = create_sstable_with_bloom_filter(env, sst_mgr, schema_ptr, 50);
-        // sst1 has the most reclaimable memory
-        BOOST_REQUIRE_EQUAL(sst1->filter_memory_size(), 0);
-        BOOST_REQUIRE_EQUAL(sst2->filter_memory_size(), sst2_bf_memory);
-        BOOST_REQUIRE_EQUAL(sst3->filter_memory_size(), sst3_bf_memory);
-        BOOST_REQUIRE_EQUAL(sst_mgr.get_total_memory_reclaimed(), sst1_bf_memory);
-
-        // Reclaim should also work on the latest sst being added
-        auto [sst4, sst4_bf_memory] = create_sstable_with_bloom_filter(env, sst_mgr, schema_ptr, 100);
-        // sst4 should have been reclaimed
-        BOOST_REQUIRE_EQUAL(sst1->filter_memory_size(), 0);
-        BOOST_REQUIRE_EQUAL(sst2->filter_memory_size(), sst2_bf_memory);
-        BOOST_REQUIRE_EQUAL(sst3->filter_memory_size(), sst3_bf_memory);
-        BOOST_REQUIRE_EQUAL(sst4->filter_memory_size(), 0);
-        BOOST_REQUIRE_EQUAL(sst_mgr.get_total_memory_reclaimed(), sst1_bf_memory + sst4_bf_memory);
-
-        // Test auto reload - disposing sst3 should trigger reload of the
-        // smallest filter in the reclaimed list, which is sst1's bloom filter.
-        shared_sstable::dispose(sst3.release().release());
-        REQUIRE_EVENTUALLY_EQUAL(sst1->filter_memory_size(), sst1_bf_memory);
-        // only sst4's bloom filter memory should be reported as reclaimed
-        REQUIRE_EVENTUALLY_EQUAL(sst_mgr.get_total_memory_reclaimed(), sst4_bf_memory);
-        // sst2 and sst4 remain the same
-        BOOST_REQUIRE_EQUAL(sst2->filter_memory_size(), sst2_bf_memory);
-        BOOST_REQUIRE_EQUAL(sst4->filter_memory_size(), 0);
-    }, {
-        // limit available memory to the sstables_manager to test reclaiming.
-        // this will set the reclaim threshold to 100 bytes.
-        .available_memory = 500
-    });
-}
-
-// Reproducer for https://github.com/scylladb/scylladb/issues/18398.
-SEASTAR_TEST_CASE(test_reclaimed_bloom_filter_deletion_from_disk) {
-    return test_env::do_with_async([] (test_env& env) {
-        simple_schema ss;
-        auto s = ss.schema();
-        auto pks = ss.make_pkeys(1);
-
-        auto mut1 = mutation(s, pks[0]);
-        mut1.partition().apply_insert(*s, ss.make_ckey(0), ss.new_timestamp());
-        auto sst = make_sstable_containing(env.make_sstable(s), {std::move(mut1)});
-        auto sst_test = sstables::test(sst);
-
-        const auto filter_path = (env.tempdir().path() / sst_test.filename(component_type::Filter)).native();
-        // confirm that the filter exists in disk
-        BOOST_REQUIRE(file_exists(filter_path).get());
-
-        // reclaim filter from memory and unlink the sst
-        sst_test.reclaim_memory_from_components();
-        sst->unlink().get();
-
-        // verify the filter doesn't exist in disk anymore
-        BOOST_REQUIRE(!file_exists(filter_path).get());
-    });
-}
-
-SEASTAR_TEST_CASE(test_bloom_filter_reclaim_during_reload) {
-    return test_env::do_with_async([](test_env& env) {
-#ifndef SCYLLA_ENABLE_ERROR_INJECTION
-        fmt::print("Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n");
-        return;
-#endif
-        simple_schema ss;
-        auto schema_ptr = ss.schema();
-
-        auto& sst_mgr = env.manager();
-
-        auto [sst1, sst1_bf_memory] = create_sstable_with_bloom_filter(env, sst_mgr, schema_ptr, 100);
-        // there is sufficient memory for sst1's filter
-        BOOST_REQUIRE_EQUAL(sst1->filter_memory_size(), sst1_bf_memory);
-
-        auto [sst2, sst2_bf_memory] = create_sstable_with_bloom_filter(env, sst_mgr, schema_ptr, 60);
-        // total memory used by the bloom filters has crossed the threshold, so sst1's
-        // filter, which occupies the most memory, will be discarded from memory.
-        BOOST_REQUIRE_EQUAL(sst1->filter_memory_size(), 0);
-        BOOST_REQUIRE_EQUAL(sst2->filter_memory_size(), sst2_bf_memory);
-        BOOST_REQUIRE_EQUAL(sst_mgr.get_total_memory_reclaimed(), sst1_bf_memory);
-
-        // enable injector that delays reloading a filter
-        utils::get_local_injector().enable("reload_reclaimed_components/pause", true);
-
-        // dispose sst2 to trigger reload of sst1's bloom filter
-        shared_sstable::dispose(sst2.release().release());
-        // _total_reclaimable_memory will be updated when the reload begins; wait for it.
-        REQUIRE_EVENTUALLY_EQUAL(sst_mgr.get_total_reclaimable_memory(), sst1_bf_memory);
-
-        // now that the reload is midway and paused, create new sst to verify that its
-        // filter gets evicted immediately as the memory that became available is reserved
-        // for sst1's filter reload.
-        auto [sst3, sst3_bf_memory] = create_sstable_with_bloom_filter(env, sst_mgr, schema_ptr, 80);
-        BOOST_REQUIRE_EQUAL(sst3->filter_memory_size(), 0);
-        // confirm sst1 is not reloaded yet
-        BOOST_REQUIRE_EQUAL(sst1->filter_memory_size(), 0);
-        BOOST_REQUIRE_EQUAL(sst_mgr.get_total_memory_reclaimed(), sst1_bf_memory + sst3_bf_memory);
-
-        // resume reloading sst1 filter
-        utils::get_local_injector().receive_message("reload_reclaimed_components/pause");
-        REQUIRE_EVENTUALLY_EQUAL(sst1->filter_memory_size(), sst1_bf_memory);
-        BOOST_REQUIRE_EQUAL(sst_mgr.get_total_reclaimable_memory(), sst1_bf_memory);
-        BOOST_REQUIRE_EQUAL(sst_mgr.get_total_memory_reclaimed(), sst3_bf_memory);
-
-        utils::get_local_injector().disable("reload_reclaimed_components/pause");
-    }, {
-        // limit available memory to the sstables_manager to test reclaiming.
-        // this will set the reclaim threshold to 100 bytes.
-        .available_memory = 500
-    });
-}

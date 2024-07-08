@@ -10,6 +10,8 @@ import logging
 import pathlib
 import os
 import pytest
+import random
+import string
 
 from typing import Callable, Awaitable, Optional, TypeVar, Any
 
@@ -29,11 +31,10 @@ class LogPrefixAdapter(logging.LoggerAdapter):
         return '[%s] %s' % (self.extra['prefix'], msg), kwargs
 
 
-unique_name_prefix = 'test_'
 T = TypeVar('T')
 
 
-def unique_name():
+def unique_name(unique_name_prefix = 'test_'):
     if not hasattr(unique_name, "last_ms"):
         unique_name.last_ms = 0
     current_ms = int(round(time.time() * 1000))
@@ -41,7 +42,7 @@ def unique_name():
     if unique_name.last_ms >= current_ms:
         current_ms = unique_name.last_ms + 1
     unique_name.last_ms = current_ms
-    return unique_name_prefix + str(current_ms)
+    return unique_name_prefix + str(current_ms) + '_' + ''.join(random.choice(string.ascii_lowercase) for _ in range(5))
 
 
 async def wait_for(
@@ -240,3 +241,10 @@ async def start_writes(cql: Session, keyspace: str, table: str, concurrency: int
         return 0
 
     return finish
+
+async def wait_for_view(cql: Session, name: str, node_count: int, timeout: int = 120):
+    async def view_is_built():
+        done = await cql.run_async(f"SELECT COUNT(*) FROM system_distributed.view_build_status WHERE status = 'SUCCESS' AND view_name = '{name}' ALLOW FILTERING")
+        return done[0][0] == node_count or None
+    deadline = time.time() + timeout
+    await wait_for(view_is_built, deadline)

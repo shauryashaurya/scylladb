@@ -19,6 +19,10 @@ import logging
 import time
 import boto3
 import botocore
+import requests
+import json
+
+from test.pylib.manager_client import ManagerClient
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +88,7 @@ unique_table_name.last_ms = 0
 async def test_alternator_ttl_scheduling_group(alternator3):
     """A reproducer for issue #18719: The expiration scans and deletions
        initiated by the Alternator TTL feature are supposed to run entirely in
-       the "streaming" scheduling group. But because of a bug in inheritence
+       the "streaming" scheduling group. But because of a bug in inheritance
        of scheduling groups through RPC, some of the work ended up being done
        on the "statement" scheduling group.
        This test verifies that Alternator TTL work is done on the right
@@ -180,3 +184,36 @@ async def test_alternator_ttl_scheduling_group(alternator3):
     assert ratio < 0.1
 
     table.delete()
+
+@pytest.mark.asyncio
+async def test_localnodes_broadcast_rpc_address(manager: ManagerClient):
+    """Test that if the "broadcast_rpc_address" of a node is set, the
+       "/localnodes" request returns not the node's internal IP address,
+       but rather the one set in broadcast_rpc_address as passed between
+       nodes via gossip. The case where this parameter is not configured is
+       tested separately, in test/alternator/test_scylla.py.
+       Reproduces issue #18711.
+    """
+    # Run two Scylla nodes telling both their broadcast_rpc_address is 1.2.3.4
+    # (this is silly, but servers_add() doesn't let us use a different config
+    # per server). We need to run two nodes to check that the node to which
+    # we send the /localnodes request knows not only its own modified
+    # address, but also the other node's (which it learnt by gossip).
+    # This address isn't used for any communication, but it will be
+    # produced by "/localnodes" and this is what we want to check
+    config = alternator_config | {
+        'broadcast_rpc_address': '1.2.3.4'
+    }
+    servers = await manager.servers_add(2, config=config)
+    for server in servers:
+        url = f"http://{server.ip_addr}:{config['alternator_port']}/localnodes"
+        response = requests.get(url, verify=False)
+        assert response.ok
+        j = json.loads(response.content.decode('utf-8'))
+        # We expect /localnodes to return ["1.2.3.4", "1.2.3.4"]
+        # (since we configured both nodes with the same broadcast_rpc_address):
+        assert j == ['1.2.3.4', '1.2.3.4']
+
+# TODO: add a more thorough test for /localnodes, creating a cluster with
+# multiple nodes in multiple data centers, and check that we can get a list
+# of nodes in each data center.

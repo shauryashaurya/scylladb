@@ -330,12 +330,14 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
         }
         return backlog;
     }))
-    , _read_concurrency_sem(max_count_concurrent_reads,
+    , _read_concurrency_sem(
+        utils::updateable_value<int>(max_count_concurrent_reads),
         max_memory_concurrent_reads(),
         "user",
         max_inactive_queue_length(),
         _cfg.reader_concurrency_semaphore_serialize_limit_multiplier,
         _cfg.reader_concurrency_semaphore_kill_limit_multiplier,
+        _cfg.reader_concurrency_semaphore_cpu_concurrency,
         reader_concurrency_semaphore::register_metrics::yes)
     // No timeouts or queue length limits - a failure here can kill an entire repair.
     // Trust the caller to limit concurrency.
@@ -346,6 +348,7 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
             std::numeric_limits<size_t>::max(),
             utils::updateable_value(std::numeric_limits<uint32_t>::max()),
             utils::updateable_value(std::numeric_limits<uint32_t>::max()),
+            utils::updateable_value(uint32_t(1)),
             reader_concurrency_semaphore::register_metrics::yes)
     // No limits, just for accounting.
     , _compaction_concurrency_sem(reader_concurrency_semaphore::no_limits{}, "compaction", reader_concurrency_semaphore::register_metrics::no)
@@ -551,7 +554,7 @@ database::setup_metrics() {
         sm::make_counter("total_reads_rate_limited", _stats->total_reads_rate_limited,
                        sm::description("Counts read operations which were rejected on the replica side because the per-partition limit was reached.")),
 
-        sm::make_current_bytes("view_update_backlog", [this] { return get_view_update_backlog().current; },
+        sm::make_current_bytes("view_update_backlog", [this] { return get_view_update_backlog().get_current_bytes(); },
                        sm::description("Holds the current size in bytes of the pending view updates for all tables")),
 
         sm::make_counter("querier_cache_lookups", _querier_cache.get_stats().lookups,
@@ -622,6 +625,9 @@ database::setup_metrics() {
 
         sm::make_total_operations("total_view_updates_failed_remote", _cf_stats.total_view_updates_failed_remote,
                 sm::description("Total number of view updates generated for tables and failed to be sent to remote replicas.")),
+
+        sm::make_total_operations("total_view_updates_on_wrong_node", _cf_stats.total_view_updates_on_wrong_node,
+                sm::description("Total number of view updates which are computed on the wrong node.")).set_skip_when_empty(),
     });
     if (this_shard_id() == 0) {
         _metrics.add_group("database", {
@@ -691,21 +697,23 @@ future<> database::parse_system_tables(distributed<service::storage_proxy>& prox
         }
         co_return;
     }));
+    cql3::functions::change_batch batch;
     co_await do_parse_schema_tables(proxy, db::schema_tables::FUNCTIONS, coroutine::lambda([&] (schema_result_value_type& v) -> future<> {
         auto&& user_functions = co_await create_functions_from_schema_partition(*this, v.second);
         for (auto&& func : user_functions) {
-            cql3::functions::functions::add_function(func);
+            batch.add_function(func);
         }
         co_return;
     }));
     co_await do_parse_schema_tables(proxy, db::schema_tables::AGGREGATES, coroutine::lambda([&] (schema_result_value_type& v) -> future<> {
         auto v2 = co_await read_schema_partition_for_keyspace(proxy, db::schema_tables::SCYLLA_AGGREGATES, v.first);
-        auto&& user_aggregates = create_aggregates_from_schema_partition(*this, v.second, v2.second);
+        auto&& user_aggregates = create_aggregates_from_schema_partition(*this, v.second, v2.second, batch);
         for (auto&& agg : user_aggregates) {
-            cql3::functions::functions::add_function(agg);
+            batch.add_function(agg);
         }
         co_return;
     }));
+    batch.commit();
     co_await do_parse_schema_tables(proxy, db::schema_tables::TABLES, coroutine::lambda([&] (schema_result_value_type &v) -> future<> {
         std::map<sstring, schema_ptr> tables = co_await create_tables_from_tables_partition(proxy, v.second);
         co_await coroutine::parallel_for_each(tables.begin(), tables.end(), [&] (auto& t) -> future<> {
@@ -1423,7 +1431,7 @@ public:
         , _compaction_time(compaction_time)
         , _contexts(smp::count) {
     }
-    virtual flat_mutation_reader_v2 create_reader(
+    virtual mutation_reader create_reader(
         schema_ptr schema,
         reader_permit permit,
         const dht::partition_range& range,
@@ -2940,7 +2948,7 @@ void database::unplug_view_update_generator() noexcept {
 
 } // namespace replica
 
-flat_mutation_reader_v2 make_multishard_streaming_reader(distributed<replica::database>& db,
+mutation_reader make_multishard_streaming_reader(distributed<replica::database>& db,
         schema_ptr schema, reader_permit permit,
         std::function<std::optional<dht::partition_range>()> range_generator,
         gc_clock::time_point compaction_time) {
@@ -2963,7 +2971,7 @@ flat_mutation_reader_v2 make_multishard_streaming_reader(distributed<replica::da
             std::move(range_generator), std::move(full_slice), {}, mutation_reader::forwarding::no);
 }
 
-flat_mutation_reader_v2 make_multishard_streaming_reader(distributed<replica::database>& db,
+mutation_reader make_multishard_streaming_reader(distributed<replica::database>& db,
         schema_ptr schema, reader_permit permit, const dht::partition_range& range, gc_clock::time_point compaction_time)
 {
     const auto table_id = schema->id();

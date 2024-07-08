@@ -199,7 +199,7 @@ SEASTAR_THREAD_TEST_CASE(test_reader_concurrency_semaphore_readmission_preserves
 // kills the test if no progress is being made.
 SEASTAR_THREAD_TEST_CASE(test_reader_concurrency_semaphore_forward_progress) {
     class reader {
-        class skeleton_reader : public flat_mutation_reader_v2::impl {
+        class skeleton_reader : public mutation_reader::impl {
             std::optional<reader_permit::resource_units> _resources;
         public:
             skeleton_reader(schema_ptr s, reader_permit permit)
@@ -220,7 +220,7 @@ SEASTAR_THREAD_TEST_CASE(test_reader_concurrency_semaphore_forward_progress) {
         struct reader_visitor {
             reader& r;
             future<> operator()(std::monostate& ms) { return r.tick(ms); }
-            future<> operator()(flat_mutation_reader_v2& reader) { return r.tick(reader); }
+            future<> operator()(mutation_reader& reader) { return r.tick(reader); }
             future<> operator()(reader_concurrency_semaphore::inactive_read_handle& handle) { return r.tick(handle); }
         };
 
@@ -231,17 +231,17 @@ SEASTAR_THREAD_TEST_CASE(test_reader_concurrency_semaphore_forward_progress) {
         bool _evictable = false;
         reader_permit_opt _permit;
         std::optional<reader_permit::resource_units> _units;
-        std::variant<std::monostate, flat_mutation_reader_v2, reader_concurrency_semaphore::inactive_read_handle> _reader;
+        std::variant<std::monostate, mutation_reader, reader_concurrency_semaphore::inactive_read_handle> _reader;
 
     private:
         void make_reader() {
-            _reader = make_flat_mutation_reader_v2<skeleton_reader>(_schema, *_permit);
+            _reader = make_mutation_reader<skeleton_reader>(_schema, *_permit);
         }
         future<> tick(std::monostate&) {
             make_reader();
-            co_await tick(std::get<flat_mutation_reader_v2>(_reader));
+            co_await tick(std::get<mutation_reader>(_reader));
         }
-        future<> tick(flat_mutation_reader_v2& reader) {
+        future<> tick(mutation_reader& reader) {
             co_await reader.fill_buffer();
             if (_evictable) {
                 _reader = _permit->semaphore().register_inactive_read(std::move(reader));
@@ -256,7 +256,7 @@ SEASTAR_THREAD_TEST_CASE(test_reader_concurrency_semaphore_forward_progress) {
                 }
                 make_reader();
             }
-            co_await tick(std::get<flat_mutation_reader_v2>(_reader));
+            co_await tick(std::get<mutation_reader>(_reader));
         }
 
     public:
@@ -279,7 +279,7 @@ SEASTAR_THREAD_TEST_CASE(test_reader_concurrency_semaphore_forward_progress) {
             return std::visit(reader_visitor{*this}, _reader);
         }
         future<> close() noexcept {
-            if (auto reader = std::get_if<flat_mutation_reader_v2>(&_reader)) {
+            if (auto reader = std::get_if<mutation_reader>(&_reader)) {
                 return reader->close();
             }
             return make_ready_future<>();
@@ -614,6 +614,35 @@ SEASTAR_THREAD_TEST_CASE(test_reader_concurrency_semaphore_stop_waits_on_permits
     }
 }
 
+
+static void require_can_admit(schema_ptr schema, reader_concurrency_semaphore& semaphore, bool expected_can_admit, const char* description,
+        seastar::compat::source_location sl = seastar::compat::source_location::current()) {
+    testlog.trace("Running admission scenario {}, with exepcted_can_admit={}", description, expected_can_admit);
+    const auto stats_before = semaphore.get_stats();
+
+    auto admit_fut = semaphore.obtain_permit(schema, "require_can_admit", 1024, db::timeout_clock::now(), {});
+    admit_fut.wait();
+    const bool can_admit = !admit_fut.failed();
+    if (can_admit) {
+        admit_fut.ignore_ready_future();
+    } else {
+        // Make sure we have a timeout exception, not something else
+        BOOST_REQUIRE_THROW(std::rethrow_exception(admit_fut.get_exception()), semaphore_timed_out);
+    }
+
+    const auto stats_after = semaphore.get_stats();
+    BOOST_REQUIRE_EQUAL(stats_after.reads_admitted, stats_before.reads_admitted + uint64_t(can_admit));
+    // Deliberately not checking `reads_enqueued_for_admission`, a read can be enqueued temporarily during the admission process.
+
+    if (can_admit == expected_can_admit) {
+        testlog.trace("admission scenario '{}' with expected_can_admit={} passed at {}:{}", description, expected_can_admit, sl.file_name(),
+                sl.line());
+    } else {
+        BOOST_FAIL(fmt::format("admission scenario '{}'  with expected_can_admit={} failed at {}:{}\ndiagnostics: {}", description,
+                expected_can_admit, sl.file_name(), sl.line(), semaphore.dump_diagnostics()));
+    }
+};
+
 SEASTAR_THREAD_TEST_CASE(test_reader_concurrency_semaphore_admission) {
     simple_schema s;
     const auto schema = s.schema();
@@ -623,30 +652,7 @@ SEASTAR_THREAD_TEST_CASE(test_reader_concurrency_semaphore_admission) {
 
     auto require_can_admit = [&] (bool expected_can_admit, const char* description,
             seastar::compat::source_location sl = seastar::compat::source_location::current()) {
-        testlog.trace("Running admission scenario {}, with exepcted_can_admit={}", description, expected_can_admit);
-        const auto stats_before = semaphore.get_stats();
-
-        auto admit_fut = semaphore.obtain_permit(schema, get_name(), 1024, db::timeout_clock::now(), {});
-        admit_fut.wait();
-        const bool can_admit = !admit_fut.failed();
-        if (can_admit) {
-            admit_fut.ignore_ready_future();
-        } else {
-            // Make sure we have a timeout exception, not something else
-            BOOST_REQUIRE_THROW(std::rethrow_exception(admit_fut.get_exception()), semaphore_timed_out);
-        }
-
-        const auto stats_after = semaphore.get_stats();
-        BOOST_REQUIRE_EQUAL(stats_after.reads_admitted, stats_before.reads_admitted + uint64_t(can_admit));
-        // Deliberately not checking `reads_enqueued_for_admission`, a read can be enqueued temporarily during the admission process.
-
-        if (can_admit == expected_can_admit) {
-            testlog.trace("admission scenario '{}' with expected_can_admit={} passed at {}:{}", description, expected_can_admit, sl.file_name(),
-                    sl.line());
-        } else {
-            BOOST_FAIL(fmt::format("admission scenario '{}'  with expected_can_admit={} failed at {}:{}\ndiagnostics: {}", description,
-                    expected_can_admit, sl.file_name(), sl.line(), semaphore.dump_diagnostics()));
-        }
+        ::require_can_admit(schema, semaphore, expected_can_admit, description, sl);
     };
 
     require_can_admit(true, "semaphore in initial state");
@@ -1378,7 +1384,7 @@ memory_limit_table create_memory_limit_table(cql_test_env& env, uint64_t target_
                 auto sst = tbl.make_sstable();
                 auto writer_cfg = sst_man.configure_writer("test");
                 sst->write_components(
-                    make_flat_mutation_reader_from_mutations_v2(s, semaphore.make_tracking_only_permit(s, "test", db::no_timeout, {}), mut, s->full_slice()),
+                    make_mutation_reader_from_mutations_v2(s, semaphore.make_tracking_only_permit(s, "test", db::no_timeout, {}), mut, s->full_slice()),
                     1,
                     s,
                     writer_cfg,
@@ -2000,6 +2006,7 @@ SEASTAR_THREAD_TEST_CASE(test_reader_concurrency_semaphore_live_update_count) {
             100,
             utils::updateable_value<uint32_t>(serialize_multiplier),
             utils::updateable_value<uint32_t>(kill_multiplier),
+            utils::updateable_value<uint32_t>(1),
             reader_concurrency_semaphore::register_metrics::no);
     auto stop_sem = deferred_stop(semaphore);
 
@@ -2008,4 +2015,59 @@ SEASTAR_THREAD_TEST_CASE(test_reader_concurrency_semaphore_live_update_count) {
     count.set(10);
 
     BOOST_REQUIRE_EQUAL(semaphore.initial_resources(), reader_resources(count(), initial_memory));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_reader_concurrency_semaphore_live_update_cpu_concurrency) {
+    simple_schema s;
+    const auto schema = s.schema();
+
+    utils::updateable_value_source<uint32_t> cpu_concurrency{2};
+    const int32_t initial_count = 4;
+    const uint32_t initial_memory = 4 * 1024;
+    const auto serialize_multiplier = std::numeric_limits<uint32_t>::max();
+    const auto kill_multiplier = std::numeric_limits<uint32_t>::max();
+
+    reader_concurrency_semaphore semaphore(
+            utils::updateable_value<int>(initial_count),
+            initial_memory,
+            get_name(),
+            100,
+            utils::updateable_value<uint32_t>(serialize_multiplier),
+            utils::updateable_value<uint32_t>(kill_multiplier),
+            utils::updateable_value(cpu_concurrency),
+            reader_concurrency_semaphore::register_metrics::no);
+    auto stop_sem = deferred_stop(semaphore);
+
+    auto require_can_admit = [&] (bool expected_can_admit, const char* description,
+            seastar::compat::source_location sl = seastar::compat::source_location::current()) {
+        ::require_can_admit(schema, semaphore, expected_can_admit, description, sl);
+    };
+
+    auto permit1 = semaphore.obtain_permit(schema, get_name(), 1024, db::timeout_clock::now(), {}).get();
+
+    require_can_admit(true, "!need_cpu");
+    {
+        reader_permit::need_cpu_guard ncpu_guard{permit1};
+
+        require_can_admit(true, "need_cpu < cpu_concurrency");
+
+        auto permit2 = semaphore.obtain_permit(schema, get_name(), 1024, db::timeout_clock::now(), {}).get();
+
+        // no change
+        require_can_admit(true, "need_cpu < cpu_concurrency");
+        {
+            reader_permit::need_cpu_guard ncpu_guard{permit2};
+            require_can_admit(false, "need_cpu == cpu_concurrency");
+
+            cpu_concurrency.set(3);
+
+            require_can_admit(true, "after set(3): need_cpu < cpu_concurrency");
+
+            cpu_concurrency.set(2);
+
+            require_can_admit(false, "after set(2): need_cpu == cpu_concurrency");
+        }
+        require_can_admit(true, "need_cpu < cpu_concurrency");
+    }
+    require_can_admit(true, "!need_cpu");
 }

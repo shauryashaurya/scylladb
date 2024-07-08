@@ -96,7 +96,7 @@
 #include "db/paxos_grace_seconds_extension.hh"
 #include "service/qos/standard_service_level_distributed_data_accessor.hh"
 #include "service/storage_proxy.hh"
-#include "service/forward_service.hh"
+#include "service/mapreduce_service.hh"
 #include "alternator/controller.hh"
 #include "alternator/ttl.hh"
 #include "tools/entry_point.hh"
@@ -648,7 +648,8 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
     init("list-tools", bpo::bool_switch(), "list included tools and exit");
 
     bpo::options_description deprecated_options("Deprecated options - ignored");
-    cfg->add_deprecated_options(deprecated_options.add_options());
+    auto deprecated_options_easy_init = deprecated_options.add_options();
+    cfg->add_deprecated_options(deprecated_options_easy_init);
     app.get_options_description().add(deprecated_options);
 
     // TODO : default, always read?
@@ -677,7 +678,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
     sharded<service::storage_service> ss;
     sharded<service::migration_manager> mm;
     sharded<tasks::task_manager> task_manager;
-    api::http_context ctx(db, load_meter);
+    api::http_context ctx(db);
     httpd::http_server_control prometheus_server;
     std::optional<utils::directories> dirs = {};
     sharded<gms::feature_service> feature_service;
@@ -691,7 +692,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
     sharded<repair_service> repair;
     sharded<sstables_loader> sst_loader;
     sharded<streaming::stream_manager> stream_manager;
-    sharded<service::forward_service> forward_service;
+    sharded<service::mapreduce_service> mapreduce_service;
     sharded<gms::gossiper> gossiper;
     sharded<locator::snitch_ptr> snitch;
 
@@ -720,7 +721,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
         tcp_syncookies_sanity();
         tcp_timestamps_sanity();
 
-        return seastar::async([&app, cfg, ext, &cm, &sstm, &db, &qp, &bm, &proxy, &forward_service, &mm, &mm_notifier, &ctx, &opts, &dirs,
+        return seastar::async([&app, cfg, ext, &cm, &sstm, &db, &qp, &bm, &proxy, &mapreduce_service, &mm, &mm_notifier, &ctx, &opts, &dirs,
                 &prometheus_server, &cf_cache_hitrate_calculator, &load_meter, &feature_service, &gossiper, &snitch,
                 &token_metadata, &erm_factory, &snapshot_ctl, &messaging, &sst_dir_semaphore, &raft_gr, &service_memory_limiter,
                 &repair, &sst_loader, &ss, &lifecycle_notifier, &stream_manager, &task_manager] {
@@ -1217,6 +1218,9 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             startlog.info("Scylla API server listening on {}:{} ...", api_addr, cfg->api_port());
 
             api::set_server_config(ctx, *cfg).get();
+            auto stop_config_api = defer_verbose_shutdown("config API", [&ctx] {
+                api::unset_server_config(ctx).get();
+            });
 
             static sharded<auth::service> auth_service;
             static sharded<auth::service> maintenance_auth_service;
@@ -1424,6 +1428,11 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             });
             gossiper.invoke_on_all(&gms::gossiper::start).get();
 
+            api::set_server_gossip(ctx, gossiper).get();
+            auto stop_gossip_api = defer_verbose_shutdown("gossiper API", [&ctx] {
+                api::unset_server_gossip(ctx).get();
+            });
+
             static sharded<service::raft_address_map> raft_address_map;
             supervisor::notify("starting Raft address map");
             raft_address_map.start().get();
@@ -1478,10 +1487,10 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 api::unset_server_token_metadata(ctx).get();
             });
 
-            supervisor::notify("starting forward service");
-            forward_service.start(std::ref(messaging), std::ref(proxy), std::ref(db), std::ref(token_metadata), std::ref(stop_signal.as_sharded_abort_source())).get();
-            auto stop_forward_service_handlers = defer_verbose_shutdown("forward service", [&forward_service] {
-                forward_service.stop().get();
+            supervisor::notify("starting mapreduce service");
+            mapreduce_service.start(std::ref(messaging), std::ref(proxy), std::ref(db), std::ref(token_metadata), std::ref(stop_signal.as_sharded_abort_source())).get();
+            auto stop_mapreduce_service_handlers = defer_verbose_shutdown("mapreduce service", [&mapreduce_service] {
+                mapreduce_service.stop().get();
             });
 
             supervisor::notify("starting migration manager");
@@ -1520,7 +1529,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 
             supervisor::notify("initializing query processor remote part");
             // TODO: do this together with proxy.start_remote(...)
-            qp.invoke_on_all(&cql3::query_processor::start_remote, std::ref(mm), std::ref(forward_service),
+            qp.invoke_on_all(&cql3::query_processor::start_remote, std::ref(mm), std::ref(mapreduce_service),
                              std::ref(ss), std::ref(group0_client)).get();
             auto stop_qp_remote = defer_verbose_shutdown("query processor remote part", [&qp] {
                 qp.invoke_on_all(&cql3::query_processor::stop_remote).get();
@@ -1649,7 +1658,6 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 });
             }).get();
 
-            api::set_server_gossip(ctx, gossiper).get();
             api::set_server_snitch(ctx, snitch).get();
             auto stop_snitch_api = defer_verbose_shutdown("snitch API", [&ctx] {
                 api::unset_server_snitch(ctx).get();
@@ -1693,11 +1701,9 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 lifecycle_notifier.local().register_subscriber(&local_proxy);
             }).get();
 
-            auto drain_proxy = defer_verbose_shutdown("drain storage proxy", [&proxy, &lifecycle_notifier] {
+            auto unsubscribe_proxy = defer_verbose_shutdown("unsubscribe storage proxy", [&proxy, &lifecycle_notifier] {
                 proxy.invoke_on_all([&lifecycle_notifier] (service::storage_proxy& local_proxy) mutable {
-                    return lifecycle_notifier.local().unregister_subscriber(&local_proxy).finally([&local_proxy] {
-                        return local_proxy.drain_on_shutdown();
-                    });
+                    return lifecycle_notifier.local().unregister_subscriber(&local_proxy);
                 }).get();
             });
 
@@ -1969,6 +1975,11 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 load_meter.exit().get();
             });
 
+            api::set_load_meter(ctx, load_meter).get();
+            auto stop_load_meter_api = defer_verbose_shutdown("load meter API", [&ctx] {
+                api::unset_load_meter(ctx).get();
+            });
+
             supervisor::notify("starting cf cache hit rate calculator");
             cf_cache_hitrate_calculator.start(std::ref(db), std::ref(gossiper)).get();
             auto stop_cache_hitrate_calculator = defer_verbose_shutdown("cf cache hit rate calculator",
@@ -1990,7 +2001,6 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 startlog.info("Waiting for gossip to settle before accepting client requests...");
                 gossiper.local().wait_for_gossip_to_settle().get();
             }
-            api::set_server_gossip_settle(ctx, gossiper).get();
 
             supervisor::notify("allow replaying hints");
             proxy.invoke_on_all(&service::storage_proxy::allow_replaying_hints).get();

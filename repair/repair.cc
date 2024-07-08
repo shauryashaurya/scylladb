@@ -120,10 +120,6 @@ static std::ostream& operator<<(std::ostream& os, const std::unordered_map<T1, T
     return os;
 }
 
-std::ostream& operator<<(std::ostream& out, row_level_diff_detect_algorithm algo) {
-    return out << format_as(algo);
-}
-
 std::string_view format_as(row_level_diff_detect_algorithm algo) {
     using enum row_level_diff_detect_algorithm;
     switch (algo) {
@@ -548,7 +544,7 @@ void repair::task_manager_module::abort_all_repairs() {
         if (it != _tasks.end()) {
             auto& impl = dynamic_cast<repair::shard_repair_task_impl&>(*it->second->_impl);
             // If the task is aborted, its state will change to failed. One can wait for this with task_manager::task::done().
-            (void)impl.abort();
+            impl.abort();
         }
     }
     rlogger.info0("Started to abort repair jobs={}, nr_jobs={}", _aborted_pending_repairs, _aborted_pending_repairs.size());
@@ -706,7 +702,7 @@ future<> repair::shard_repair_task_impl::repair_range(const dht::token_range& ra
             rlogger.error("repair[{}]: Repair {} out of {} ranges, keyspace={}, table={}, range={}, peers={}, live_peers={}, status={}",
                     global_repair_id.uuid(), ranges_index, ranges_size(), _status.keyspace, table.name, range, neighbors, live_neighbors, status);
             // If the task is aborted, its state will change to failed. One can wait for this with task_manager::task::done().
-            (void)abort();
+            abort();
             co_await coroutine::return_exception(std::runtime_error(format("Repair mandatory neighbor={} is not alive, keyspace={}, mandatory_neighbors={}",
                 node, _status.keyspace, mandatory_neighbors)));
         }

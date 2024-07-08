@@ -7,7 +7,7 @@ ScyllaDB Open Source Documentation
 .. meta::
    :title: ScyllaDB Open Source Documentation
    :description: ScyllaDB Open Source Documentation
-   :keywords: ScyllaDB Open Source, Scylla Open Source, Scylla docs, ScyllaDB documentation, Scylla Documentation
+   :keywords: ScyllaDB Open Source, ScyllaDB Open Source, ScyllaDB docs, ScyllaDB documentation, ScyllaDB Documentation
 
 About This User Guide
 -----------------------
@@ -40,7 +40,6 @@ Join the ScyllaDB Open Source community:
 * Contribute to the ScyllaDB Open Source `project <https://github.com/scylladb/scylladb>`_.
 * Join the `ScyllaDB Community Forum <https://forum.scylladb.com/>`_.
 * Join our `Slack Channel <https://slack.scylladb.com/>`_.
-* Sign up for the `scylladb-users <https://groups.google.com/d/forum/scylladb-users>`_ Google group.
 
 Learn How to Use ScyllaDB
 ---------------------------

@@ -18,7 +18,7 @@
 
 #include "reader_concurrency_semaphore.hh"
 #include "query-result.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader.hh"
 #include "utils/exceptions.hh"
 #include "schema/schema.hh"
 #include "utils/human_readable.hh"
@@ -27,13 +27,13 @@
 logger rcslog("reader_concurrency_semaphore");
 
 struct reader_concurrency_semaphore::inactive_read {
-    flat_mutation_reader_v2 reader;
+    mutation_reader reader;
     const dht::partition_range* range = nullptr;
     eviction_notify_handler notify_handler;
     timer<lowres_clock> ttl_timer;
     inactive_read_handle* handle = nullptr;
 
-    explicit inactive_read(flat_mutation_reader_v2 reader_, const dht::partition_range* range_) noexcept
+    explicit inactive_read(mutation_reader reader_, const dht::partition_range* range_) noexcept
         : reader(std::move(reader_))
         , range(range_)
     { }
@@ -938,12 +938,15 @@ future<> reader_concurrency_semaphore::execution_loop() noexcept {
                 e.pr.set_exception(std::current_exception());
             }
 
+            // We now possibly have >= CPU concurrency, so even if the above read
+            // didn't release any resources, just dequeueing it from the
+            // _ready_list could allow us to admit new reads.
+            maybe_admit_waiters();
+
             if (need_preempt()) {
                 co_await coroutine::maybe_yield();
             }
         }
-
-        maybe_admit_waiters();
     }
 }
 
@@ -983,15 +986,23 @@ void reader_concurrency_semaphore::signal(const resources& r) noexcept {
 namespace sm = seastar::metrics;
 static const sm::label class_label("class");
 
-reader_concurrency_semaphore::reader_concurrency_semaphore(utils::updateable_value<int> count, ssize_t memory, sstring name, size_t max_queue_length,
-            utils::updateable_value<uint32_t> serialize_limit_multiplier, utils::updateable_value<uint32_t> kill_limit_multiplier, register_metrics metrics)
-    : _initial_resources(count(), memory)
-    , _resources(count(), memory)
+reader_concurrency_semaphore::reader_concurrency_semaphore(
+        utils::updateable_value<int> count,
+        ssize_t memory,
+        sstring name,
+        size_t max_queue_length,
+        utils::updateable_value<uint32_t> serialize_limit_multiplier,
+        utils::updateable_value<uint32_t> kill_limit_multiplier,
+        utils::updateable_value<uint32_t> cpu_concurrency,
+        register_metrics metrics)
+    : _initial_resources(count, memory)
+    , _resources(count, memory)
     , _count_observer(count.observe([this] (const int& new_count) { set_resources({new_count, _initial_resources.memory}); }))
     , _name(std::move(name))
     , _max_queue_length(max_queue_length)
     , _serialize_limit_multiplier(std::move(serialize_limit_multiplier))
     , _kill_limit_multiplier(std::move(kill_limit_multiplier))
+    , _cpu_concurrency(cpu_concurrency)
 {
     if (metrics == register_metrics::yes) {
         _metrics.emplace();
@@ -1056,6 +1067,7 @@ reader_concurrency_semaphore::reader_concurrency_semaphore(no_limits, sstring na
             std::numeric_limits<size_t>::max(),
             utils::updateable_value(std::numeric_limits<uint32_t>::max()),
             utils::updateable_value(std::numeric_limits<uint32_t>::max()),
+            utils::updateable_value(uint32_t(1)),
             metrics) {}
 
 reader_concurrency_semaphore::~reader_concurrency_semaphore() {
@@ -1073,7 +1085,7 @@ reader_concurrency_semaphore::~reader_concurrency_semaphore() {
     }
 }
 
-reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore::register_inactive_read(flat_mutation_reader_v2 reader,
+reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore::register_inactive_read(mutation_reader reader,
         const dht::partition_range* range) noexcept {
     auto& permit = reader.permit();
     if (permit->get_state() == reader_permit::state::waiting_for_memory) {
@@ -1120,7 +1132,7 @@ void reader_concurrency_semaphore::set_notify_handler(inactive_read_handle& irh,
     }
 }
 
-flat_mutation_reader_v2_opt reader_concurrency_semaphore::unregister_inactive_read(inactive_read_handle irh) {
+mutation_reader_opt reader_concurrency_semaphore::unregister_inactive_read(inactive_read_handle irh) {
     if (!irh) {
         return {};
     }
@@ -1241,7 +1253,7 @@ void reader_concurrency_semaphore::do_detach_inactive_reader(reader_permit::impl
     }
 }
 
-flat_mutation_reader_v2 reader_concurrency_semaphore::detach_inactive_reader(reader_permit::impl& permit, evict_reason reason) noexcept {
+mutation_reader reader_concurrency_semaphore::detach_inactive_reader(reader_permit::impl& permit, evict_reason reason) noexcept {
     do_detach_inactive_reader(permit, reason);
     auto irp = std::move(permit.aux_data().ir);
     return std::move(irp->reader);
@@ -1251,7 +1263,7 @@ void reader_concurrency_semaphore::evict(reader_permit::impl& permit, evict_reas
     close_reader(detach_inactive_reader(permit, reason));
 }
 
-void reader_concurrency_semaphore::close_reader(flat_mutation_reader_v2 reader) {
+void reader_concurrency_semaphore::close_reader(mutation_reader reader) {
     // It is safe to discard the future since it is waited on indirectly
     // by closing the _close_readers_gate in stop().
     (void)with_gate(_close_readers_gate, [reader = std::move(reader)] () mutable {
@@ -1265,8 +1277,8 @@ bool reader_concurrency_semaphore::has_available_units(const resources& r) const
     return (_resources.non_zero() && _resources.count >= r.count && _resources.memory >= r.memory) || _resources.count == _initial_resources.count;
 }
 
-bool reader_concurrency_semaphore::all_need_cpu_permits_are_awaiting() const {
-    return _stats.need_cpu_permits == _stats.awaits_permits;
+bool reader_concurrency_semaphore::cpu_concurrency_limit_reached() const {
+    return (_stats.need_cpu_permits - _stats.awaits_permits) >= _cpu_concurrency();
 }
 
 std::exception_ptr reader_concurrency_semaphore::check_queue_size(std::string_view queue_name) {
@@ -1349,7 +1361,7 @@ reader_concurrency_semaphore::can_admit_read(const reader_permit::impl& permit) 
         return {can_admit::no, reason::ready_list};
     }
 
-    if (!all_need_cpu_permits_are_awaiting()) {
+    if (cpu_concurrency_limit_reached()) {
         return {can_admit::no, reason::need_cpu_permits};
     }
 

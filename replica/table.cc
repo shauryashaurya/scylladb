@@ -91,7 +91,7 @@ sstables::generation_type table::calculate_generation_for_new_table() {
     return ret;
 }
 
-flat_mutation_reader_v2
+mutation_reader
 table::make_sstable_reader(schema_ptr s,
                                    reader_permit permit,
                                    lw_shared_ptr<const sstables::sstable_set> sstables,
@@ -142,8 +142,8 @@ void table::refresh_compound_sstable_set() {
 future<table::const_mutation_partition_ptr>
 table::find_partition(schema_ptr s, reader_permit permit, const dht::decorated_key& key) const {
     return do_with(dht::partition_range::make_singular(key), [s = std::move(s), permit = std::move(permit), this] (auto& range) mutable {
-        return with_closeable(this->make_reader_v2(std::move(s), std::move(permit), range), [] (flat_mutation_reader_v2& reader) {
-            return read_mutation_from_flat_mutation_reader(reader).then([] (mutation_opt&& mo) -> std::unique_ptr<const mutation_partition> {
+        return with_closeable(this->make_reader_v2(std::move(s), std::move(permit), range), [] (mutation_reader& reader) {
+            return read_mutation_from_mutation_reader(reader).then([] (mutation_opt&& mo) -> std::unique_ptr<const mutation_partition> {
                 if (!mo) {
                     return {};
                 }
@@ -170,7 +170,7 @@ table::find_row(schema_ptr s, reader_permit permit, const dht::decorated_key& pa
 }
 
 void
-table::add_memtables_to_reader_list(std::vector<flat_mutation_reader_v2>& readers,
+table::add_memtables_to_reader_list(std::vector<mutation_reader>& readers,
         const schema_ptr& s,
         const reader_permit& permit,
         const dht::partition_range& range,
@@ -205,7 +205,7 @@ table::add_memtables_to_reader_list(std::vector<flat_mutation_reader_v2>& reader
     }
 }
 
-flat_mutation_reader_v2
+mutation_reader
 table::make_reader_v2(schema_ptr s,
                            reader_permit permit,
                            const dht::partition_range& range,
@@ -227,7 +227,7 @@ table::make_reader_v2(schema_ptr s,
     }
     auto& slice = unreversed_slice ? *unreversed_slice : query_slice;
 
-    std::vector<flat_mutation_reader_v2> readers;
+    std::vector<mutation_reader> readers;
 
     // We're assuming that cache and memtables are both read atomically
     // for single-key queries, so we don't need to special case memtable
@@ -287,7 +287,7 @@ sstables::shared_sstable table::make_streaming_staging_sstable() {
     return newtab;
 }
 
-static flat_mutation_reader_v2 maybe_compact_for_streaming(flat_mutation_reader_v2 underlying, const compaction_manager& cm, gc_clock::time_point compaction_time, bool compaction_enabled) {
+static mutation_reader maybe_compact_for_streaming(mutation_reader underlying, const compaction_manager& cm, gc_clock::time_point compaction_time, bool compaction_enabled) {
     utils::get_local_injector().set_parameter("maybe_compact_for_streaming", "compaction_enabled", fmt::to_string(compaction_enabled));
     if (!compaction_enabled) {
         return underlying;
@@ -300,7 +300,7 @@ static flat_mutation_reader_v2 maybe_compact_for_streaming(flat_mutation_reader_
             streamed_mutation::forwarding::no);
 }
 
-flat_mutation_reader_v2
+mutation_reader
 table::make_streaming_reader(schema_ptr s, reader_permit permit,
                            const dht::partition_range_vector& ranges,
                            gc_clock::time_point compaction_time) const {
@@ -308,7 +308,7 @@ table::make_streaming_reader(schema_ptr s, reader_permit permit,
 
     auto source = mutation_source([this] (schema_ptr s, reader_permit permit, const dht::partition_range& range, const query::partition_slice& slice,
                                       tracing::trace_state_ptr trace_state, streamed_mutation::forwarding fwd, mutation_reader::forwarding fwd_mr) {
-        std::vector<flat_mutation_reader_v2> readers;
+        std::vector<mutation_reader> readers;
         add_memtables_to_reader_list(readers, s, permit, range, slice, trace_state, fwd, fwd_mr, [&] (size_t memtable_count) {
             readers.reserve(memtable_count + 1);
         });
@@ -323,12 +323,12 @@ table::make_streaming_reader(schema_ptr s, reader_permit permit,
             _config.enable_compacting_data_for_streaming_and_repair());
 }
 
-flat_mutation_reader_v2 table::make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
+mutation_reader table::make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
         const query::partition_slice& slice, mutation_reader::forwarding fwd_mr, gc_clock::time_point compaction_time) const {
     auto trace_state = tracing::trace_state_ptr();
     const auto fwd = streamed_mutation::forwarding::no;
 
-    std::vector<flat_mutation_reader_v2> readers;
+    std::vector<mutation_reader> readers;
     add_memtables_to_reader_list(readers, schema, permit, range, slice, trace_state, fwd, fwd_mr, [&] (size_t memtable_count) {
         readers.reserve(memtable_count + 1);
     });
@@ -340,7 +340,7 @@ flat_mutation_reader_v2 table::make_streaming_reader(schema_ptr schema, reader_p
             _config.enable_compacting_data_for_streaming_and_repair());
 }
 
-flat_mutation_reader_v2 table::make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
+mutation_reader table::make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
         lw_shared_ptr<sstables::sstable_set> sstables, gc_clock::time_point compaction_time) const {
     auto& slice = schema->full_slice();
     auto trace_state = tracing::trace_state_ptr();
@@ -354,7 +354,7 @@ flat_mutation_reader_v2 table::make_streaming_reader(schema_ptr schema, reader_p
             _config.enable_compacting_data_for_streaming_and_repair());
 }
 
-flat_mutation_reader_v2 table::make_nonpopulating_cache_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
+mutation_reader table::make_nonpopulating_cache_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
         const query::partition_slice& slice, tracing::trace_state_ptr ts) {
     if (!range.is_singular()) {
         throw std::runtime_error("table::make_cache_reader(): only singular ranges are supported");
@@ -402,7 +402,7 @@ api::timestamp_type table::min_memtable_timestamp() const {
 future<bool>
 table::for_all_partitions_slow(schema_ptr s, reader_permit permit, std::function<bool (const dht::decorated_key&, const mutation_partition&)> func) const {
     struct iteration_state {
-        flat_mutation_reader_v2 reader;
+        mutation_reader reader;
         std::function<bool (const dht::decorated_key&, const mutation_partition&)> func;
         bool ok = true;
         bool empty = false;
@@ -417,7 +417,7 @@ table::for_all_partitions_slow(schema_ptr s, reader_permit permit, std::function
 
     return do_with(iteration_state(std::move(s), std::move(permit), *this, std::move(func)), [] (iteration_state& is) {
         return do_until([&is] { return is.done(); }, [&is] {
-            return read_mutation_from_flat_mutation_reader(is.reader).then([&is](mutation_opt&& mo) {
+            return read_mutation_from_mutation_reader(is.reader).then([&is](mutation_opt&& mo) {
                 if (!mo) {
                     is.empty = true;
                 } else {
@@ -1345,7 +1345,7 @@ table::try_flush_memtable_to_sstable(compaction_group& cg, lw_shared_ptr<memtabl
             co_await _compaction_manager.maybe_wait_for_sstable_count_reduction(cg.as_table_state());
         }
 
-        auto consumer = _compaction_strategy.make_interposer_consumer(metadata, [this, old, permit, &newtabs, estimated_partitions, &cg] (flat_mutation_reader_v2 reader) mutable -> future<> {
+        auto consumer = _compaction_strategy.make_interposer_consumer(metadata, [this, old, permit, &newtabs, estimated_partitions, &cg] (mutation_reader reader) mutable -> future<> {
           std::exception_ptr ex;
           try {
             sstables::sstable_writer_config cfg = get_sstables_manager().configure_writer("memtable");
@@ -1992,6 +1992,96 @@ table::make_memtable_list(compaction_group& cg) {
     return make_lw_shared<memtable_list>(std::move(seal), std::move(get_schema), _config.dirty_memory_manager, _memtable_shared_data, _stats, _config.memory_compaction_scheduling_group);
 }
 
+class compaction_group::table_state : public compaction::table_state {
+    table& _t;
+    compaction_group& _cg;
+public:
+    explicit table_state(table& t, compaction_group& cg) : _t(t), _cg(cg) {}
+
+    const schema_ptr& schema() const noexcept override {
+        return _t.schema();
+    }
+    unsigned min_compaction_threshold() const noexcept override {
+        // During receiving stream operations, the less we compact the faster streaming is. For
+        // bootstrap and replace thereThere are no readers so it is fine to be less aggressive with
+        // compactions as long as we don't ignore them completely (this could create a problem for
+        // when streaming ends)
+        if (_t._is_bootstrap_or_replace) {
+            auto target = std::min(_t.schema()->max_compaction_threshold(), 16);
+            return std::max(_t.schema()->min_compaction_threshold(), target);
+        } else {
+            return _t.schema()->min_compaction_threshold();
+        }
+    }
+    bool compaction_enforce_min_threshold() const noexcept override {
+        return _t.get_config().compaction_enforce_min_threshold || _t._is_bootstrap_or_replace;
+    }
+    const sstables::sstable_set& main_sstable_set() const override {
+        return *_cg.main_sstables();
+    }
+    const sstables::sstable_set& maintenance_sstable_set() const override {
+        return *_cg.maintenance_sstables();
+    }
+    std::unordered_set<sstables::shared_sstable> fully_expired_sstables(const std::vector<sstables::shared_sstable>& sstables, gc_clock::time_point query_time) const override {
+        return sstables::get_fully_expired_sstables(*this, sstables, query_time);
+    }
+    const std::vector<sstables::shared_sstable>& compacted_undeleted_sstables() const noexcept override {
+        return _cg.compacted_undeleted_sstables();
+    }
+    sstables::compaction_strategy& get_compaction_strategy() const noexcept override {
+        return _t.get_compaction_strategy();
+    }
+    compaction::compaction_strategy_state& get_compaction_strategy_state() noexcept override {
+        return _cg._compaction_strategy_state;
+    }
+    reader_permit make_compaction_reader_permit() const override {
+        return _t.compaction_concurrency_semaphore().make_tracking_only_permit(schema(), "compaction", db::no_timeout, {});
+    }
+    sstables::sstables_manager& get_sstables_manager() noexcept override {
+        return _t.get_sstables_manager();
+    }
+    sstables::shared_sstable make_sstable() const override {
+        return _t.make_sstable();
+    }
+    sstables::sstable_writer_config configure_writer(sstring origin) const override {
+        auto cfg = _t.get_sstables_manager().configure_writer(std::move(origin));
+        return cfg;
+    }
+    api::timestamp_type min_memtable_timestamp() const override {
+        return _cg.min_memtable_timestamp();
+    }
+    bool memtable_has_key(const dht::decorated_key& key) const override {
+        return _cg.memtable_has_key(key);
+    }
+    future<> on_compaction_completion(sstables::compaction_completion_desc desc, sstables::offstrategy offstrategy) override {
+        if (offstrategy) {
+            co_await _cg.update_sstable_lists_on_off_strategy_completion(std::move(desc));
+            _cg.trigger_compaction();
+            co_return;
+        }
+        co_await _cg.update_main_sstable_list_on_compaction_completion(std::move(desc));
+    }
+    bool is_auto_compaction_disabled_by_user() const noexcept override {
+        return _t.is_auto_compaction_disabled_by_user();
+    }
+    bool tombstone_gc_enabled() const noexcept override {
+        return _t._tombstone_gc_enabled;
+    }
+    const tombstone_gc_state& get_tombstone_gc_state() const noexcept override {
+        return _t.get_compaction_manager().get_tombstone_gc_state();
+    }
+    compaction_backlog_tracker& get_backlog_tracker() override {
+        return _t._compaction_manager.get_backlog_tracker(*this);
+    }
+    const std::string get_group_id() const noexcept override {
+        return fmt::format("{}", _cg.group_id());
+    }
+
+    seastar::condition_variable& get_staging_done_condition() noexcept override {
+        return _cg.get_staging_done_condition();
+    }
+};
+
 compaction_group::compaction_group(table& t, size_t group_id, dht::token_range token_range)
     : _t(t)
     , _table_state(std::make_unique<table_state>(t, *this))
@@ -2004,6 +2094,8 @@ compaction_group::compaction_group(table& t, size_t group_id, dht::token_range t
 {
     _t._compaction_manager.add(as_table_state());
 }
+
+compaction_group::~compaction_group() = default;
 
 future<> compaction_group::stop() noexcept {
     if (_async_gate.is_closed()) {
@@ -2898,7 +2990,7 @@ future<> table::apply(const frozen_mutation& m, schema_ptr m_schema, db::rp_hand
 template void table::do_apply(compaction_group& cg, db::rp_handle&&, const frozen_mutation&, const schema_ptr&);
 
 future<>
-write_memtable_to_sstable(flat_mutation_reader_v2 reader,
+write_memtable_to_sstable(mutation_reader reader,
                           memtable& mt, sstables::shared_sstable sst,
                           size_t estimated_partitions,
                           sstables::write_monitor& monitor,
@@ -3132,7 +3224,7 @@ void table::set_tombstone_gc_enabled(bool tombstone_gc_enabled) noexcept {
     }
 }
 
-flat_mutation_reader_v2
+mutation_reader
 table::make_reader_v2_excluding_staging(schema_ptr s,
         reader_permit permit,
         const dht::partition_range& range,
@@ -3140,7 +3232,7 @@ table::make_reader_v2_excluding_staging(schema_ptr s,
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr) const {
-    std::vector<flat_mutation_reader_v2> readers;
+    std::vector<mutation_reader> readers;
 
     add_memtables_to_reader_list(readers, s, permit, range, slice, trace_state, fwd, fwd_mr, [&] (size_t memtable_count) {
         readers.reserve(memtable_count + 1);
@@ -3214,6 +3306,15 @@ future<row_locker::lock_holder> table::do_push_view_replica_updates(shared_ptr<d
     utils::get_local_injector().inject("table_push_view_replica_updates_stale_time_point", [&now] {
         now -= 10s;
     });
+
+    if (!db::view::should_generate_view_updates_on_this_shard(base, get_effective_replication_map(), m.token())) {
+        // This could happen if we are a pending replica.
+        // A pending replica may have incomplete data, and building view updates could result
+        // in wrong updates. Therefore we don't send updates from a pending replica. Instead, the
+        // base replicas send the updates to the view replicas, including pending replicas.
+        co_return row_locker::lock_holder();
+    }
+
     auto views = db::view::with_base_info_snapshot(affected_views(gen, base, m));
     if (views.empty()) {
         co_return row_locker::lock_holder();
@@ -3311,96 +3412,6 @@ std::vector<mutation_source> table::select_memtables_as_mutation_sources(dht::to
     }
     return mss;
 }
-
-class compaction_group::table_state : public compaction::table_state {
-    table& _t;
-    compaction_group& _cg;
-public:
-    explicit table_state(table& t, compaction_group& cg) : _t(t), _cg(cg) {}
-
-    const schema_ptr& schema() const noexcept override {
-        return _t.schema();
-    }
-    unsigned min_compaction_threshold() const noexcept override {
-        // During receiving stream operations, the less we compact the faster streaming is. For
-        // bootstrap and replace thereThere are no readers so it is fine to be less aggressive with
-        // compactions as long as we don't ignore them completely (this could create a problem for
-        // when streaming ends)
-        if (_t._is_bootstrap_or_replace) {
-            auto target = std::min(_t.schema()->max_compaction_threshold(), 16);
-            return std::max(_t.schema()->min_compaction_threshold(), target);
-        } else {
-            return _t.schema()->min_compaction_threshold();
-        }
-    }
-    bool compaction_enforce_min_threshold() const noexcept override {
-        return _t.get_config().compaction_enforce_min_threshold || _t._is_bootstrap_or_replace;
-    }
-    const sstables::sstable_set& main_sstable_set() const override {
-        return *_cg.main_sstables();
-    }
-    const sstables::sstable_set& maintenance_sstable_set() const override {
-        return *_cg.maintenance_sstables();
-    }
-    std::unordered_set<sstables::shared_sstable> fully_expired_sstables(const std::vector<sstables::shared_sstable>& sstables, gc_clock::time_point query_time) const override {
-        return sstables::get_fully_expired_sstables(*this, sstables, query_time);
-    }
-    const std::vector<sstables::shared_sstable>& compacted_undeleted_sstables() const noexcept override {
-        return _cg.compacted_undeleted_sstables();
-    }
-    sstables::compaction_strategy& get_compaction_strategy() const noexcept override {
-        return _t.get_compaction_strategy();
-    }
-    compaction::compaction_strategy_state& get_compaction_strategy_state() noexcept override {
-        return _cg._compaction_strategy_state;
-    }
-    reader_permit make_compaction_reader_permit() const override {
-        return _t.compaction_concurrency_semaphore().make_tracking_only_permit(schema(), "compaction", db::no_timeout, {});
-    }
-    sstables::sstables_manager& get_sstables_manager() noexcept override {
-        return _t.get_sstables_manager();
-    }
-    sstables::shared_sstable make_sstable() const override {
-        return _t.make_sstable();
-    }
-    sstables::sstable_writer_config configure_writer(sstring origin) const override {
-        auto cfg = _t.get_sstables_manager().configure_writer(std::move(origin));
-        return cfg;
-    }
-    api::timestamp_type min_memtable_timestamp() const override {
-        return _cg.min_memtable_timestamp();
-    }
-    bool memtable_has_key(const dht::decorated_key& key) const override {
-        return _cg.memtable_has_key(key);
-    }
-    future<> on_compaction_completion(sstables::compaction_completion_desc desc, sstables::offstrategy offstrategy) override {
-        if (offstrategy) {
-            co_await _cg.update_sstable_lists_on_off_strategy_completion(std::move(desc));
-            _cg.trigger_compaction();
-            co_return;
-        }
-        co_await _cg.update_main_sstable_list_on_compaction_completion(std::move(desc));
-    }
-    bool is_auto_compaction_disabled_by_user() const noexcept override {
-        return _t.is_auto_compaction_disabled_by_user();
-    }
-    bool tombstone_gc_enabled() const noexcept override {
-        return _t._tombstone_gc_enabled;
-    }
-    const tombstone_gc_state& get_tombstone_gc_state() const noexcept override {
-        return _t.get_compaction_manager().get_tombstone_gc_state();
-    }
-    compaction_backlog_tracker& get_backlog_tracker() override {
-        return _t._compaction_manager.get_backlog_tracker(*this);
-    }
-    const std::string get_group_id() const noexcept override {
-        return fmt::format("{}", _cg.group_id());
-    }
-
-    seastar::condition_variable& get_staging_done_condition() noexcept override {
-        return _cg.get_staging_done_condition();
-    }
-};
 
 compaction_backlog_tracker& compaction_group::get_backlog_tracker() {
     return as_table_state().get_backlog_tracker();

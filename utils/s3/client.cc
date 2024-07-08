@@ -134,7 +134,7 @@ future<semaphore_units<>> client::claim_memory(size_t size) {
 }
 
 client::group_client::group_client(std::unique_ptr<http::experimental::connection_factory> f, unsigned max_conn)
-        : http(std::move(f), max_conn)
+        : http(std::move(f), max_conn, http::experimental::client::retry_requests::yes)
 {
 }
 
@@ -403,7 +403,7 @@ future<> client::put_object(sstring object_name, temporary_buffer<char> buf) {
     s3l.trace("PUT {}", object_name);
     auto req = http::request::make("PUT", _host, object_name);
     auto len = buf.size();
-    req.write_body("bin", len, [buf = std::move(buf)] (output_stream<char>&& out_) mutable -> future<> {
+    req.write_body("bin", len, [buf = std::move(buf)] (output_stream<char>&& out_) -> future<> {
         auto out = std::move(out_);
         std::exception_ptr ex;
         try {
@@ -427,7 +427,7 @@ future<> client::put_object(sstring object_name, ::memory_data_sink_buffers bufs
     s3l.trace("PUT {} (buffers)", object_name);
     auto req = http::request::make("PUT", _host, object_name);
     auto len = bufs.size();
-    req.write_body("bin", len, [bufs = std::move(bufs)] (output_stream<char>&& out_) mutable -> future<> {
+    req.write_body("bin", len, [bufs = std::move(bufs)] (output_stream<char>&& out_) -> future<> {
         auto out = std::move(out_);
         std::exception_ptr ex;
         try {

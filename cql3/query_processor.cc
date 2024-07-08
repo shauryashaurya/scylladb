@@ -11,13 +11,13 @@
 #include "cql3/query_processor.hh"
 
 #include <seastar/core/metrics.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 
-#include "seastar/core/shared_ptr.hh"
 #include "service/storage_proxy.hh"
 #include "service/topology_mutation.hh"
 #include "service/migration_manager.hh"
-#include "service/forward_service.hh"
+#include "service/mapreduce_service.hh"
 #include "service/raft/raft_group0_client.hh"
 #include "service/storage_service.hh"
 #include "cql3/CqlParser.hpp"
@@ -45,12 +45,12 @@ const sstring query_processor::CQL_VERSION = "3.3.1";
 const std::chrono::minutes prepared_statements_cache::entry_expiry = std::chrono::minutes(60);
 
 struct query_processor::remote {
-    remote(service::migration_manager& mm, service::forward_service& fwd,
+    remote(service::migration_manager& mm, service::mapreduce_service& fwd,
            service::storage_service& ss, service::raft_group0_client& group0_client)
-            : mm(mm), forwarder(fwd), ss(ss), group0_client(group0_client) {}
+            : mm(mm), mapreducer(fwd), ss(ss), group0_client(group0_client) {}
 
     service::migration_manager& mm;
-    service::forward_service& forwarder;
+    service::mapreduce_service& mapreducer;
     service::storage_service& ss;
     service::raft_group0_client& group0_client;
 
@@ -506,9 +506,9 @@ query_processor::~query_processor() {
     }
 }
 
-void query_processor::start_remote(service::migration_manager& mm, service::forward_service& forwarder,
+void query_processor::start_remote(service::migration_manager& mm, service::mapreduce_service& mapreducer,
                                    service::storage_service& ss, service::raft_group0_client& group0_client) {
-    _remote = std::make_unique<struct remote>(mm, forwarder, ss, group0_client);
+    _remote = std::make_unique<struct remote>(mm, mapreducer, ss, group0_client);
 }
 
 future<> query_processor::stop_remote() {
@@ -827,7 +827,7 @@ bool query_processor::has_more_results(cql3::internal_query_state& state) const 
 
 future<> query_processor::for_each_cql_result(
         cql3::internal_query_state& state,
-         noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set::row&)>&& f) {
+        noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set::row&)> f) {
     do {
         auto msg = co_await execute_paged_internal(state);
         for (auto& row : *msg) {
@@ -988,10 +988,10 @@ query_processor::execute_broadcast_table_query(const service::broadcast_tables::
     co_return co_await service::broadcast_tables::execute(remote_.get().group0_client, query);
 }
 
-future<query::forward_result>
-query_processor::forward(query::forward_request req, tracing::trace_state_ptr tr_state) {
+future<query::mapreduce_result>
+query_processor::mapreduce(query::mapreduce_request req, tracing::trace_state_ptr tr_state) {
     auto [remote_, holder] = remote();
-    co_return co_await remote_.get().forwarder.dispatch(std::move(req), std::move(tr_state));
+    co_return co_await remote_.get().mapreducer.dispatch(std::move(req), std::move(tr_state));
 }
 
 future<::shared_ptr<messages::result_message>>
@@ -999,9 +999,6 @@ query_processor::execute_schema_statement(const statements::schema_altering_stat
     if (this_shard_id() != 0) {
         on_internal_error(log, "DDL must be executed on shard 0");
     }
-
-    // TODO: remove this field, it should be injected directly as prepare_schema_mutations argument
-    stmt.global_req_id = mc.new_group0_state_id();
 
     auto [ce, warnings] = co_await stmt.prepare_schema_mutations(*this, state, options, mc);
     // We are creating something.
@@ -1150,14 +1147,14 @@ future<> query_processor::query_internal(
         db::consistency_level cl,
         const data_value_list& values,
         int32_t page_size,
-        noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)>&& f) {
+        noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)> f) {
     auto query_state = create_paged_state(query_string, cl, values, page_size);
     co_return co_await for_each_cql_result(query_state, std::move(f));
 }
 
 future<> query_processor::query_internal(
         const sstring& query_string,
-        noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)>&& f) {
+        noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)> f) {
     return query_internal(query_string, db::consistency_level::ONE, {}, 1000, std::move(f));
 }
 

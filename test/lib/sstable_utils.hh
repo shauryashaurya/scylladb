@@ -233,6 +233,10 @@ public:
     void reload_reclaimed_components() {
         _sst->reload_reclaimed_components().get();
     }
+
+    const utils::filter_ptr& get_filter() const {
+        return _sst->_components->filter;
+    }
 };
 
 inline auto replacer_fn_no_op() {
@@ -254,13 +258,13 @@ future<compaction_result> compact_sstables(test_env& env, sstables::compaction_d
                  std::function<shared_sstable()> creator, sstables::compaction_sstable_replacer_fn replacer = sstables::replacer_fn_no_op(),
                  can_purge_tombstones can_purge = can_purge_tombstones::yes);
 
-shared_sstable make_sstable_easy(test_env& env, flat_mutation_reader_v2 rd, sstable_writer_config cfg,
+shared_sstable make_sstable_easy(test_env& env, mutation_reader rd, sstable_writer_config cfg,
         sstables::generation_type gen, const sstable::version_types version = sstables::get_highest_sstable_version(), int expected_partition = 1, gc_clock::time_point = gc_clock::now());
 shared_sstable make_sstable_easy(test_env& env, lw_shared_ptr<replica::memtable> mt, sstable_writer_config cfg,
         sstables::generation_type gen, const sstable::version_types v = sstables::get_highest_sstable_version(), int estimated_partitions = 1, gc_clock::time_point = gc_clock::now());
 
 
-inline shared_sstable make_sstable_easy(test_env& env, flat_mutation_reader_v2 rd, sstable_writer_config cfg,
+inline shared_sstable make_sstable_easy(test_env& env, mutation_reader rd, sstable_writer_config cfg,
         const sstable::version_types version = sstables::get_highest_sstable_version(), int expected_partition = 1) {
     return make_sstable_easy(env, std::move(rd), std::move(cfg), env.new_generation(), version, expected_partition);
 }

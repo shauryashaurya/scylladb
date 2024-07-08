@@ -14,12 +14,12 @@
 #include <boost/range/join.hpp>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/rwlock.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include "db_clock.hh"
 #include "log.hh"
-#include "seastar/core/rwlock.hh"
 #include "tasks/types.hh"
 #include "utils/serialized_action.hh"
 #include "utils/updateable_value.hh"
@@ -167,7 +167,7 @@ public:
             virtual future<task_manager::task::progress> get_progress() const;
             virtual tasks::is_abortable is_abortable() const noexcept;
             virtual tasks::is_internal is_internal() const noexcept;
-            virtual future<> abort() noexcept;
+            virtual void abort() noexcept;
             bool is_complete() const noexcept;
             bool is_done() const noexcept;
             virtual void release_resources() noexcept {}
@@ -206,7 +206,7 @@ public:
         future<progress> get_progress() const;
         tasks::is_abortable is_abortable() const noexcept;
         tasks::is_internal is_internal() const noexcept;
-        future<> abort() noexcept;
+        void abort() noexcept;
         bool abort_requested() const noexcept;
         future<> done() const noexcept;
         void register_task();

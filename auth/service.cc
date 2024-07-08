@@ -32,7 +32,7 @@
 #include "log.hh"
 #include "schema/schema_fwd.hh"
 #include <seastar/core/future.hh>
-#include "seastar/coroutine/parallel_for_each.hh"
+#include <seastar/coroutine/parallel_for_each.hh>
 #include "service/migration_manager.hh"
 #include "service/raft/raft_group0_client.hh"
 #include "timestamp.hh"
@@ -410,7 +410,7 @@ future<bool> service::exists(const resource& r) const {
                 return make_ready_future<bool>(db.has_keyspace(sstring(*keyspace)));
             }
             auto [name, function_args] = auth::decode_signature(*function_signature);
-            return make_ready_future<bool>(cql3::functions::functions::find(db::functions::function_name{sstring(*keyspace), name}, function_args));
+            return make_ready_future<bool>(cql3::functions::instance().find(db::functions::function_name{sstring(*keyspace), name}, function_args));
         }
     }
 

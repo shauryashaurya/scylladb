@@ -36,7 +36,7 @@ namespace lang { class manager; }
 namespace service {
 class migration_manager;
 class query_state;
-class forward_service;
+class mapreduce_service;
 class raft_group0_client;
 
 namespace broadcast_tables {
@@ -146,7 +146,7 @@ public:
 
     ~query_processor();
 
-    void start_remote(service::migration_manager&, service::forward_service&,
+    void start_remote(service::migration_manager&, service::mapreduce_service&,
                       service::storage_service& ss, service::raft_group0_client&);
     future<> stop_remote();
 
@@ -311,7 +311,7 @@ public:
             db::consistency_level cl,
             const data_value_list& values,
             int32_t page_size,
-            noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)>&& f);
+            noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)> f);
 
     /*
      * \brief iterate over all cql results using paging
@@ -326,7 +326,7 @@ public:
      */
     future<> query_internal(
             const sstring& query_string,
-            noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)>&& f);
+            noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)> f);
 
     class cache_internal_tag;
     using cache_internal = bool_class<cache_internal_tag>;
@@ -431,9 +431,9 @@ public:
     future<service::broadcast_tables::query_result>
     execute_broadcast_table_query(const service::broadcast_tables::query&);
 
-    // Splits given `forward_request` and distributes execution of resulting subrequests across a cluster.
-    future<query::forward_result>
-    forward(query::forward_request, tracing::trace_state_ptr);
+    // Splits given `mapreduce_request` and distributes execution of resulting subrequests across a cluster.
+    future<query::mapreduce_result>
+    mapreduce(query::mapreduce_request, tracing::trace_state_ptr);
 
     struct retry_statement_execution_error : public std::exception {};
 
@@ -493,7 +493,7 @@ private:
      */
     future<> for_each_cql_result(
             cql3::internal_query_state& state,
-             noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)>&& f);
+            noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)> f);
 
     /*!
      * \brief check, based on the state if there are additional results

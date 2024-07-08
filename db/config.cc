@@ -1009,6 +1009,8 @@ db::config::config(std::shared_ptr<db::extensions> exts)
             "Start serializing reads after their collective memory consumption goes above $normal_limit * $multiplier.")
     , reader_concurrency_semaphore_kill_limit_multiplier(this, "reader_concurrency_semaphore_kill_limit_multiplier", liveness::LiveUpdate, value_status::Used, 4,
             "Start killing reads after their collective memory consumption goes above $normal_limit * $multiplier.")
+    , reader_concurrency_semaphore_cpu_concurrency(this, "reader_concurrency_semaphore_cpu_concurrency", liveness::LiveUpdate, value_status::Used, 1,
+            "Admit new reads while there are less than this number of requests that need CPU.")
     , maintenance_reader_concurrency_semaphore_count_limit(this, "maintenance_reader_concurrency_semaphore_count_limit", liveness::LiveUpdate, value_status::Used, 10,
             "Allow up to this many maintenance (e.g. streaming and repair) reads per shard to progress at the same time.")
     , twcs_max_window_count(this, "twcs_max_window_count", liveness::LiveUpdate, value_status::Used, 50,
@@ -1138,10 +1140,10 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , error_injections_at_startup(this, "error_injections_at_startup", error_injection_value_status, {}, "List of error injections that should be enabled on startup.")
     , topology_barrier_stall_detector_threshold_seconds(this, "topology_barrier_stall_detector_threshold_seconds", value_status::Used, 2, "Report sites blocking topology barrier if it takes longer than this.")
     , enable_tablets(this, "enable_tablets", value_status::Used, false, "Enable tablets for newly created keyspaces")
-    , default_log_level(this, "default_log_level", value_status::Used)
-    , logger_log_level(this, "logger_log_level", value_status::Used)
-    , log_to_stdout(this, "log_to_stdout", value_status::Used)
-    , log_to_syslog(this, "log_to_syslog", value_status::Used)
+    , default_log_level(this, "default_log_level", value_status::Used, seastar::log_level::info, "Default log level for log messages")
+    , logger_log_level(this, "logger_log_level", value_status::Used, {}, "Map of logger name to log level. Valid log levels are 'error', 'warn', 'info', 'debug' and 'trace'")
+    , log_to_stdout(this, "log_to_stdout", value_status::Used, true, "Send log output to stdout")
+    , log_to_syslog(this, "log_to_syslog", value_status::Used, false, "Send log output to syslog")
     , _extensions(std::move(exts))
 {
     add_tombstone_gc_extension();

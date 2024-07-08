@@ -17,8 +17,8 @@
 #include <exception>
 #include <iterator>
 #include <seastar/core/print.hh>
+#include <seastar/core/shared_ptr.hh>
 #include "types/types.hh"
-#include "seastar/core/shared_ptr.hh"
 #include "utils/serialization.hh"
 #include "vint-serialization.hh"
 #include <cmath>
@@ -3722,11 +3722,6 @@ auto fmt::formatter<data_value>::format(const data_value& v,
         return fmt::format_to(ctx.out(), "null");
     }
     return fmt::format_to(ctx.out(), "{}", v.type()->to_string_impl(v));
-}
-
-std::ostream& operator<<(std::ostream& out, const data_value& v) {
-    fmt::print(out, "{}", v);
-    return out;
 }
 
 shared_ptr<const reversed_type_impl> reversed_type_impl::get_instance(data_type type) {

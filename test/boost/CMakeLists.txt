@@ -19,6 +19,8 @@ add_scylla_test(batchlog_manager_test
 add_scylla_test(big_decimal_test
   KIND BOOST
   LIBRARIES utils)
+add_scylla_test(bloom_filter_test
+  KIND SEASTAR)
 add_scylla_test(bptree_test
   KIND BOOST
   LIBRARIES utils)
@@ -30,7 +32,7 @@ add_scylla_test(bytes_ostream_test
   KIND SEASTAR)
 add_scylla_test(cache_algorithm_test
   KIND SEASTAR)
-add_scylla_test(cache_flat_mutation_reader_test
+add_scylla_test(cache_mutation_reader_test
   KIND SEASTAR)
 add_scylla_test(cached_file_test
   KIND SEASTAR)
@@ -126,7 +128,7 @@ add_scylla_test(extensions_test
   KIND SEASTAR)
 add_scylla_test(filtering_test
   KIND SEASTAR)
-add_scylla_test(flat_mutation_reader_test
+add_scylla_test(mutation_reader_another_test
   KIND SEASTAR)
 add_scylla_test(flush_queue_test
   KIND SEASTAR)

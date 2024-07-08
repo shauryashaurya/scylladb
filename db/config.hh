@@ -380,6 +380,7 @@ public:
     named_value<uint64_t> max_memory_for_unlimited_query_hard_limit;
     named_value<uint32_t> reader_concurrency_semaphore_serialize_limit_multiplier;
     named_value<uint32_t> reader_concurrency_semaphore_kill_limit_multiplier;
+    named_value<uint32_t> reader_concurrency_semaphore_cpu_concurrency;
     named_value<int> maintenance_reader_concurrency_semaphore_count_limit;
     named_value<uint32_t> twcs_max_window_count;
     named_value<unsigned> initial_sstable_loading_concurrency;
@@ -505,7 +506,8 @@ private:
 
     log_legacy_value<seastar::log_level> default_log_level;
     log_legacy_value<std::unordered_map<sstring, seastar::log_level>> logger_log_level;
-    log_legacy_value<bool> log_to_stdout, log_to_syslog;
+    log_legacy_value<bool> log_to_stdout;
+    log_legacy_value<bool> log_to_syslog;
 
     void maybe_in_workdir(named_value<sstring>&, const char*);
     void maybe_in_workdir(named_value<string_list>&, const char*);

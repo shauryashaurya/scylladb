@@ -76,17 +76,16 @@ struct http_context {
     sstring api_doc;
     httpd::http_server_control http_server;
     distributed<replica::database>& db;
-    service::load_meter& lmeter;
 
-    http_context(distributed<replica::database>& _db,
-            service::load_meter& _lm)
-            : db(_db), lmeter(_lm)
+    http_context(distributed<replica::database>& _db)
+            : db(_db)
     {
     }
 };
 
 future<> set_server_init(http_context& ctx);
 future<> set_server_config(http_context& ctx, const db::config& cfg);
+future<> unset_server_config(http_context& ctx);
 future<> set_server_snitch(http_context& ctx, sharded<locator::snitch_ptr>& snitch);
 future<> unset_server_snitch(http_context& ctx);
 future<> set_server_storage_service(http_context& ctx, sharded<service::storage_service>& ss, service::raft_group0_client&);
@@ -108,6 +107,7 @@ future<> unset_server_snapshot(http_context& ctx);
 future<> set_server_token_metadata(http_context& ctx, sharded<locator::shared_token_metadata>& tm);
 future<> unset_server_token_metadata(http_context& ctx);
 future<> set_server_gossip(http_context& ctx, sharded<gms::gossiper>& g);
+future<> unset_server_gossip(http_context& ctx);
 future<> set_server_column_family(http_context& ctx, sharded<db::system_keyspace>& sys_ks);
 future<> unset_server_column_family(http_context& ctx);
 future<> set_server_messaging_service(http_context& ctx, sharded<netw::messaging_service>& ms);
@@ -118,7 +118,6 @@ future<> set_server_stream_manager(http_context& ctx, sharded<streaming::stream_
 future<> unset_server_stream_manager(http_context& ctx);
 future<> set_hinted_handoff(http_context& ctx, sharded<service::storage_proxy>& p);
 future<> unset_hinted_handoff(http_context& ctx);
-future<> set_server_gossip_settle(http_context& ctx, sharded<gms::gossiper>& g);
 future<> set_server_cache(http_context& ctx);
 future<> set_server_compaction_manager(http_context& ctx);
 future<> set_server_done(http_context& ctx);
@@ -130,5 +129,7 @@ future<> set_server_tasks_compaction_module(http_context& ctx, sharded<service::
 future<> unset_server_tasks_compaction_module(http_context& ctx);
 future<> set_server_raft(http_context&, sharded<service::raft_group_registry>&);
 future<> unset_server_raft(http_context&);
+future<> set_load_meter(http_context& ctx, service::load_meter& lm);
+future<> unset_load_meter(http_context& ctx);
 
 }

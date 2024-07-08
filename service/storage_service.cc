@@ -1224,6 +1224,10 @@ public:
                 rtlogger.info("join: request to join placed, waiting"
                              " for the response from the topology coordinator");
 
+                if (utils::get_local_injector().enter("pre_server_start_drop_expiring")) {
+                    _ss._group0->modifiable_address_map().force_drop_expiring_entries();
+                }
+
                 _ss._join_node_request_done.set_value();
             },
             [] (const join_node_request_result::rejected& rej) {
@@ -1676,10 +1680,8 @@ future<> storage_service::join_token_ring(sharded<db::system_distributed_keyspac
         // NORMAL doesn't necessarily mean UP (#14042). Wait for these nodes to be UP as well
         // to reduce flakiness (we need them to be UP to perform CDC generation write and for repair/streaming).
         //
-        // This could be done in Raft topology mode as well, but the calculation of nodes to sync with
-        // has to be done based on topology state machine instead of gossiper as it is here;
-        // furthermore, the place in the code where we do this has to be different (it has to be coordinated
-        // by the topology coordinator after it joins the node to the cluster).
+        // We do it in Raft topology mode as well in join_node_response_handler. The calculation of nodes to
+        // sync with is done based on topology state machine instead of gossiper as it is here.
         //
         // We calculate nodes to wait for based on token_metadata. Previously we would use gossiper
         // directly for this, but gossiper may still contain obsolete entries from 1. replaced nodes
@@ -1687,20 +1689,26 @@ future<> storage_service::join_token_ring(sharded<db::system_distributed_keyspac
         // but here they may still be present if we're performing topology changes in quick succession.
         // `token_metadata` has all host ID / token collisions resolved so in particular it doesn't contain
         // these obsolete IPs. Refs: #14487, #14468
-        auto& tm = get_token_metadata();
+        //
+        // We recalculate nodes in every step of the loop in wait_alive. For example, if we booted a new node
+        // just after removing a different node, other nodes could still see the removed node as NORMAL. Then,
+        // the joining node would wait for it to be UP, and wait_alive would time out. Recalculation fixes
+        // this problem. Ref: #17526
+        auto get_sync_nodes = [&] {
+            std::vector<gms::inet_address> sync_nodes;
+            get_token_metadata().get_topology().for_each_node([&] (const locator::node* np) {
+                auto ep = np->endpoint();
+                const auto& host_id = np->host_id();
+                if (!ri || (host_id != ri->host_id && !ri->ignore_nodes.contains(host_id))) {
+                    sync_nodes.push_back(ep);
+                }
+            });
+            return sync_nodes;
+        };
 
-        std::vector<gms::inet_address> sync_nodes;
-        tm.get_topology().for_each_node([&] (const locator::node* np) {
-            auto ep = np->endpoint();
-            const auto& host_id = np->host_id();
-            if (!ri || (host_id != ri->host_id && !ri->ignore_nodes.contains(host_id))) {
-                sync_nodes.push_back(ep);
-            }
-        });
-
-        slogger.info("Waiting for nodes {} to be alive", sync_nodes);
-        co_await _gossiper.wait_alive(sync_nodes, wait_for_live_nodes_timeout);
-        slogger.info("Nodes {} are alive", sync_nodes);
+        slogger.info("Waiting for other nodes to be alive. Current nodes: {}", get_sync_nodes());
+        co_await _gossiper.wait_alive(get_sync_nodes, wait_for_live_nodes_timeout);
+        slogger.info("Nodes {} are alive", get_sync_nodes());
     }
 
     assert(_group0);
@@ -1829,6 +1837,17 @@ future<> storage_service::join_token_ring(sharded<db::system_distributed_keyspac
 
         // Initializes monitor only after updating local topology.
         start_tablet_split_monitor();
+
+        std::unordered_set<inet_address> ips;
+        const auto& am = _group0->address_map();
+        for (auto id : _topology_state_machine._topology.normal_nodes | boost::adaptors::map_keys) {
+            auto ip = am.find(id);
+            if (ip) {
+                ips.insert(*ip);
+            }
+        }
+
+        co_await _gossiper.notify_nodes_on_up(std::move(ips));
 
         co_return;
     }
@@ -2002,6 +2021,15 @@ future<> storage_service::join_token_ring(sharded<db::system_distributed_keyspac
         }
         // Other errors are handled internally by track_upgrade_progress_to_topology_coordinator
     })(*this, sys_dist_ks, proxy);
+
+    std::unordered_set<inet_address> ips;
+    _gossiper.for_each_endpoint_state([this, &ips] (const inet_address& addr, const gms::endpoint_state&) {
+        if (_gossiper.is_normal(addr)) {
+            ips.insert(addr);
+        }
+    });
+
+    co_await _gossiper.notify_nodes_on_up(std::move(ips));
 }
 
 future<> storage_service::track_upgrade_progress_to_topology_coordinator(sharded<db::system_distributed_keyspace>& sys_dist_ks, sharded<service::storage_proxy>& proxy) {
@@ -2807,8 +2835,10 @@ future<> storage_service::init_address_map(raft_address_map& address_map, gms::g
         address_map.add_or_update_entry(raft::server_id(host.uuid()), ip);
     }
     const auto& topology = get_token_metadata().get_topology();
-    address_map.add_or_update_entry(raft::server_id{topology.my_host_id().uuid()},
-        topology.my_address(), new_generation);
+    raft::server_id myid{topology.my_host_id().uuid()};
+    address_map.add_or_update_entry(myid,topology.my_address(), new_generation);
+    // Make my entry non expiring
+    address_map.set_nonexpiring(myid);
     _raft_ip_address_updater = make_shared<raft_ip_address_updater>(address_map, *this);
     _gossiper.register_(_raft_ip_address_updater);
 }
@@ -4475,10 +4505,10 @@ future<> storage_service::do_drain() {
         return bm.drain();
     });
 
+    co_await _view_builder.invoke_on_all(&db::view::view_builder::drain);
     co_await _db.invoke_on_all(&replica::database::drain);
     co_await _sys_ks.invoke_on_all(&db::system_keyspace::shutdown);
     co_await _repair.invoke_on_all(&repair_service::shutdown);
-    co_await _view_builder.invoke_on_all(&db::view::view_builder::drain);
 }
 
 future<> storage_service::do_cluster_cleanup() {
@@ -5800,6 +5830,15 @@ future<> storage_service::stream_tablet(locator::global_tablet_id tablet) {
                                                      tablet, leaving_replica));
             }
             tm = nullptr;
+
+            co_await utils::get_local_injector().inject("intranode_migration_streaming_wait", [this] (auto& handler) -> future<> {
+                rtlogger.info("intranode_migration_streaming: waiting");
+                while (!handler.poll_for_message() && !_async_gate.is_closed()) {
+                    co_await sleep(std::chrono::milliseconds(5));
+                }
+                rtlogger.info("intranode_migration_streaming: released");
+            });
+
             rtlogger.info("Starting intra-node streaming of tablet {} from shard {} to {}", tablet, leaving_replica->shard, pending_replica->shard);
             co_await clone_locally_tablet_storage(tablet, *leaving_replica, *pending_replica);
             rtlogger.info("Finished intra-node streaming of tablet {} from shard {} to {}", tablet, leaving_replica->shard, pending_replica->shard);

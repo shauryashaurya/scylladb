@@ -116,10 +116,6 @@ namespace gms {
 class gossiper;
 }
 
-namespace compaction {
-class shard_reshaping_compaction_task_impl;
-}
-
 namespace api {
 class autocompaction_toggle_guard;
 }
@@ -324,6 +320,9 @@ struct cf_stats {
     uint64_t total_view_updates_pushed_remote = 0;
     uint64_t total_view_updates_failed_local = 0;
     uint64_t total_view_updates_failed_remote = 0;
+
+    // How many times we build view updates only to realize it's the wrong node and drop the update
+    uint64_t total_view_updates_on_wrong_node = 0;
 };
 
 class table;
@@ -647,7 +646,7 @@ private:
     // Caller needs to ensure that column_family remains live (FIXME: relax this).
     // The 'range' parameter must be live as long as the reader is used.
     // Mutations returned by the reader will all have given schema.
-    flat_mutation_reader_v2 make_sstable_reader(schema_ptr schema,
+    mutation_reader make_sstable_reader(schema_ptr schema,
                                         reader_permit permit,
                                         lw_shared_ptr<const sstables::sstable_set> sstables,
                                         const dht::partition_range& range,
@@ -671,7 +670,7 @@ private:
     }
 
     // reserve_fn will be called before any element is added to readers
-    void add_memtables_to_reader_list(std::vector<flat_mutation_reader_v2>& readers,
+    void add_memtables_to_reader_list(std::vector<mutation_reader>& readers,
              const schema_ptr& s,
              const reader_permit& permit,
              const dht::partition_range& range,
@@ -719,14 +718,14 @@ public:
     // Note: for data queries use query() instead.
     // The 'range' parameter must be live as long as the reader is used.
     // Mutations returned by the reader will all have given schema.
-    flat_mutation_reader_v2 make_reader_v2(schema_ptr schema,
+    mutation_reader make_reader_v2(schema_ptr schema,
             reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
             tracing::trace_state_ptr trace_state = nullptr,
             streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
             mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes) const;
-    flat_mutation_reader_v2 make_reader_v2_excluding_staging(schema_ptr schema,
+    mutation_reader make_reader_v2_excluding_staging(schema_ptr schema,
             reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
@@ -734,7 +733,7 @@ public:
             streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
             mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes) const;
 
-    flat_mutation_reader_v2 make_reader_v2(schema_ptr schema, reader_permit permit, const dht::partition_range& range = query::full_partition_range) const {
+    mutation_reader make_reader_v2(schema_ptr schema, reader_permit permit, const dht::partition_range& range = query::full_partition_range) const {
         auto& full_slice = schema->full_slice();
         return make_reader_v2(std::move(schema), std::move(permit), range, full_slice);
     }
@@ -746,28 +745,28 @@ public:
     // Requires ranges to be sorted and disjoint.
     // When compaction_time is engaged, the reader's output will be compacted, with the provided query time.
     // This compaction doesn't do tombstone garbage collection.
-    flat_mutation_reader_v2 make_streaming_reader(schema_ptr schema, reader_permit permit,
+    mutation_reader make_streaming_reader(schema_ptr schema, reader_permit permit,
             const dht::partition_range_vector& ranges, gc_clock::time_point compaction_time) const;
 
     // Single range overload.
-    flat_mutation_reader_v2 make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
+    mutation_reader make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
             const query::partition_slice& slice,
             mutation_reader::forwarding fwd_mr,
             gc_clock::time_point compaction_time) const;
 
-    flat_mutation_reader_v2 make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range, gc_clock::time_point compaction_time) {
+    mutation_reader make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range, gc_clock::time_point compaction_time) {
         return make_streaming_reader(schema, std::move(permit), range, schema->full_slice(), mutation_reader::forwarding::no, compaction_time);
     }
 
     // Stream reader from the given sstables
-    flat_mutation_reader_v2 make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
+    mutation_reader make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
             lw_shared_ptr<sstables::sstable_set> sstables, gc_clock::time_point compaction_time) const;
 
     // Make a reader which reads only from the row-cache.
     // The reader doesn't populate the cache, it reads only what is in the cache
     // Supports reading only a single partition.
     // Does not support reading in reverse.
-    flat_mutation_reader_v2 make_nonpopulating_cache_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
+    mutation_reader make_nonpopulating_cache_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
             const query::partition_slice& slice, tracing::trace_state_ptr ts);
 
     sstables::shared_sstable make_streaming_sstable_for_write();
@@ -1001,9 +1000,6 @@ public:
                                         std::optional<tasks::task_info> info = std::nullopt,
                                         do_flush = do_flush::yes);
     unsigned estimate_pending_compactions() const;
-    size_t get_compaction_group_id_for_sstable(const sstables::shared_sstable& sst) const noexcept {
-        return compaction_group_for_sstable(sst).group_id();
-    }
 
     void set_compaction_strategy(sstables::compaction_strategy_type strategy);
     const sstables::compaction_strategy& get_compaction_strategy() const {
@@ -1207,7 +1203,6 @@ public:
 
     friend class distributed_loader;
     friend class table_populator;
-    friend class compaction::shard_reshaping_compaction_task_impl;
 
 private:
     timer<> _off_strategy_trigger;
@@ -1221,6 +1216,9 @@ public:
     compaction::table_state& try_get_table_state_with_static_sharding() const;
     // Safely iterate through table states, while performing async operations on them.
     future<> parallel_foreach_table_state(std::function<future<>(compaction::table_state&)> action);
+    compaction::table_state& table_state_for_sstable(const sstables::shared_sstable& sst) const noexcept {
+        return compaction_group_for_sstable(sst).as_table_state();
+    }
 
     // Uncoditionally erase sst from `sstables_requiring_cleanup`
     // Returns true iff sst was found and erased.
@@ -1889,10 +1887,10 @@ future<> start_large_data_handler(sharded<replica::database>& db);
 // Range generator must generate disjoint, monotonically increasing ranges.
 // Opt-in for compacting the output by passing `compaction_time`, see
 // make_streaming_reader() for more details.
-flat_mutation_reader_v2 make_multishard_streaming_reader(distributed<replica::database>& db, schema_ptr schema, reader_permit permit,
+mutation_reader make_multishard_streaming_reader(distributed<replica::database>& db, schema_ptr schema, reader_permit permit,
         std::function<std::optional<dht::partition_range>()> range_generator, gc_clock::time_point compaction_time);
 
-flat_mutation_reader_v2 make_multishard_streaming_reader(distributed<replica::database>& db,
+mutation_reader make_multishard_streaming_reader(distributed<replica::database>& db,
     schema_ptr schema, reader_permit permit, const dht::partition_range& range, gc_clock::time_point compaction_time);
 
 bool is_internal_keyspace(std::string_view name);

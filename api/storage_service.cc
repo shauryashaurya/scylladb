@@ -36,6 +36,7 @@
 #include <seastar/http/exception.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
+#include <seastar/coroutine/exception.hh>
 #include "repair/row_level.hh"
 #include "locator/snitch_base.hh"
 #include "column_family.hh"
@@ -678,19 +679,6 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
 
     ss::get_load.set(r, [&ctx](std::unique_ptr<http::request> req) {
         return get_cf_stats(ctx, &replica::column_family_stats::live_disk_space_used);
-    });
-
-    ss::get_load_map.set(r, [&ctx] (std::unique_ptr<http::request> req) {
-        return ctx.lmeter.get_load_map().then([] (auto&& load_map) {
-            std::vector<ss::map_string_double> res;
-            for (auto i : load_map) {
-                ss::map_string_double val;
-                val.key = i.first;
-                val.value = i.second;
-                res.push_back(val);
-            }
-            return make_ready_future<json::json_return_type>(res);
-        });
     });
 
     ss::get_current_generation_number.set(r, [&ss](std::unique_ptr<http::request> req) {
@@ -1577,7 +1565,6 @@ void unset_storage_service(http_context& ctx, routes& r) {
     ss::get_pending_range_to_endpoint_map.unset(r);
     ss::describe_ring.unset(r);
     ss::get_load.unset(r);
-    ss::get_load_map.unset(r);
     ss::get_current_generation_number.unset(r);
     ss::get_natural_endpoints.unset(r);
     ss::cdc_streams_check_and_repair.unset(r);
@@ -1653,36 +1640,63 @@ void unset_storage_service(http_context& ctx, routes& r) {
     sp::get_schema_versions.unset(r);
 }
 
+void set_load_meter(http_context& ctx, routes& r, service::load_meter& lm) {
+    ss::get_load_map.set(r, [&lm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto load_map = co_await lm.get_load_map();
+        std::vector<ss::map_string_double> res;
+        for (auto i : load_map) {
+            ss::map_string_double val;
+            val.key = i.first;
+            val.value = i.second;
+            res.push_back(val);
+        }
+        co_return res;
+    });
+}
+
+void unset_load_meter(http_context& ctx, routes& r) {
+    ss::get_load_map.unset(r);
+}
+
 void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_ctl) {
     ss::get_snapshot_details.set(r, [&snap_ctl](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
         auto result = co_await snap_ctl.local().get_snapshot_details();
         co_return std::function([res = std::move(result)] (output_stream<char>&& o) -> future<> {
-            auto result = std::move(res);
+            std::exception_ptr ex;
             output_stream<char> out = std::move(o);
-            bool first = true;
+            try {
+                auto result = std::move(res);
+                bool first = true;
 
-            co_await out.write("[");
-            for (auto& [name, details] : result) {
-                if (!first) {
-                    co_await out.write(", ");
+                co_await out.write("[");
+                for (auto& [name, details] : result) {
+                    if (!first) {
+                        co_await out.write(", ");
+                    }
+                    std::vector<ss::snapshot> snapshot;
+                    for (auto& cf : details) {
+                        ss::snapshot snp;
+                        snp.ks = cf.ks;
+                        snp.cf = cf.cf;
+                        snp.live = cf.details.live;
+                        snp.total = cf.details.total;
+                        snapshot.push_back(std::move(snp));
+                    }
+                    ss::snapshots all_snapshots;
+                    all_snapshots.key = name;
+                    all_snapshots.value = std::move(snapshot);
+                    co_await all_snapshots.write(out);
+                    first = false;
                 }
-                std::vector<ss::snapshot> snapshot;
-                for (auto& cf : details) {
-                    ss::snapshot snp;
-                    snp.ks = cf.ks;
-                    snp.cf = cf.cf;
-                    snp.live = cf.details.live;
-                    snp.total = cf.details.total;
-                    snapshot.push_back(std::move(snp));
-                }
-                ss::snapshots all_snapshots;
-                all_snapshots.key = name;
-                all_snapshots.value = std::move(snapshot);
-                co_await all_snapshots.write(out);
-                first = false;
+                co_await out.write("]");
+                co_await out.flush();
+            } catch (...) {
+              ex = std::current_exception();
             }
-            co_await out.write("]");
             co_await out.close();
+            if (ex) {
+                co_await coroutine::return_exception_ptr(std::move(ex));
+            }
         });
     });
 

@@ -41,7 +41,7 @@
 #include "counters.hh"
 #include "test/lib/simple_schema.hh"
 #include "replica/memtable-sstable.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/sstable_run_based_compaction_strategy_for_tests.hh"
 #include "test/lib/random_schema.hh"
 #include "mutation/mutation_compactor.hh"
@@ -109,7 +109,7 @@ static future<std::vector<sstables::shared_sstable>> open_sstables(test_env& env
 }
 
 // mutation_reader for sstable keeping all the required objects alive.
-static flat_mutation_reader_v2 sstable_reader(shared_sstable sst, schema_ptr s, reader_permit permit) {
+static mutation_reader sstable_reader(shared_sstable sst, schema_ptr s, reader_permit permit) {
     return sst->as_mutation_source().make_reader_v2(s, std::move(permit), query::full_partition_range, s->full_slice());
 }
 
@@ -242,7 +242,7 @@ SEASTAR_TEST_CASE(compact) {
         auto reader = sstable_reader(sst, s, env.make_reader_permit());
         auto close_reader = deferred_close(reader);
         auto verify_mutation = [&] (std::function<void(mutation_opt)> verify) {
-            std::invoke(verify, read_mutation_from_flat_mutation_reader(reader).get());
+            std::invoke(verify, read_mutation_from_mutation_reader(reader).get());
         };
         verify_mutation([&] (mutation_opt m) {
             BOOST_REQUIRE(m);
@@ -418,7 +418,7 @@ static future<> check_compacted_sstables(test_env& env, compact_sstables_result 
         auto close_reader = deferred_close(reader);
         std::vector<partition_key> keys;
 
-        while (auto m = read_mutation_from_flat_mutation_reader(reader).get()) {
+        while (auto m = read_mutation_from_mutation_reader(reader).get()) {
             keys.push_back(m->key());
         }
 
@@ -1000,8 +1000,8 @@ SEASTAR_TEST_CASE(tombstone_purge_test) {
         };
 
         auto assert_that_produces_dead_cell = [&] (auto& sst, partition_key& key) {
-            auto reader = make_lw_shared<flat_mutation_reader_v2>(sstable_reader(sst, s, env.make_reader_permit()));
-            read_mutation_from_flat_mutation_reader(*reader).then([reader, s, &key] (mutation_opt m) {
+            auto reader = make_lw_shared<mutation_reader>(sstable_reader(sst, s, env.make_reader_permit()));
+            read_mutation_from_mutation_reader(*reader).then([reader, s, &key] (mutation_opt m) {
                 BOOST_REQUIRE(m);
                 BOOST_REQUIRE(m->key().equal(*s, key));
                 auto rows = m->partition().clustered_rows();
@@ -1983,7 +1983,7 @@ static std::deque<mutation_fragment_v2> explode(reader_permit permit, std::vecto
     auto schema = muts.front().schema();
     std::deque<mutation_fragment_v2> frags;
 
-    auto mr = make_flat_mutation_reader_from_mutations_v2(schema, permit, std::move(muts));
+    auto mr = make_mutation_reader_from_mutations_v2(schema, permit, std::move(muts));
     mr.consume_pausable([&frags] (mutation_fragment_v2&& mf) {
         frags.emplace_back(std::move(mf));
         return stop_iteration::no;
@@ -2004,7 +2004,7 @@ static std::deque<mutation_fragment_v2> clone(const schema& schema, reader_permi
 static void verify_fragments(std::vector<sstables::shared_sstable> ssts, reader_permit permit, const std::deque<mutation_fragment_v2>& mfs) {
     auto schema = ssts.front()->get_schema();
 
-    std::vector<flat_mutation_reader_v2> readers;
+    std::vector<mutation_reader> readers;
     readers.reserve(ssts.size());
     for (auto& sst : ssts) {
         readers.push_back(sst->as_mutation_source().make_reader_v2(schema, permit));
@@ -2061,7 +2061,7 @@ public:
         const auto partition_count = std::count_if(frags.begin(), frags.end(), std::mem_fn(&mutation_fragment_v2::is_partition_start));
 
         auto permit = env.make_reader_permit();
-        auto mr = make_flat_mutation_reader_from_fragments(schema, permit, clone(*schema, permit, frags));
+        auto mr = make_mutation_reader_from_fragments(schema, permit, clone(*schema, permit, frags));
 
         auto close_mr = deferred_close(mr);
 
@@ -2196,7 +2196,7 @@ SEASTAR_TEST_CASE(sstable_validate_test) {
     };
 
     auto make_sst = [&] (std::deque<mutation_fragment_v2> frags) {
-        auto rd = make_flat_mutation_reader_from_fragments(schema, permit, std::move(frags));
+        auto rd = make_mutation_reader_from_fragments(schema, permit, std::move(frags));
         auto config = env.manager().configure_writer();
         config.validation_level = mutation_fragment_stream_validation_level::partition_region; // this test violates key order on purpose
         return make_sstable_easy(env, std::move(rd), std::move(config), sstables::get_highest_sstable_version(), local_keys.size());
@@ -2531,9 +2531,9 @@ SEASTAR_THREAD_TEST_CASE(test_scrub_segregate_stack) {
 
     uint64_t validation_errors = 0;
     mutation_writer::segregate_by_partition(
-            make_scrubbing_reader(make_flat_mutation_reader_from_fragments(schema, permit, std::move(all_fragments)), sstables::compaction_type_options::scrub::mode::segregate, validation_errors),
+            make_scrubbing_reader(make_mutation_reader_from_fragments(schema, permit, std::move(all_fragments)), sstables::compaction_type_options::scrub::mode::segregate, validation_errors),
             mutation_writer::segregate_config{100000},
-            [&schema, &segregated_fragment_streams] (flat_mutation_reader_v2 rd) {
+            [&schema, &segregated_fragment_streams] (mutation_reader rd) {
         return async([&schema, &segregated_fragment_streams, rd = std::move(rd)] () mutable {
             auto close = deferred_close(rd);
             auto& fragments = segregated_fragment_streams.emplace_back();
@@ -2550,18 +2550,18 @@ SEASTAR_THREAD_TEST_CASE(test_scrub_segregate_stack) {
         size_t i = 0;
         for (const auto& segregated_fragment_stream : segregated_fragment_streams) {
             testlog.debug("Checking position monotonicity of segregated stream #{}", i++);
-            assert_that(make_flat_mutation_reader_from_fragments(schema, permit, copy_fragments(segregated_fragment_stream)))
+            assert_that(make_mutation_reader_from_fragments(schema, permit, copy_fragments(segregated_fragment_stream)))
                     .has_monotonic_positions();
         }
     }
 
     testlog.info("Checking position monotonicity of re-combined stream");
     {
-        std::vector<flat_mutation_reader_v2> readers;
+        std::vector<mutation_reader> readers;
         readers.reserve(segregated_fragment_streams.size());
 
         for (const auto& segregated_fragment_stream : segregated_fragment_streams) {
-            readers.emplace_back(make_flat_mutation_reader_from_fragments(schema, permit, copy_fragments(segregated_fragment_stream)));
+            readers.emplace_back(make_mutation_reader_from_fragments(schema, permit, copy_fragments(segregated_fragment_stream)));
         }
 
         assert_that(make_combined_reader(schema, permit, std::move(readers))).has_monotonic_positions();
@@ -2569,11 +2569,11 @@ SEASTAR_THREAD_TEST_CASE(test_scrub_segregate_stack) {
 
     testlog.info("Checking content of re-combined stream");
     {
-        std::vector<flat_mutation_reader_v2> readers;
+        std::vector<mutation_reader> readers;
         readers.reserve(segregated_fragment_streams.size());
 
         for (const auto& segregated_fragment_stream : segregated_fragment_streams) {
-            readers.emplace_back(make_flat_mutation_reader_from_fragments(schema, permit, copy_fragments(segregated_fragment_stream)));
+            readers.emplace_back(make_mutation_reader_from_fragments(schema, permit, copy_fragments(segregated_fragment_stream)));
         }
 
         auto rd = assert_that(make_combined_reader(schema, permit, std::move(readers)));
@@ -2671,7 +2671,7 @@ SEASTAR_THREAD_TEST_CASE(sstable_scrub_reader_test) {
     scrubbed_fragments.emplace_back(*schema, permit, partition_end{}); // missing partition-end - at EOS
 
     uint64_t validation_errors = 0;
-    auto r = assert_that(make_scrubbing_reader(make_flat_mutation_reader_from_fragments(schema, permit, std::move(corrupt_fragments)),
+    auto r = assert_that(make_scrubbing_reader(make_mutation_reader_from_fragments(schema, permit, std::move(corrupt_fragments)),
                 compaction_type_options::scrub::mode::skip, validation_errors));
     for (const auto& mf : scrubbed_fragments) {
        testlog.info("Expecting {}", mutation_fragment_v2::printer(*schema, mf));
@@ -2908,7 +2908,7 @@ SEASTAR_TEST_CASE(partial_sstable_run_filtered_out_test) {
 
         sstable_writer_config sst_cfg = env.manager().configure_writer();
         sst_cfg.run_identifier = partial_sstable_run_identifier;
-        auto partial_sstable_run_sst = make_sstable_easy(env, make_flat_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), std::move(mut)), sst_cfg);
+        auto partial_sstable_run_sst = make_sstable_easy(env, make_mutation_reader_from_mutations_v2(s, env.make_reader_permit(), std::move(mut)), sst_cfg);
 
         column_family_test(cf).add_sstable(partial_sstable_run_sst).get();
         column_family_test::update_sstables_known_generation(*cf, partial_sstable_run_sst->generation());
@@ -3027,8 +3027,8 @@ SEASTAR_TEST_CASE(purged_tombstone_consumer_sstable_test) {
         auto ttl = 5;
 
         auto assert_that_produces_purged_tombstone = [&] (auto& sst, partition_key& key, tombstone tomb) {
-            auto reader = make_lw_shared<flat_mutation_reader_v2>(sstable_reader(sst, s, env.make_reader_permit()));
-            read_mutation_from_flat_mutation_reader(*reader).then([reader, s, &key, is_tombstone_purgeable, &tomb] (mutation_opt m) {
+            auto reader = make_lw_shared<mutation_reader>(sstable_reader(sst, s, env.make_reader_permit()));
+            read_mutation_from_mutation_reader(*reader).then([reader, s, &key, is_tombstone_purgeable, &tomb] (mutation_opt m) {
                 BOOST_REQUIRE(m);
                 BOOST_REQUIRE(m->key().equal(*s, key));
                 auto rows = m->partition().clustered_rows();
@@ -3499,6 +3499,15 @@ SEASTAR_TEST_CASE(test_twcs_partition_estimate) {
     });
 }
 
+static compaction_descriptor get_reshaping_job(sstables::compaction_strategy& cs, const std::vector<shared_sstable>& input,
+                                               const schema_ptr& s, reshape_mode mode, uint64_t free_storage_space = std::numeric_limits<uint64_t>::max()) {
+    reshape_config cfg {
+        .mode = mode,
+        .free_storage_space = free_storage_space,
+    };
+    return cs.get_reshaping_job(input, s, cfg);
+}
+
 SEASTAR_TEST_CASE(stcs_reshape_test) {
     return test_env::do_with_async([] (test_env& env) {
         simple_schema ss;
@@ -3516,8 +3525,8 @@ SEASTAR_TEST_CASE(stcs_reshape_test) {
         auto cs = sstables::make_compaction_strategy(sstables::compaction_strategy_type::size_tiered,
                                                     s->compaction_strategy_options());
 
-        BOOST_REQUIRE(cs.get_reshaping_job(sstables, s, reshape_mode::strict).sstables.size());
-        BOOST_REQUIRE(cs.get_reshaping_job(sstables, s, reshape_mode::relaxed).sstables.size());
+        BOOST_REQUIRE(get_reshaping_job(cs, sstables, s, reshape_mode::strict).sstables.size());
+        BOOST_REQUIRE(get_reshaping_job(cs, sstables, s, reshape_mode::relaxed).sstables.size());
     });
 }
 
@@ -3539,7 +3548,7 @@ SEASTAR_TEST_CASE(lcs_reshape_test) {
                 sstables.push_back(std::move(sst));
             }
 
-            BOOST_REQUIRE(cs.get_reshaping_job(sstables, s, reshape_mode::strict).sstables.size() == 256);
+            BOOST_REQUIRE(get_reshaping_job(cs, sstables, s, reshape_mode::strict).sstables.size() == 256);
         }
         // all overlapping
         {
@@ -3551,7 +3560,7 @@ SEASTAR_TEST_CASE(lcs_reshape_test) {
                 sstables.push_back(std::move(sst));
             }
 
-            BOOST_REQUIRE(cs.get_reshaping_job(sstables, s, reshape_mode::strict).sstables.size() == uint64_t(s->max_compaction_threshold()));
+            BOOST_REQUIRE(get_reshaping_job(cs, sstables, s, reshape_mode::strict).sstables.size() == uint64_t(s->max_compaction_threshold()));
         }
         // single sstable
         {
@@ -3559,7 +3568,7 @@ SEASTAR_TEST_CASE(lcs_reshape_test) {
             auto key = keys[0].key();
             sstables::test(sst).set_values_for_leveled_strategy(1 /* size */, 0 /* level */, 0 /* max ts */, key, key);
 
-            BOOST_REQUIRE(cs.get_reshaping_job({ sst }, s, reshape_mode::strict).sstables.size() == 0);
+            BOOST_REQUIRE(get_reshaping_job(cs, { sst }, s, reshape_mode::strict).sstables.size() == 0);
         }
     });
 }
@@ -3776,7 +3785,7 @@ SEASTAR_TEST_CASE(twcs_reshape_with_disjoint_set_test) {
                 sstables.push_back(std::move(sst));
             }
 
-            BOOST_REQUIRE_EQUAL(cs.get_reshaping_job(sstables, s, reshape_mode::strict).sstables.size(), disjoint_sstable_count);
+            BOOST_REQUIRE_EQUAL(get_reshaping_job(cs, sstables, s, reshape_mode::strict).sstables.size(), disjoint_sstable_count);
         }
 
         {
@@ -3789,7 +3798,7 @@ SEASTAR_TEST_CASE(twcs_reshape_with_disjoint_set_test) {
                 sstables.push_back(std::move(sst));
             }
 
-            auto reshaping_count = cs.get_reshaping_job(sstables, s, reshape_mode::strict).sstables.size();
+            auto reshaping_count = get_reshaping_job(cs, sstables, s, reshape_mode::strict).sstables.size();
             BOOST_REQUIRE_GE(reshaping_count, disjoint_sstable_count - min_threshold + 1);
             BOOST_REQUIRE_LE(reshaping_count, disjoint_sstable_count);
         }
@@ -3807,7 +3816,7 @@ SEASTAR_TEST_CASE(twcs_reshape_with_disjoint_set_test) {
                 sstables.push_back(std::move(sst));
             }
 
-            BOOST_REQUIRE_EQUAL(cs.get_reshaping_job(sstables, s, reshape_mode::strict).sstables.size(), 0);
+            BOOST_REQUIRE_EQUAL(get_reshaping_job(cs, sstables, s, reshape_mode::strict).sstables.size(), 0);
         }
 
         {
@@ -3820,7 +3829,7 @@ SEASTAR_TEST_CASE(twcs_reshape_with_disjoint_set_test) {
                 sstables.push_back(std::move(sst));
             }
 
-            BOOST_REQUIRE_EQUAL(cs.get_reshaping_job(sstables, s, reshape_mode::strict).sstables.size(), uint64_t(s->max_compaction_threshold()));
+            BOOST_REQUIRE_EQUAL(get_reshaping_job(cs, sstables, s, reshape_mode::strict).sstables.size(), uint64_t(s->max_compaction_threshold()));
         }
 
         {
@@ -3855,7 +3864,7 @@ SEASTAR_TEST_CASE(twcs_reshape_with_disjoint_set_test) {
             }
 
             auto check_mode_correctness = [&] (reshape_mode mode) {
-                auto ret = cs.get_reshaping_job(sstables, s, mode);
+                auto ret = get_reshaping_job(cs, sstables, s, mode);
                 BOOST_REQUIRE_EQUAL(ret.sstables.size(), uint64_t(s->max_compaction_threshold()));
                 // fail if any file doesn't belong to set of small files
                 bool has_big_sized_files = boost::algorithm::any_of(ret.sstables, [&] (const sstables::shared_sstable& sst) {
@@ -3866,6 +3875,45 @@ SEASTAR_TEST_CASE(twcs_reshape_with_disjoint_set_test) {
 
             check_mode_correctness(reshape_mode::strict);
             check_mode_correctness(reshape_mode::relaxed);
+        }
+
+        {
+            // create set of 256 disjoint ssts that spans multiple windows (essentially what happens in off-strategy during node op)
+
+            std::vector<sstables::shared_sstable> sstables;
+            sstables.reserve(disjoint_sstable_count);
+            for (auto i = 0U; i < disjoint_sstable_count; i++) {
+                std::vector<mutation> muts;
+                muts.reserve(5);
+                for (auto j = 0; j < 5; j++) {
+                    muts.push_back(make_row(i, std::chrono::hours(j * 8)));
+                }
+                auto sst = make_sstable_containing(sst_gen, std::move(muts));
+                sstables.push_back(std::move(sst));
+            }
+
+            auto job_size = [] (auto&& sst_range) {
+                return boost::accumulate(sst_range | boost::adaptors::transformed(std::mem_fn(&sstable::bytes_on_disk)), uint64_t(0));
+            };
+            auto free_space_for_reshaping_sstables = [&job_size] (auto&& sst_range) {
+                return job_size(std::move(sst_range)) * (time_window_compaction_strategy::reshape_target_space_overhead * 100);
+            };
+
+            // all sstables can be reshaped in a single round if there's enough space
+            {
+                uint64_t free_space = free_space_for_reshaping_sstables(boost::make_iterator_range(sstables));
+                BOOST_REQUIRE(get_reshaping_job(cs, sstables, s, reshape_mode::strict, free_space).sstables.size() == sstables.size());
+            }
+
+            // only a subset can be reshaped in a single round to respect the 10% space overhead
+            {
+                const size_t sstables_that_fit_in_target_overhead = 10;
+                uint64_t free_space = free_space_for_reshaping_sstables(boost::make_iterator_range(sstables.begin(), sstables.begin() + sstables_that_fit_in_target_overhead));
+                auto target_space_overhead = free_space * time_window_compaction_strategy::reshape_target_space_overhead;
+                auto job = get_reshaping_job(cs, sstables, s, reshape_mode::strict, free_space);
+                BOOST_REQUIRE(job.sstables.size() < sstables.size());
+                BOOST_REQUIRE(job_size(boost::make_iterator_range(job.sstables)) <= target_space_overhead);
+            }
         }
     });
 }
@@ -3909,7 +3957,7 @@ SEASTAR_TEST_CASE(stcs_reshape_overlapping_test) {
                 sstables.push_back(std::move(sst));
             }
 
-            BOOST_REQUIRE(cs.get_reshaping_job(sstables, s, reshape_mode::strict).sstables.size() == disjoint_sstable_count);
+            BOOST_REQUIRE(get_reshaping_job(cs, sstables, s, reshape_mode::strict).sstables.size() == disjoint_sstable_count);
         }
 
         {
@@ -3922,7 +3970,7 @@ SEASTAR_TEST_CASE(stcs_reshape_overlapping_test) {
                 sstables.push_back(std::move(sst));
             }
 
-            BOOST_REQUIRE(cs.get_reshaping_job(sstables, s, reshape_mode::strict).sstables.size() == uint64_t(s->max_compaction_threshold()));
+            BOOST_REQUIRE(get_reshaping_job(cs, sstables, s, reshape_mode::strict).sstables.size() == uint64_t(s->max_compaction_threshold()));
         }
     });
 }
@@ -4293,9 +4341,9 @@ SEASTAR_TEST_CASE(twcs_single_key_reader_through_compound_set_test) {
                                                                 tracing::trace_state_ptr(), ::streamed_mutation::forwarding::no,
                                                                 ::mutation_reader::forwarding::no);
         auto close_reader = deferred_close(reader);
-        auto mfopt = read_mutation_from_flat_mutation_reader(reader).get();
+        auto mfopt = read_mutation_from_mutation_reader(reader).get();
         BOOST_REQUIRE(mfopt);
-        mfopt = read_mutation_from_flat_mutation_reader(reader).get();
+        mfopt = read_mutation_from_mutation_reader(reader).get();
         BOOST_REQUIRE(!mfopt);
         BOOST_REQUIRE(cf.cf_stats().clustering_filter_count > 0);
     });
@@ -4649,7 +4697,7 @@ SEASTAR_TEST_CASE(test_large_partition_splitting_on_compaction) {
 
             auto reader = sstable_reader(sst, s, env.make_reader_permit());
 
-            mutation_opt m = read_mutation_from_flat_mutation_reader(reader).get();
+            mutation_opt m = read_mutation_from_mutation_reader(reader).get();
             BOOST_REQUIRE(m);
             BOOST_REQUIRE(m->decorated_key().equal(*s, pkey));
             // ASSERT that partition tobmstone is replicated to every fragment.

@@ -371,8 +371,7 @@ modes = {
         'cxxflags': '-DDEBUG -DSANITIZE -DDEBUG_LSA_SANITIZER -DSCYLLA_ENABLE_ERROR_INJECTION',
         'cxx_ld_flags': '',
         'stack-usage-threshold': 1024*40,
-        # -fasan -Og breaks some coroutines on aarch64, use -O0 instead
-        'optimization-level': ('0' if platform.machine() == 'aarch64' else 'g'),
+        'optimization-level': 'g',
         'per_src_extra_cxxflags': {},
         'cmake_build_type': 'Debug',
         'can_have_debug_info': True,
@@ -443,10 +442,11 @@ scylla_tests = set([
     'test/boost/auth_test',
     'test/boost/batchlog_manager_test',
     'test/boost/big_decimal_test',
+    'test/boost/bloom_filter_test',
     'test/boost/broken_sstable_test',
     'test/boost/bytes_ostream_test',
     'test/boost/cache_algorithm_test',
-    'test/boost/cache_flat_mutation_reader_test',
+    'test/boost/cache_mutation_reader_test',
     'test/boost/cached_file_test',
     'test/boost/caching_options_test',
     'test/boost/canonical_mutation_test',
@@ -485,7 +485,7 @@ scylla_tests = set([
     'test/boost/extensions_test',
     'test/boost/error_injection_test',
     'test/boost/filtering_test',
-    'test/boost/flat_mutation_reader_test',
+    'test/boost/mutation_reader_another_test',
     'test/boost/flush_queue_test',
     'test/boost/fragmented_temporary_buffer_test',
     'test/boost/frozen_mutation_test',
@@ -688,6 +688,11 @@ all_artifacts = apps | tests | other | wasms
 arg_parser = argparse.ArgumentParser('Configure scylla')
 arg_parser.add_argument('--out', dest='buildfile', action='store', default='build.ninja',
                         help='Output build-file name (by default build.ninja)')
+arg_parser.add_argument('--out-final-name', dest="buildfile_final_name", action='store',
+                        help='If set, rules will be generated as if this were the actual name of the file instead of the name passed by the --out option. \
+                              This option is rather not useful for developers, it is intended to be used by Ninja when it decides to regenerate the makefile \
+                              (a makefile with the same name but with a ".new" suffix is generated, then it is renamed to overwrite the old file; \
+                              the new file\'s regeneration rule itself needs to refer to the correct filename).')
 arg_parser.add_argument('--mode', action='append', choices=list(modes.keys()), dest='selected_modes',
                         help="Build modes to generate ninja files for. The available build modes are:\n{}".format("; ".join(["{} - {}".format(m, cfg['description']) for m, cfg in modes.items()])))
 arg_parser.add_argument('--with', dest='artifacts', action='append', default=[],
@@ -966,7 +971,7 @@ scylla_core = (['message/messaging_service.cc',
                 'service/tablet_allocator.cc',
                 'service/storage_proxy.cc',
                 'query_ranges_to_vnodes.cc',
-                'service/forward_service.cc',
+                'service/mapreduce_service.cc',
                 'service/paxos/proposal.cc',
                 'service/paxos/prepare_response.cc',
                 'service/paxos/paxos_state.cc',
@@ -1289,7 +1294,7 @@ idls = ['idl/gossip_digest.idl.hh',
         'idl/hinted_handoff.idl.hh',
         'idl/storage_proxy.idl.hh',
         'idl/group0_state_machine.idl.hh',
-        'idl/forward_request.idl.hh',
+        'idl/mapreduce_request.idl.hh',
         'idl/replica_exception.idl.hh',
         'idl/per_partition_rate_limit_info.idl.hh',
         'idl/position_in_partition.idl.hh',
@@ -1297,6 +1302,7 @@ idls = ['idl/gossip_digest.idl.hh',
         'idl/storage_service.idl.hh',
         'idl/join_node.idl.hh',
         'idl/utils.idl.hh',
+        'idl/gossip.idl.hh',
         ]
 
 scylla_tests_generic_dependencies = [
@@ -1536,10 +1542,6 @@ def get_warning_options(cxx):
 def get_clang_inline_threshold():
     if args.clang_inline_threshold != -1:
         return args.clang_inline_threshold
-    elif platform.machine() == 'aarch64':
-        # we see miscompiles with 1200 and above with format("{}", uuid)
-        # also coroutine miscompiles with 600
-        return 300
     else:
         return 2500
 
@@ -1570,6 +1572,8 @@ link_pool_depth = max(int(total_memory / 7e9), 1)
 selected_modes = args.selected_modes or modes.keys()
 default_modes = args.selected_modes or [mode for mode, mode_cfg in modes.items() if mode_cfg["default"]]
 build_modes =  {m: modes[m] for m in selected_modes}
+
+buildfile_final_name = args.buildfile_final_name or args.buildfile
 
 if args.artifacts:
     build_artifacts = set()
@@ -1680,10 +1684,10 @@ def configure_seastar(build_dir, mode, mode_config):
         '-DCMAKE_C_COMPILER={}'.format(args.cc),
         '-DCMAKE_CXX_COMPILER={}'.format(args.cxx),
         '-DCMAKE_EXPORT_NO_PACKAGE_REGISTRY=ON',
-        '-DCMAKE_CXX_STANDARD=20',
+        '-DCMAKE_CXX_STANDARD=23',
         '-DSeastar_CXX_FLAGS=SHELL:{}'.format(mode_config['lib_cflags']),
         '-DSeastar_LD_FLAGS={}'.format(semicolon_separated(mode_config['lib_ldflags'], seastar_cxx_ld_flags)),
-        '-DSeastar_CXX_DIALECT=gnu++20',
+        '-DSeastar_CXX_DIALECT=gnu++23',
         '-DSeastar_API_LEVEL=7',
         '-DSeastar_DEPRECATED_OSTREAM_FORMATTERS=OFF',
         '-DSeastar_UNUSED_RESULT_ERROR=ON',
@@ -1746,7 +1750,7 @@ def configure_abseil(build_dir, mode, mode_config):
         '-DCMAKE_CXX_COMPILER={}'.format(args.cxx),
         '-DCMAKE_CXX_FLAGS_{}={}'.format(cmake_mode.upper(), cxx_flags),
         '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
-        '-DCMAKE_CXX_STANDARD=20',
+        '-DCMAKE_CXX_STANDARD=23',
         '-DABSL_PROPAGATE_CXX_STD=ON',
     ]
 
@@ -1881,7 +1885,7 @@ def write_build_file(f,
         configure_args = {configure_args}
         builddir = {outdir}
         cxx = {cxx}
-        cxxflags = -std=gnu++20 {user_cflags} {warnings} {defines}
+        cxxflags = -std=gnu++23 {user_cflags} {warnings} {defines}
         ldflags = {linker_flags} {user_ldflags}
         ldflags_build = {linker_flags}
         libs = {libs}
@@ -2265,10 +2269,10 @@ def write_build_file(f,
         f.write(f'build dist-server-debuginfo-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-debuginfo-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
         f.write(f'build dist-jmx-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz dist-jmx-rpm dist-jmx-deb\n')
         f.write(f'build dist-tools-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz dist-tools-rpm dist-tools-deb\n')
-        f.write(f'build dist-cqlsh-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.noarch.tar.gz dist-cqlsh-rpm dist-cqlsh-deb\n')
+        f.write(f'build dist-cqlsh-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz dist-cqlsh-rpm dist-cqlsh-deb\n')
         f.write(f'build dist-python3-{mode}: phony dist-python3-tar dist-python3-rpm dist-python3-deb\n')
         f.write(f'build dist-unified-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
-        f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz: unified $builddir/{mode}/dist/tar/{scylla_product}-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.noarch.tar.gz | always\n')
+        f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz: unified $builddir/{mode}/dist/tar/{scylla_product}-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz | always\n')
         f.write(f'  mode = {mode}\n')
         f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-package-{scylla_version}-{scylla_release}.tar.gz: copy $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
         f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{arch}-package-{scylla_version}-{scylla_release}.tar.gz: copy $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
@@ -2337,15 +2341,15 @@ def write_build_file(f,
         build dist-tools-tar: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz'.format(mode=mode, scylla_product=scylla_product, scylla_version=scylla_version, scylla_release=scylla_release) for mode in default_modes])}
         build dist-tools: phony dist-tools-tar dist-tools-rpm dist-tools-deb
 
-        build tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.noarch.tar.gz: build-submodule-reloc | $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE
+        build tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz: build-submodule-reloc | $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE
           reloc_dir = tools/cqlsh
-        build dist-cqlsh-rpm: build-submodule-rpm tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.noarch.tar.gz
+        build dist-cqlsh-rpm: build-submodule-rpm tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
           dir = tools/cqlsh
-          artifact = build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build dist-cqlsh-deb: build-submodule-deb tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.noarch.tar.gz
+          artifact = build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
+        build dist-cqlsh-deb: build-submodule-deb tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
           dir = tools/cqlsh
-          artifact = build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build dist-cqlsh-tar: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.noarch.tar.gz'.format(mode=mode, scylla_product=scylla_product, scylla_version=scylla_version, scylla_release=scylla_release) for mode in default_modes])}
+          artifact = build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
+        build dist-cqlsh-tar: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz'.format(mode=mode, scylla_product=scylla_product, scylla_version=scylla_version, scylla_release=scylla_release, arch=arch) for mode in default_modes])}
         build dist-cqlsh: phony dist-cqlsh-tar dist-cqlsh-rpm dist-cqlsh-deb
 
         build tools/python3/build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz: build-submodule-reloc | $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE
@@ -2380,8 +2384,8 @@ def write_build_file(f,
         build $builddir/{mode}/dist/tar/{scylla_product}-tools-package.tar.gz: copy tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
         build $builddir/{mode}/dist/tar/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz: copy tools/jmx/build/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz
         build $builddir/{mode}/dist/tar/{scylla_product}-jmx-package.tar.gz: copy tools/jmx/build/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.noarch.tar.gz: copy tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-package.tar.gz: copy tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.noarch.tar.gz
+        build $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz: copy tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
+        build $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-package.tar.gz: copy tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
 
         build {mode}-dist: phony dist-server-{mode} dist-server-debuginfo-{mode} dist-python3-{mode} dist-tools-{mode} dist-jmx-{mode} dist-unified-{mode} dist-cqlsh-{mode}
         build dist-{mode}: phony {mode}-dist
@@ -2391,10 +2395,10 @@ def write_build_file(f,
 
     f.write(textwrap.dedent('''\
         rule configure
-          command = {python} configure.py --out={buildfile}.new $configure_args && mv {buildfile}.new {buildfile}
+          command = {python} configure.py --out={buildfile_final_name}.new --out-final-name={buildfile_final_name} $configure_args && mv {buildfile_final_name}.new {buildfile_final_name}
           generator = 1
           description = CONFIGURE $configure_args
-        build {buildfile} {build_ninja_list}: configure | configure.py SCYLLA-VERSION-GEN $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE {args.seastar_path}/CMakeLists.txt
+        build {buildfile_final_name} {build_ninja_list}: configure | configure.py SCYLLA-VERSION-GEN $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE {args.seastar_path}/CMakeLists.txt
         rule cscope
             command = find -name '*.[chS]' -o -name "*.cc" -o -name "*.hh" | cscope -bq -i-
             description = CSCOPE

@@ -54,13 +54,14 @@ set(idl_headers
   storage_proxy.idl.hh
   storage_service.idl.hh
   group0_state_machine.idl.hh
-  forward_request.idl.hh
+  mapreduce_request.idl.hh
   replica_exception.idl.hh
   per_partition_rate_limit_info.idl.hh
   position_in_partition.idl.hh
   experimental/broadcast_tables_lang.idl.hh
   join_node.idl.hh
   utils.idl.hh
+  gossip.idl.hh
   )
 
 foreach(idl_header ${idl_headers})

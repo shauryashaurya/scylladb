@@ -160,7 +160,8 @@ SCYLLA_CMDLINE_OPTIONS = [
 # [--overprovisioned, --smp=1, --abort-on-ebadf], [--smp=2] -> [--overprovisioned, --smp=2, --abort-on-ebadf]
 # [], [--experimental-features, raft, --experimental-features, broadcast-tables] ->
 # [--experimental-features, raft, --experimental-features, broadcast-tables]
-def merge_cmdline_options(base: List[str], override: List[str]) -> List[str]:
+def merge_cmdline_options(
+        base: List[str], override: List[str], appending_options: List[str] = ["--logger-log-level"]) -> List[str]:
     if len(override) == 0:
         return base
 
@@ -191,7 +192,8 @@ def merge_cmdline_options(base: List[str], override: List[str]) -> List[str]:
                 if v != '__remove__':
                     if merged_values is None:
                         merged_values = merged.setdefault(name, [])
-                        merged_values.clear()
+                        if name not in appending_options:
+                            merged_values.clear()
                     merged_values.append(v if v != '__missing__' else None)
                 elif name in merged:
                     del merged[name]
@@ -330,7 +332,7 @@ class ScyllaServer:
         size = 0
 
         if self.cmd is not None:
-            deleted_sstable_re = f"^.*/{keyspace}/{table}-[0-9a-f]{{32}}/.* \(deleted\)$"
+            deleted_sstable_re = rf"^.*/{keyspace}/{table}-[0-9a-f]{{32}}/.* \(deleted\)$"
             deleted_sstable_re = re.compile(deleted_sstable_re)
             for f in pathlib.Path(f"/proc/{self.cmd.pid}/fd/").iterdir():
                 try:
